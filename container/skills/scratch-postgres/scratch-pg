@@ -1,0 +1,347 @@
+#!/usr/bin/env bash
+# A throwaway Postgres for this container: data under /tmp, listening on 127.0.0.1 only.
+#
+#   scratch-pg start [--port N] [--role R] [--extra-role NAME[:member]]...
+#                                          start the cluster (no-op when it is already running); R is the login
+#                                          role every client uses, default scratch; each extra role is made at
+#                                          setup with no login and no privileges, for a migration that expects it
+#                                          to exist, and :member lets R SET ROLE to it
+#   scratch-pg psql <db> -c <sql> [...]  run psql against it
+#   scratch-pg createdb <db>
+#   scratch-pg dropdb <db>
+#   scratch-pg url <db>                  the connection URL an app's env takes
+#   scratch-pg stop
+#
+# The destructive-command guard reads only the command line an agent types, never what this script runs, so the
+# script proves every connection is its own cluster before making it: the listener on the recorded port must be held
+# only by postgres running from the recorded data directory under /tmp. An ssh -L, socat or port-forward on that
+# port, or a postgres with its data anywhere else, is refused.
+#
+# What runs on the server is bounded by the server, not by reading the SQL: the only role pg_hba.conf lets log in is
+# a NOSUPERUSER CREATEDB role, which Postgres refuses dblink, postgres_fdw, COPY ... PROGRAM and server file access,
+# however the SQL is assembled. The superuser initdb makes is used once, during setup, and then refused too.
+set -euo pipefail
+
+ROOT="${SCRATCH_PG_ROOT:-/tmp/scratch-pg}"
+STATE="$ROOT/state"
+DATA="$ROOT/data"
+ADMIN=scratch_admin
+DEFAULT_ROLE=scratch
+HBA_MARKER='# scratch-pg: only the scratch role logs in'
+DEFAULT_PORT=5432
+# libpq reads these to connect somewhere other than the -h and -p given; psql reads PGOPTIONS into the session.
+LIBPQ_ENV=(PGHOST PGHOSTADDR PGPORT PGDATABASE PGUSER PGSERVICE PGSERVICEFILE PGSYSCONFDIR PGOPTIONS PGPASSFILE POSIXLY_CORRECT PSQLRC)
+# The psql options the guard's scratch-Postgres exemption places; anything else could move the connection or read SQL
+# the guard can't.
+PSQL_SHORT_FLAGS=XqtA1eabEnwWx
+PSQL_LONG_FLAGS=" --no-psqlrc --quiet --tuples-only --no-align --single-transaction --echo-queries --echo-all --echo-errors --echo-hidden --no-readline --no-password --expanded --csv "
+
+
+die() {
+  echo "scratch-pg: $*" >&2
+  exit 1
+}
+
+check_root() {
+  case "$ROOT" in
+    /tmp/?*) ;;
+    *) die "SCRATCH_PG_ROOT must be under /tmp, got $ROOT" ;;
+  esac
+  [[ "$ROOT" != *..* ]] || die "SCRATCH_PG_ROOT must not contain .."
+}
+
+pg_bin() {
+  if [[ -n "${SCRATCH_PG_BIN:-}" ]]; then
+    echo "$SCRATCH_PG_BIN"
+    return
+  fi
+  local dir
+  dir="$(ls -d /usr/lib/postgresql/*/bin 2>/dev/null | sort -V | tail -1)"
+  [[ -n "$dir" && -x "$dir/initdb" ]] || die "no Postgres server binaries under /usr/lib/postgresql"
+  echo "$dir"
+}
+
+recorded_port() {
+  [[ -f "$STATE" ]] || die "no scratch cluster was started here; run: scratch-pg start"
+  local port
+  port="$(sed -n 's/^port=//p' "$STATE")"
+  [[ "$port" =~ ^[1-9][0-9]{0,4}$ ]] && ((port <= 65535)) || die "state file $STATE has no valid port"
+  echo "$port"
+}
+
+recorded_role() {
+  [[ -f "$STATE" ]] || die "no scratch cluster was started here; run: scratch-pg start"
+  local role
+  role="$(sed -n 's/^role=//p' "$STATE")"
+  [[ -n "$role" ]] || die "this cluster predates the scratch role; run: scratch-pg stop, remove $ROOT, then scratch-pg start"
+  echo "$role"
+}
+
+check_role() {
+  [[ "$1" =~ ^[a-z_][a-z0-9_]{0,62}$ ]] || die "role names are lowercase letters, digits and _"
+  [[ "$1" != "$ADMIN" ]] || die "$ADMIN is the setup superuser; pick another role"
+  # pg_hba.conf reads these in its user column as keywords (all matches every role), and Postgres reserves the rest.
+  case "$1" in
+    all | sameuser | samerole | samegroup | replication | public | none) die "$1 is a reserved word in pg_hba.conf; pick another role" ;;
+    pg_*) die "Postgres reserves role names starting with pg_; pick another role" ;;
+  esac
+}
+
+hba_text() {
+  printf '%s\nlocal all %s trust\nhost all %s 127.0.0.1/32 trust\nlocal all all reject\nhost all all all reject\n' \
+    "$HBA_MARKER" "$1" "$1"
+}
+
+# As the setup superuser on a cluster initdb has just made, so no other role or extension exists yet: make the login
+# role, let only it log in, then confirm the superuser is refused. pg_ctl reload returns before the server rereads
+# pg_hba.conf, and a file it can't parse leaves the old one in force, so the refusal is what proves the lock.
+lock_down() {
+  local bin="$1" port="$2" role="$3" extras="$4" n out spec name
+  "$bin/psql" -X -q -h "$ROOT/sock" -p "$port" -U "$ADMIN" -d postgres -v ON_ERROR_STOP=1 \
+    -c "create role \"$role\" login createdb nosuperuser nocreaterole noreplication nobypassrls" >/dev/null ||
+    stop_and_die "could not create role $role"
+  # The login role holds no CREATEROLE: on Postgres 15 that would let it grant itself pg_execute_server_program. A
+  # migration that creates roles finds them made here instead.
+  for spec in ${extras//,/ }; do
+    name="${spec%:member}"
+    "$bin/psql" -X -q -h "$ROOT/sock" -p "$port" -U "$ADMIN" -d postgres -v ON_ERROR_STOP=1 \
+      -c "create role \"$name\" nologin nosuperuser nocreatedb nocreaterole noinherit noreplication nobypassrls" >/dev/null ||
+      stop_and_die "could not create role $name"
+    if [[ "$spec" == *:member ]]; then
+      "$bin/psql" -X -q -h "$ROOT/sock" -p "$port" -U "$ADMIN" -d postgres -v ON_ERROR_STOP=1 \
+        -c "grant \"$name\" to \"$role\"" >/dev/null || stop_and_die "could not grant $name to $role"
+    fi
+  done
+  hba_text "$role" >"$DATA/pg_hba.conf"
+  "$bin/pg_ctl" -D "$DATA" reload >/dev/null || stop_and_die "could not reload pg_hba.conf"
+  for n in $(seq 50); do
+    out="$("$bin/psql" -X -q -h "$ROOT/sock" -p "$port" -U "$ADMIN" -d postgres -c 'select 1' 2>&1)" || true
+    [[ "$out" != *"pg_hba.conf rejects connection"* ]] || return 0
+    sleep 0.1
+  done
+  stop_and_die "the setup superuser can still log in after pg_hba.conf was locked; see $ROOT/postgres.log"
+}
+
+# A cluster whose setup failed still lets the superuser in, so it is not left running.
+stop_and_die() {
+  "$(pg_bin)/pg_ctl" -D "$DATA" -m immediate stop >/dev/null 2>&1 || true
+  die "$1"
+}
+
+# /proc/net/tcp{,6} local addresses that a connection to 127.0.0.1 reaches, as the kernel prints them on a
+# little-endian host: each 32-bit word in host order.
+loopback_addrs() {
+  local hex
+  hex="$(printf '%04X' "$1")"
+  printf '%s\n' "0100007F:$hex" "00000000:$hex" \
+    "00000000000000000000000000000000:$hex" \
+    "0000000000000000FFFF000000000000:$hex" \
+    "0000000000000000FFFF00000100007F:$hex"
+}
+
+listener_inodes() {
+  local port="$1" addrs
+  addrs="$(loopback_addrs "$port")"
+  awk -v addrs="$addrs" 'BEGIN { n = split(addrs, a, "\n"); for (i = 1; i <= n; i++) want[a[i]] = 1 }
+    FNR > 1 && $4 == "0A" && ($2 in want) { print $10 }' /proc/net/tcp /proc/net/tcp6
+}
+
+is_postgres() {
+  local pid="$1" comm exe
+  comm="$(cat "/proc/$pid/comm" 2>/dev/null || true)"
+  [[ "$comm" == postgres ]] && return 0
+  exe="$(readlink "/proc/$pid/exe" 2>/dev/null || true)"
+  [[ "$(basename "${exe% (deleted)}")" == postgres ]]
+}
+
+# Succeeds only when every listener 127.0.0.1:<port> reaches is held by postgres running from $DATA, the cluster this
+# script started; prints why not otherwise.
+prove_scratch() {
+  local port="$1" data pid inodes inode holders p fd link
+  data="$(realpath -e "$DATA" 2>/dev/null)" || { echo "no data directory at $DATA"; return 1; }
+  [[ "$data" == /tmp/?* ]] || { echo "data directory $data is not under /tmp"; return 1; }
+  [[ -f "$data/postmaster.pid" ]] || { echo "the scratch cluster is not running"; return 1; }
+  pid="$(sed -n 1p "$data/postmaster.pid")"
+  [[ "$pid" =~ ^[1-9][0-9]*$ && -d "/proc/$pid" ]] || { echo "the scratch cluster is not running"; return 1; }
+  is_postgres "$pid" || { echo "pid $pid from postmaster.pid is not postgres"; return 1; }
+  [[ "$(readlink "/proc/$pid/cwd" 2>/dev/null)" == "$data" ]] || { echo "pid $pid is not running from $data"; return 1; }
+  inodes="$(listener_inodes "$port")"
+  [[ -n "$inodes" ]] || { echo "nothing listens on 127.0.0.1:$port"; return 1; }
+  for inode in $inodes; do
+    [[ "$inode" =~ ^[1-9][0-9]*$ ]] || { echo "unreadable listener on port $port"; return 1; }
+    holders=0
+    for p in /proc/[0-9]*; do
+      if ! fd="$(ls "$p/fd" 2>/dev/null)"; then
+        [[ -e "$p" ]] && { echo "cannot read the descriptors of ${p#/proc/}"; return 1; }
+        continue
+      fi
+      for f in $fd; do
+        link="$(readlink "$p/fd/$f" 2>/dev/null || true)"
+        [[ "$link" == "socket:[$inode]" ]] || continue
+        if ! is_postgres "${p#/proc/}" || [[ "$(readlink "$p/cwd" 2>/dev/null)" != "$data" ]]; then
+          echo "port $port is held by pid ${p#/proc/}, not the scratch cluster"
+          return 1
+        fi
+        holders=$((holders + 1))
+      done
+    done
+    ((holders > 0)) || { echo "no process holds the listener on port $port"; return 1; }
+  done
+}
+
+require_scratch() {
+  local port="$1" why
+  why="$(prove_scratch "$port")" || die "refusing to connect: $why. Run: scratch-pg start"
+}
+
+check_db() {
+  [[ "${1:-}" =~ ^[A-Za-z_][A-Za-z0-9_]{0,62}$ ]] || die "database name must be letters, digits and _, got '${1:-}'"
+}
+
+# Runs, or with SCRATCH_PG_DRY_RUN=1 prints, a client command with the libpq environment cleared.
+run_client() {
+  local unset_args=()
+  for v in "${LIBPQ_ENV[@]}"; do unset_args+=(-u "$v"); done
+  if [[ "${SCRATCH_PG_DRY_RUN:-}" == 1 ]]; then
+    local a out=()
+    for a in "$@"; do
+      if [[ "$a" =~ ^[A-Za-z0-9_./:=-]+$ ]]; then out+=("$a"); else out+=("'${a//\'/\'\\\'\'}'"); fi
+    done
+    echo "${out[*]}"
+    return
+  fi
+  exec env "${unset_args[@]}" "$@"
+}
+
+# Meta-commands run in the psql client, where the server role doesn't reach: \\c connects elsewhere, \\! and \\copy ...
+# program run programs.
+check_sql_arg() {
+  [[ "$1" != *\\* ]] || die "psql arguments may not hold a backslash (meta-commands such as \\c can connect elsewhere)"
+}
+
+check_psql_args() {
+  local commands=0 a i
+  local args=("$@")
+  for ((i = 0; i < ${#args[@]}; i++)); do
+    a="${args[i]}"
+    check_sql_arg "$a"
+    case "$a" in
+      -c | --command) commands=$((commands + 1)); ((i + 1 < ${#args[@]})) || die "$a needs a value"; i=$((i + 1)); check_sql_arg "${args[i]}" ;;
+      --command=*) commands=$((commands + 1)); check_sql_arg "${a#--command=}" ;;
+      -c?*) commands=$((commands + 1)); check_sql_arg "${a#-c}" ;;
+      -v | --set | --variable) ((i + 1 < ${#args[@]})) || die "$a needs a value"; i=$((i + 1)); check_sql_arg "${args[i]}" ;;
+      --set=* | --variable=*) check_sql_arg "${a#*=}" ;;
+      -v?*) check_sql_arg "${a#-v}" ;;
+      --*) [[ "$PSQL_LONG_FLAGS" == *" $a "* ]] || die "psql option $a is not allowed here" ;;
+      -?*) [[ "${a:1}" =~ ^[$PSQL_SHORT_FLAGS]+$ ]] || die "psql option $a is not allowed here" ;;
+      *) die "unexpected argument '$a'; give SQL with -c" ;;
+    esac
+  done
+  ((commands > 0)) || die "give the SQL with -c"
+}
+
+cmd_start() {
+  local port="" role="" extras="" bin why recorded spec
+  while (($#)); do
+    case "$1" in
+      --port) port="${2:-}"; shift 2 || die "--port needs a value" ;;
+      --port=*) port="${1#--port=}"; shift ;;
+      --role) role="${2:-}"; shift 2 || die "--role needs a value" ;;
+      --role=*) role="${1#--role=}"; shift ;;
+      --extra-role) extras="${extras:+$extras,}${2:-}"; shift 2 || die "--extra-role needs a value" ;;
+      --extra-role=*) extras="${extras:+$extras,}${1#--extra-role=}"; shift ;;
+      *) die "unknown start option $1" ;;
+    esac
+  done
+  [[ -z "$role" ]] || check_role "$role"
+  for spec in ${extras//,/ }; do
+    check_role "${spec%:member}"
+  done
+  [[ "$extras" != *,,* && "$extras" != ,* && "$extras" != *, ]] || die "--extra-role needs a value"
+  if [[ -f "$STATE" ]]; then
+    recorded="$(recorded_role)"
+    [[ -z "$role" || "$role" == "$recorded" ]] || die "this cluster was set up for role $recorded; stop it and remove $ROOT to change roles"
+    role="$recorded"
+    recorded="$(sed -n 's/^extra=//p' "$STATE")"
+    [[ -z "$extras" || "$extras" == "$recorded" ]] || die "this cluster was set up with extra roles '$recorded'; stop it and remove $ROOT to change them"
+    extras="$recorded"
+    recorded="$(recorded_port)"
+    if prove_scratch "$recorded" >/dev/null; then
+      echo "scratch Postgres already running on 127.0.0.1:$recorded (role $role, data $DATA)"
+      return
+    fi
+    [[ -z "$port" || "$port" == "$recorded" ]] || die "this cluster was set up on port $recorded; stop it and remove $ROOT to change ports"
+    port="$recorded"
+  fi
+  role="${role:-$DEFAULT_ROLE}"
+  for spec in ${extras//,/ }; do
+    [[ "${spec%:member}" != "$role" ]] || die "extra role ${spec%:member} is the login role"
+  done
+  port="${port:-$DEFAULT_PORT}"
+  [[ "$port" =~ ^[1-9][0-9]{0,4}$ ]] && ((port <= 65535)) || die "invalid port $port"
+  bin="$(pg_bin)"
+  mkdir -p "$ROOT/sock"
+  chmod 700 "$ROOT"
+  local fresh=""
+  if [[ ! -f "$DATA/PG_VERSION" ]]; then
+    # Without a locale in the environment initdb falls back to SQL_ASCII, which can't hold UTF-8 a migration or seed
+    # writes; C.UTF-8 ships with glibc, so it exists wherever the server binaries do.
+    "$bin/initdb" -D "$DATA" -U "$ADMIN" --auth=trust --encoding=UTF8 --locale=C.UTF-8 >"$ROOT/initdb.log" 2>&1 ||
+      die "initdb failed; see $ROOT/initdb.log"
+    fresh=1
+  elif [[ "$(cat "$DATA/pg_hba.conf" 2>/dev/null)" != "$(hba_text "$role")" ]]; then
+    die "$DATA was not set up by scratch-pg for role $role; stop whatever uses it, remove $ROOT, then start again"
+  fi
+  "$bin/pg_ctl" -D "$DATA" -l "$ROOT/postgres.log" -w start \
+    -o "-p $port -k $ROOT/sock -c listen_addresses=127.0.0.1 -c dynamic_shared_memory_type=mmap" >/dev/null ||
+    die "postgres did not start; see $ROOT/postgres.log"
+  [[ -z "$fresh" ]] || lock_down "$bin" "$port" "$role" "$extras"
+  printf 'port=%s\nrole=%s\nextra=%s\n' "$port" "$role" "$extras" >"$STATE"
+  why="$(prove_scratch "$port")" || die "started, but $why"
+  echo "scratch Postgres running on 127.0.0.1:$port (role $role, data $DATA)"
+}
+
+cmd_stop() {
+  [[ -f "$DATA/postmaster.pid" ]] || { echo "scratch Postgres is not running"; return; }
+  "$(pg_bin)/pg_ctl" -D "$DATA" -m fast stop >/dev/null
+  echo "scratch Postgres stopped"
+}
+
+main() {
+  check_root
+  local sub="${1:-}" port bin role
+  (($#)) && shift
+  case "$sub" in
+    start) cmd_start "$@" ;;
+    stop) cmd_stop ;;
+    psql)
+      check_db "${1:-}"
+      local db="$1"
+      shift
+      check_psql_args "$@"
+      port="$(recorded_port)"
+      role="$(recorded_role)"
+      require_scratch "$port"
+      bin="$(pg_bin)"
+      run_client "$bin/psql" -X -h 127.0.0.1 -p "$port" -U "$role" -d "$db" "$@"
+      ;;
+    createdb | dropdb)
+      check_db "${1:-}"
+      (($# == 1)) || die "$sub takes only a database name"
+      port="$(recorded_port)"
+      role="$(recorded_role)"
+      require_scratch "$port"
+      bin="$(pg_bin)"
+      run_client "$bin/$sub" -h 127.0.0.1 -p "$port" -U "$role" "$1"
+      ;;
+    url)
+      check_db "${1:-}"
+      port="$(recorded_port)"
+      role="$(recorded_role)"
+      echo "postgresql://$role@127.0.0.1:$port/$1"
+      ;;
+    *) die "usage: scratch-pg start [--port N] [--role R] [--extra-role NAME[:member]]... | psql <db> -c <sql> [...] | createdb <db> | dropdb <db> | url <db> | stop" ;;
+  esac
+}
+
+main "$@"

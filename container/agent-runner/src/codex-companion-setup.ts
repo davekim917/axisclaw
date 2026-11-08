@@ -7,6 +7,7 @@
 import { spawnSync, type SpawnSyncReturns } from 'node:child_process';
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
 
 import { loadExcludedPlugins } from './excluded-plugins.js';
 import { isExcludedPluginPath, type ExcludedPlugins } from './plugin-exclusions.js';
@@ -17,11 +18,11 @@ import {
 } from './providers/codex-config-file.js';
 import {
   type AppServer,
-  buildCodexHooksJson,
   listCodexHooks,
   parseTomlTableHeader,
+  readSystemCodexHooks,
   renderCodexMcpServer,
-  writeCodexHooksJson,
+  SYSTEM_CODEX_HOOKS_PATH,
 } from './providers/codex-app-server.js';
 import {
   type CodexHookTrustEntry,
@@ -40,17 +41,24 @@ import {
   syncSkillSymlinks as syncDiscoveredSkillSymlinks,
 } from './plugin-skill-discovery.js';
 import { providerContract } from './providers/contract.js';
+import {
+  FAILED_CODEX_HOME,
+  PENDING_CODEX_HOME,
+  PLUGINS_REGISTERED_MARKER,
+  RUNTIME_CODEX_DIR,
+} from './codex-home-sentinel.js';
 import type { McpServerConfig } from './providers/types.js';
 
 export { readCodexConfigToml };
 
 const HOST_CODEX_DIR = '/home/node/.codex';
-const RUNTIME_CODEX_DIR = '/home/node/.codex-runtime';
-/** Deliberately nonexistent: codex refuses to start on it instead of falling back to the default home. */
-const FAILED_CODEX_HOME = '/nonexistent/codex-runtime-setup-failed';
 const CONTAINER_CLAUDE_SKILLS_DIR = '/home/node/.claude/skills';
 const CONTAINER_PLUGINS_DIR = '/workspace/plugins';
 const CONTAINER_AGENTS_SKILLS_DIR = '/home/node/.agents/skills';
+const DEFERRED_REGISTRATION_CLI = path.join(
+  path.dirname(fileURLToPath(import.meta.url)),
+  'codex-plugin-registration.ts',
+);
 
 /** Parallel implementation of `buildContainerCodexConfig()` in src/providers/codex.ts: keep the two in sync. */
 const CONTAINER_CODEX_CONFIG_BASE = [
@@ -59,8 +67,8 @@ const CONTAINER_CODEX_CONFIG_BASE = [
   'sandbox_mode = "workspace-write"',
   'approval_policy = "on-request"',
   'approvals_reviewer = "auto_review"',
-  'model_context_window = 400000',
-  'model_auto_compact_token_limit = 360000',
+  'model_context_window = 800000',
+  'model_auto_compact_token_limit = 720000',
   'model_reasoning_effort = "high"',
   '',
   '[features]',
@@ -221,8 +229,8 @@ export function projectCodexPluginConfigForTest(primaryToml: string, targetToml:
 }
 
 /**
- * Returning `null` would be a guard bypass: the caller would leave CODEX_HOME at the staged home, which has auth
- * but no guard chain. The sentinel disables only peer Codex; throwing would crash-loop every container under disk
+ * Returning `null` would leave CODEX_HOME unset, and codex would run against the staged home without the runtime's
+ * config or plugin hooks. The sentinel disables only peer Codex; throwing would crash-loop every container under disk
  * pressure.
  */
 function failClosed(what: string, err: unknown): string {
@@ -230,52 +238,61 @@ function failClosed(what: string, err: unknown): string {
   log(
     `FAIL-CLOSED: peer-mode Codex DISABLED for this container — ${what}: ${detail}. ` +
       `CODEX_HOME is set to the nonexistent sentinel ${FAILED_CODEX_HOME}, so \`codex exec\` will refuse ` +
-      `to start rather than run unguarded against the staged ${HOST_CODEX_DIR}. ` +
-      `The primary agent provider is unaffected. Most likely cause: no space / bad permissions on /home/node.`,
+      `to start rather than run against the staged ${HOST_CODEX_DIR}. ` +
+      `The primary agent provider is unaffected.`,
   );
   return FAILED_CODEX_HOME;
+}
+
+/**
+ * The installed guard chain's handler keys. Throws when the image ships no chain: every codex run in the container
+ * would then go unguarded, which a spawn must refuse rather than discover.
+ */
+export function systemGuardHookKeys(systemHooksPath: string = SYSTEM_CODEX_HOOKS_PATH): string[] {
+  const keys = collectCodexHookTrustEntries(systemHooksPath, readSystemCodexHooks(systemHooksPath) ?? undefined).map(
+    (entry) => entry.key,
+  );
+  if (!keys.some((key) => key.startsWith(`${systemHooksPath}:pre_tool_use:`))) {
+    throw new Error(
+      `no Codex guard chain is installed at ${systemHooksPath} (no PreToolUse handler) — this image predates the ` +
+        `system-layer guard chain; rebuild it (./container/build.sh)`,
+    );
+  }
+  return keys;
 }
 
 /**
  * Only plugins `planCodexPluginRegistration` registers are trusted; codex-hook-trust.ts says why plugin hooks are
  * trusted at all.
  */
-function pluginHookTrustEntries(pluginsRoot: string): CodexHookTrustEntry[] {
+function pluginsHookTrustEntries(pluginsRoot: string): CodexHookTrustEntry[] {
   if (!fs.existsSync(pluginsRoot)) return [];
-  const entries: CodexHookTrustEntry[] = [];
-  for (const plan of planCodexPluginRegistration(pluginsRoot)) {
-    if (plan.action !== 'register' || !plan.pluginDir || !plan.entryName || !plan.marketplaceName) continue;
-    entries.push(
-      ...collectPluginHookTrustEntries({
-        pluginId: `${plan.entryName}@${plan.marketplaceName}`,
-        dir: plan.pluginDir,
-      }),
-    );
-  }
-  return entries;
+  return planCodexPluginRegistration(pluginsRoot).flatMap(pluginHookTrustEntries);
 }
 
-/** Shared by the writer and the verifier so the check cannot assert a different key set than was written. */
-function generatedHookTrustEntries(codexHome: string, opts?: { emailGateTimeoutSec?: number }): CodexHookTrustEntry[] {
-  return collectCodexHookTrustEntries(path.join(codexHome, 'hooks.json'), buildCodexHooksJson(opts).hooks);
+function pluginHookTrustEntries(plan: CodexPluginRegistrationPlan): CodexHookTrustEntry[] {
+  if (plan.action !== 'register' || !plan.pluginDir || !plan.entryName || !plan.marketplaceName) return [];
+  return collectPluginHookTrustEntries({ pluginId: `${plan.entryName}@${plan.marketplaceName}`, dir: plan.pluginDir });
 }
 
 /**
- * Throws (refusing the spawn) unless every generated guard handler is dispatchable, including when `hooks/list`
- * itself fails: the failure it catches is silent by construction. Plugin handlers are logged, not fatal.
+ * Throws (refusing the spawn) unless every handler of the installed system guard chain is dispatchable in the
+ * server's home, including when `hooks/list` itself fails: the failure it catches is silent by construction. Plugin
+ * handlers are logged, not fatal.
  */
 export async function verifyCodexHookTrust(
   server: AppServer,
-  codexHome: string,
-  opts?: { emailGateTimeoutSec?: number },
+  opts: { systemHooksPath?: string; codexHome?: string } = {},
 ): Promise<void> {
-  const expected = generatedHookTrustEntries(codexHome, opts).map((entry) => entry.key);
-  if (expected.length === 0) {
-    // buildCodexHooksJson always emits both events, so an empty set must fail rather than pass vacuously.
-    throw new Error(
-      `Codex hook trust verification: derived NO expected handler keys for ${codexHome} — ` +
-        `refusing to spawn an app-server whose guard chain cannot be checked.`,
-    );
+  const systemHooksPath = opts.systemHooksPath ?? SYSTEM_CODEX_HOOKS_PATH;
+  const where = opts.codexHome ? ` under CODEX_HOME ${opts.codexHome}` : '';
+  let expected: string[];
+  try {
+    expected = systemGuardHookKeys(systemHooksPath);
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    log(`FAIL-CLOSED: refusing the spawn: ${detail}`);
+    throw new Error(`Codex hook trust verification failed: ${detail}`);
   }
 
   let listed;
@@ -292,7 +309,7 @@ export async function verifyCodexHookTrust(
 
   const verdict = classifyCodexHookList(listed.entries, expected);
   for (const problem of verdict.plugin) {
-    log(`Non-generated hook will NOT fire (reported, not fatal): ${formatCodexHookTrustProblem(problem)}`);
+    log(`Non-guard hook will NOT fire (reported, not fatal): ${formatCodexHookTrustProblem(problem)}`);
   }
   for (const warning of listed.warnings) log(`hooks/list warning: ${warning}`);
   for (const error of listed.errors) log(`hooks/list error: ${error}`);
@@ -300,29 +317,27 @@ export async function verifyCodexHookTrust(
   if (verdict.generated.length > 0) {
     const detail = verdict.generated.map(formatCodexHookTrustProblem).join('; ');
     log(
-      `FAIL-CLOSED: ${verdict.generated.length} of ${expected.length} generated guard handler(s) in ${codexHome} ` +
-        `would NEVER be dispatched by this codex — ${detail}. ` +
+      `FAIL-CLOSED: ${verdict.generated.length} of ${expected.length} guard handler(s) in ${systemHooksPath} ` +
+        `would NEVER be dispatched by this codex${where} — ${detail}. ` +
         `Refusing the spawn: a Codex session with an inert destructive-action guard is the exact silent ` +
         `state this check exists to make unreachable.`,
     );
-    throw new Error(`Codex hook trust verification failed for ${codexHome}: ${detail}`);
+    throw new Error(`Codex hook trust verification failed for ${systemHooksPath}${where}: ${detail}`);
   }
 
   log(
-    `Hook trust verified live: ${verdict.generatedOk.length} generated guard handler(s) dispatchable in ${codexHome}`,
+    `Hook trust verified live: ${verdict.generatedOk.length} guard handler(s) from ${systemHooksPath} dispatchable${where}`,
   );
 }
 
-/** Idempotent and keyed on the home passed in: safe to re-run after `codex plugin add` or an OAuth rotation. */
-export function syncCodexHookTrust(
-  codexHome: string,
-  opts?: { emailGateTimeoutSec?: number; pluginsRoot?: string },
-): void {
+/**
+ * Trusts the registered plugins' hooks in this home (the guard chain needs no row: codex dispatches the system layer
+ * as managed). Idempotent and keyed on the home passed in: safe to re-run after `codex plugin add` or an OAuth
+ * rotation.
+ */
+export function syncCodexHookTrust(codexHome: string, opts?: { pluginsRoot?: string }): void {
   const configPath = path.join(codexHome, 'config.toml');
-  const entries = [
-    ...generatedHookTrustEntries(codexHome, opts),
-    ...pluginHookTrustEntries(opts?.pluginsRoot ?? CONTAINER_PLUGINS_DIR),
-  ];
+  const entries = pluginsHookTrustEntries(opts?.pluginsRoot ?? CONTAINER_PLUGINS_DIR);
   try {
     fs.mkdirSync(codexHome, { recursive: true });
     // Asserting variant: the trust rows are the one table nothing else can restore.
@@ -332,23 +347,12 @@ export function syncCodexHookTrust(
       codexHookTrustTables(entries),
     );
   } catch (err) {
-    // Must throw: swallowing leaves hooks.json with no trust entry, an inert guard, and callers that spawn anyway.
+    // Must throw: swallowing leaves the plugins' hooks untrusted, and callers that spawn anyway.
     const detail = err instanceof Error ? err.message : String(err);
-    log(`FAILED to write hook trust to ${configPath} — Codex hooks would be UNTRUSTED and never fire: ${detail}`);
+    log(`FAILED to write hook trust to ${configPath} — plugin hooks would be UNTRUSTED and never fire: ${detail}`);
     throw new Error(`could not write Codex hook trust entries to ${configPath}: ${detail}`);
   }
   log(`Hook trust: ${entries.length} entry(ies) written to ${configPath}`);
-}
-
-/** Always call this instead of `writeCodexHooksJson`: a hooks.json without trust entries never runs. */
-export function writeCodexHooksAndTrust(opts?: {
-  emailGateTimeoutSec?: number;
-  codexHome?: string;
-  pluginsRoot?: string;
-}): string {
-  const home = writeCodexHooksJson(opts);
-  syncCodexHookTrust(home, opts);
-  return home;
 }
 
 /**
@@ -367,8 +371,10 @@ export function setupCodexRuntime(
 
   try {
     fs.mkdirSync(RUNTIME_CODEX_DIR, { recursive: true });
+    // The config written below carries no plugin tables, so an earlier registration no longer describes this home.
+    fs.rmSync(path.join(RUNTIME_CODEX_DIR, PLUGINS_REGISTERED_MARKER), { force: true });
   } catch (err) {
-    return failClosed('could not create the runtime dir', err);
+    return failClosed('could not create or reset the runtime dir', err);
   }
 
   const runtimeAuth = path.join(RUNTIME_CODEX_DIR, 'auth.json');
@@ -409,27 +415,23 @@ export function setupCodexRuntime(
     return failClosed('could not write the merged config.toml', err);
   }
 
-  // Peer `codex exec` commands bypass the parent's Bash hook, so the guard chain must be installed before the
-  // runtime is exposed.
+  // Peer `codex exec` commands bypass the parent's Bash hook, so the runtime is exposed only once the image's guard
+  // chain is confirmed installed.
   try {
-    writeCodexHooksAndTrust({ codexHome: RUNTIME_CODEX_DIR });
-  } catch (err) {
-    return failClosed('could not write the peer Codex hooks.json', err);
-  }
-
-  // Must run after config.toml is written: `codex plugin` mutates it in place.
-  registerContainerCodexPlugins(RUNTIME_CODEX_DIR, runtime);
-
-  // Re-sync after registration: `codex plugin add` rewrote config.toml, and new plugins' hooks are reachable only now.
-  try {
+    systemGuardHookKeys();
     syncCodexHookTrust(RUNTIME_CODEX_DIR);
   } catch (err) {
-    return failClosed('could not re-write the peer Codex hook trust after plugin registration', err);
+    return failClosed('the Codex guard chain or the plugin hook trust is not in place', err);
   }
+
+  setupCodexFallbackRuntimes(mcpServers);
 
   // No skills re-sync here: without a runtime arg it would default to 'codex' and strip workflow-agents skills in
   // opencode containers.
-  log(`CODEX_HOME runtime ready at ${RUNTIME_CODEX_DIR} (${Object.keys(mcpServers).length} MCP servers merged)`);
+  log(
+    `CODEX_HOME runtime prepared at ${RUNTIME_CODEX_DIR} (${Object.keys(mcpServers).length} MCP servers merged, ` +
+      `runtime=${runtime}); plugins register on the first codex call`,
+  );
   return RUNTIME_CODEX_DIR;
 }
 
@@ -441,65 +443,184 @@ function replaceWithDirectorySymlink(linkPath: string, targetPath: string): void
 }
 
 /**
+ * The env a non-primary runner exports for the home `setupCodexRuntime` returned. A prepared home is not handed out
+ * yet: CODEX_HOME stays a nonexistent sentinel, and the codex shim and codex-exec.sh run the registration CLI (under
+ * a lock) before every codex call, so no call, whatever home it names, runs before the registration is complete; the
+ * sentinel is then replaced with the registered home.
+ */
+export function codexRuntimeEnv(home: string): Record<string, string> {
+  if (home === FAILED_CODEX_HOME) return { CODEX_HOME: FAILED_CODEX_HOME };
+  return { CODEX_HOME: PENDING_CODEX_HOME, NANOCLAW_CODEX_REGISTER: DEFERRED_REGISTRATION_CLI };
+}
+
+/**
+ * Finishes what `setupCodexRuntime` deferred, once per home: registers the plugins, re-syncs hook trust (`codex
+ * plugin add` rewrites config.toml), and projects the plugin tables into the fallback homes so codex-exec.sh's
+ * hook-parity check can still rotate to them. Throws on any registration or trust failure and writes the marker
+ * only after both succeed, so a failed or partial registration never becomes a home codex runs in.
+ */
+export function completeDeferredCodexRegistration(
+  opts: { home?: string; pluginsRoot?: string; fallbackHomes?: string[]; systemHooksPath?: string } = {},
+): string {
+  const home = opts.home ?? RUNTIME_CODEX_DIR;
+  const marker = path.join(home, PLUGINS_REGISTERED_MARKER);
+  if (fs.existsSync(marker)) return home;
+  if (!fs.existsSync(path.join(home, 'config.toml'))) {
+    throw new Error(`${home} was never prepared at boot (no config.toml), so there is no runtime to run codex in`);
+  }
+  systemGuardHookKeys(opts.systemHooksPath);
+
+  const registration = registerContainerCodexPlugins(home, opts.pluginsRoot);
+  // A plugin without hooks that fails to register costs its skills, not a guard, so only a hooked one refuses.
+  const hooked = new Set(
+    planCodexPluginRegistration(opts.pluginsRoot ?? CONTAINER_PLUGINS_DIR)
+      .filter((plan) => pluginHookTrustEntries(plan).length > 0)
+      .map((plan) => plan.name),
+  );
+  const guardGaps = registration.failed.filter((name) => hooked.has(name));
+  if (guardGaps.length > 0) {
+    throw new Error(
+      `plugin registration failed for ${guardGaps.join(', ')}, whose hooks would not run: ${registration.errors.join('; ')}`,
+    );
+  }
+  syncCodexHookTrust(home, { pluginsRoot: opts.pluginsRoot });
+
+  const fallbackHomes = (opts.fallbackHomes ?? configuredFallbackHomes()).filter((fallback) =>
+    fs.existsSync(path.join(fallback, 'auth.json')),
+  );
+  const projection = projectPluginsIntoFallbacks(home, fallbackHomes, opts.pluginsRoot);
+  for (const error of projection.errors) log(`Codex fallback NOT given the registered plugins: ${error}`);
+
+  fs.writeFileSync(`${marker}.tmp`, `${new Date().toISOString()} ${registration.registered.join(',')}\n`);
+  fs.renameSync(`${marker}.tmp`, marker);
+  log(
+    `Codex plugins registered on first use in ${home}: ${registration.registered.length} registered, ` +
+      `${projection.projected.length} of ${fallbackHomes.length} fallback(s) projected`,
+  );
+  return home;
+}
+
+function configuredFallbackHomes(): string[] {
+  return (process.env.CODEX_FALLBACK_HOMES ?? '')
+    .split(':')
+    .map((home) => home.trim())
+    .filter(Boolean);
+}
+
+/**
+ * Fallback homes share the primary's derived plugin cache through symlinks and take its plugin tables; auth,
+ * rollouts and the rest of their config stay their own. Each home's config.toml carries its own plugin trust rows.
+ */
+function projectPluginsIntoFallbacks(
+  primaryHome: string,
+  fallbackHomes: string[],
+  pluginsRoot?: string,
+): { projected: string[]; errors: string[] } {
+  const projected: string[] = [];
+  const errors: string[] = [];
+  if (fallbackHomes.length === 0) return { projected, errors };
+  const primaryConfigPath = path.join(primaryHome, 'config.toml');
+  let primaryConfig: string;
+  try {
+    primaryConfig = readCodexConfigToml(primaryConfigPath);
+  } catch (err) {
+    // Overwriting a fallback's config with nothing is unrecoverable, so an unreadable primary skips the projection.
+    errors.push(
+      `${primaryConfigPath}: unreadable — skipped projecting it into ${fallbackHomes.length} fallback home(s) ` +
+        `rather than writing an empty config over them: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return { projected, errors };
+  }
+  for (const fallbackHome of fallbackHomes) {
+    try {
+      fs.mkdirSync(fallbackHome, { recursive: true });
+      replaceWithDirectorySymlink(path.join(fallbackHome, 'plugins'), path.join(primaryHome, 'plugins'));
+      replaceWithDirectorySymlink(
+        path.join(fallbackHome, '.tmp', 'marketplaces'),
+        path.join(primaryHome, '.tmp', 'marketplaces'),
+      );
+      writeCodexConfigToml(path.join(fallbackHome, 'config.toml'), (fallbackConfig) =>
+        projectCodexPluginConfig(primaryConfig, fallbackConfig),
+      );
+      syncCodexHookTrust(fallbackHome, { pluginsRoot });
+      projected.push(fallbackHome);
+    } catch (err) {
+      errors.push(`${fallbackHome}: fallback projection failed — ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  return { projected, errors };
+}
+
+/**
+ * A peer's staged fallback is a bare credential, and the rotation wrapper a peer `codex exec` runs through moves only
+ * to a home that dispatches every hook the current one does. So each fallback gets the runtime home's config, plugins
+ * and plugin hook trust; auth and rollouts stay its own. Returns the homes made ready; a failed one is left for the
+ * wrapper to refuse.
+ */
+export function setupCodexFallbackRuntimes(
+  mcpServers: Record<string, McpServerConfig>,
+  fallbackHomes: string[] = configuredFallbackHomes(),
+  runtimeHome: string = RUNTIME_CODEX_DIR,
+): string[] {
+  if (fallbackHomes.length === 0) return [];
+  let runtimeConfig: string;
+  try {
+    runtimeConfig = readCodexConfigToml(path.join(runtimeHome, 'config.toml'));
+  } catch (err) {
+    log(
+      `Codex fallback runtimes NOT set up: ${runtimeHome}/config.toml is unreadable ` +
+        `(${err instanceof Error ? err.message : String(err)}); peer codex exec will not rotate`,
+    );
+    return [];
+  }
+  const ready: string[] = [];
+  for (const home of fallbackHomes) {
+    if (!fs.existsSync(path.join(home, 'auth.json'))) continue;
+    try {
+      replaceWithDirectorySymlink(path.join(home, 'plugins'), path.join(runtimeHome, 'plugins'));
+      replaceWithDirectorySymlink(
+        path.join(home, '.tmp', 'marketplaces'),
+        path.join(runtimeHome, '.tmp', 'marketplaces'),
+      );
+      replaceWithDirectorySymlink(path.join(home, 'agents'), GROUP_CODEX_AGENTS_DIR);
+      writeCodexConfigToml(
+        path.join(home, 'config.toml'),
+        () => projectCodexPluginConfig(runtimeConfig, buildRuntimeConfig(mcpServers)),
+        { readBase: false },
+      );
+      syncCodexHookTrust(home);
+      ready.push(home);
+    } catch (err) {
+      log(
+        `Codex fallback ${home} NOT made a runtime — peer codex exec will not rotate to it: ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+  log(`Codex fallback runtimes ready: ${ready.length} of ${fallbackHomes.length}`);
+  return ready;
+}
+
+/**
  * Fallback homes share the primary's derived plugin cache through symlinks; auth and rollout state stay
  * independent.
  */
 export function setupCodexPrimaryRuntime(
-  fallbackHomes: string[] = (process.env.CODEX_FALLBACK_HOMES ?? '')
-    .split(':')
-    .map((home) => home.trim())
-    .filter(Boolean),
+  fallbackHomes: string[] = configuredFallbackHomes(),
+  roots: { home?: string; pluginsRoot?: string } = {},
 ): { registered: string[]; skipped: string[]; errors: string[]; projectedFallbacks: string[] } {
-  const registration = registerContainerCodexPlugins(HOST_CODEX_DIR, 'codex');
+  const home = roots.home ?? HOST_CODEX_DIR;
+  const registration = registerContainerCodexPlugins(home, roots.pluginsRoot);
   // Recorded, not thrown: the spawn re-derives trust and refuses on failure, so a startup error must not
   // crash-loop the container.
   try {
-    syncCodexHookTrust(HOST_CODEX_DIR);
+    syncCodexHookTrust(home, { pluginsRoot: roots.pluginsRoot });
   } catch (err) {
-    registration.errors.push(
-      `${HOST_CODEX_DIR}: hook trust sync failed — ${err instanceof Error ? err.message : String(err)}`,
-    );
+    registration.errors.push(`${home}: hook trust sync failed — ${err instanceof Error ? err.message : String(err)}`);
   }
-  const projectedFallbacks: string[] = [];
-  const primaryConfigPath = path.join(HOST_CODEX_DIR, 'config.toml');
-  // Unreadable primary: skip the projection, since overwriting a fallback's config with nothing is unrecoverable.
-  const primaryConfig = ((): string | null => {
-    try {
-      return readCodexConfigToml(primaryConfigPath);
-    } catch (err) {
-      registration.errors.push(
-        `${primaryConfigPath}: unreadable — skipped projecting it into ${fallbackHomes.length} fallback home(s) ` +
-          `rather than writing an empty config over them: ${err instanceof Error ? err.message : String(err)}`,
-      );
-      return null;
-    }
-  })();
-
-  const projections = primaryConfig === null ? [] : fallbackHomes.map((home) => [home, primaryConfig] as const);
-
-  for (const [fallbackHome, basePrimaryConfig] of projections) {
-    try {
-      fs.mkdirSync(fallbackHome, { recursive: true });
-      replaceWithDirectorySymlink(path.join(fallbackHome, 'plugins'), path.join(HOST_CODEX_DIR, 'plugins'));
-      replaceWithDirectorySymlink(
-        path.join(fallbackHome, '.tmp', 'marketplaces'),
-        path.join(HOST_CODEX_DIR, '.tmp', 'marketplaces'),
-      );
-
-      const fallbackConfigPath = path.join(fallbackHome, 'config.toml');
-      writeCodexConfigToml(fallbackConfigPath, (fallbackConfig) =>
-        projectCodexPluginConfig(basePrimaryConfig, fallbackConfig),
-      );
-      // Trust entries are keyed on the home's OWN hooks.json path, so the
-      // projection cannot carry the primary's — derive them for this home.
-      syncCodexHookTrust(fallbackHome);
-      projectedFallbacks.push(fallbackHome);
-    } catch (err) {
-      registration.errors.push(
-        `${fallbackHome}: fallback projection failed — ${err instanceof Error ? err.message : String(err)}`,
-      );
-    }
-  }
+  const projection = projectPluginsIntoFallbacks(home, fallbackHomes, roots.pluginsRoot);
+  registration.errors.push(...projection.errors);
+  const projectedFallbacks = projection.projected;
 
   log(
     `Codex-primary plugin runtime: ${registration.registered.length} registered, ` +
@@ -656,18 +777,20 @@ function describeSpawnFailure(result: SpawnSyncReturns<string>): string {
 /** Never throws: one bad plugin must not break container startup, so failures land in `errors`. */
 export function registerContainerCodexPlugins(
   runtimeHome: string,
-  runtime: AgentRuntime,
-): { registered: string[]; skipped: string[]; errors: string[] } {
+  pluginsRoot: string = CONTAINER_PLUGINS_DIR,
+): { registered: string[]; skipped: string[]; failed: string[]; errors: string[] } {
   const registered: string[] = [];
   const skipped: string[] = [];
+  const failed: string[] = [];
   const errors: string[] = [];
 
-  if (!fs.existsSync(CONTAINER_PLUGINS_DIR)) {
-    return { registered, skipped, errors };
+  if (!fs.existsSync(pluginsRoot)) {
+    return { registered, skipped, failed, errors };
   }
 
-  const plans = planCodexPluginRegistration(CONTAINER_PLUGINS_DIR);
+  const plans = planCodexPluginRegistration(pluginsRoot);
   const env = { ...process.env, CODEX_HOME: runtimeHome };
+  const addedMarketplaces = new Set<string>();
 
   for (const plan of plans) {
     if (plan.action === 'skip') {
@@ -675,16 +798,20 @@ export function registerContainerCodexPlugins(
       continue;
     }
 
-    // Monorepo sub-plugins register against their REPO root, not the label path.
-    const dir = path.join(CONTAINER_PLUGINS_DIR, plan.repoName ?? plan.name);
-    const addMarketplace = spawnSync('codex', ['plugin', 'marketplace', 'add', dir], {
-      env,
-      timeout: 60_000,
-      encoding: 'utf-8',
-    });
-    if (addMarketplace.status !== 0) {
-      errors.push(`${plan.name}: marketplace add failed — ${describeSpawnFailure(addMarketplace)}`);
-      continue;
+    // Monorepo sub-plugins register against their REPO root, not the label path, and the repo is added once.
+    const dir = path.join(pluginsRoot, plan.repoName ?? plan.name);
+    if (!addedMarketplaces.has(dir)) {
+      const addMarketplace = spawnSync('codex', ['plugin', 'marketplace', 'add', dir], {
+        env,
+        timeout: 60_000,
+        encoding: 'utf-8',
+      });
+      if (addMarketplace.status !== 0) {
+        failed.push(plan.name);
+        errors.push(`${plan.name}: marketplace add failed — ${describeSpawnFailure(addMarketplace)}`);
+        continue;
+      }
+      addedMarketplaces.add(dir);
     }
 
     const addPlugin = spawnSync('codex', ['plugin', 'add', `${plan.entryName}@${plan.marketplaceName}`], {
@@ -693,6 +820,7 @@ export function registerContainerCodexPlugins(
       encoding: 'utf-8',
     });
     if (addPlugin.status !== 0) {
+      failed.push(plan.name);
       errors.push(`${plan.name}: plugin add failed — ${describeSpawnFailure(addPlugin)}`);
       continue;
     }
@@ -701,12 +829,12 @@ export function registerContainerCodexPlugins(
   }
 
   log(
-    `Container Codex plugin registration (runtime=${runtime}): ` +
+    `Container Codex plugin registration (${runtimeHome}): ` +
       `${registered.length} registered, ${skipped.length} skipped, ${errors.length} errors` +
       (errors.length > 0 ? ` — ${errors.join('; ')}` : ''),
   );
 
-  return { registered, skipped, errors };
+  return { registered, skipped, failed, errors };
 }
 
 /** Codex scans this dir (verified via `codex debug prompt-input`); needed for codex-primary and codex-as-peer. */

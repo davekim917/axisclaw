@@ -466,6 +466,7 @@ def gate_states():
 #     refusedAlertSha / warmupAlertSha / factsStuckAlertSha   :5122-5129, :5145
 #     overrunAlertRunId (+ overrunAlertAt, re-arms)           :5131, :5145-5147
 #     stalledAlertRunId                                       :4783 (checked :4762)
+#     walkCloseAlertSha, a walk PR's head SHA                 poll's walk-PR close
 #   control.json, rate-limited wakes (the timestamp moves on each emission):
 #     leaseFailureWakeAt   coordinator_lease_unavailable     :1463
 #     lastMisconfigWakeAt  gate_misconfigured                :4858
@@ -473,7 +474,7 @@ def gate_states():
 #     preflightWakeAt      pr_preflight_failed               :5245 (cleared :5222)
 PR_LATCHES = {"refusedAlertSha": "pr_migrations_refused", "warmupAlertSha": "pr_warmup_stuck",
               "factsStuckAlertSha": "pr_facts_unavailable", "overrunAlertRunId": "pr_run_overrun",
-              "stalledAlertRunId": "pr_run_stalled"}
+              "stalledAlertRunId": "pr_run_stalled", "walkCloseAlertSha": "pr_walk_close_failed"}
 RUN_KEYED = ("overrunAlertRunId", "stalledAlertRunId")
 CONTROL_LATCHES = {"leaseFailureWakeAt": "coordinator_lease_unavailable",
                    "lastMisconfigWakeAt": "gate_misconfigured", "lastFailureWakeAt": "gate_fetch_failed",
@@ -555,11 +556,16 @@ def alarm_queue():
 # this fire reads it before it may POLL -- the poll being what claims new
 # campaigns (pr_build_settled) and what re-mints a stale one.
 #
-# ANY state but `fresh` refuses the poll: that only delays a campaign, and a
-# campaign claimed with no renewer is the one that dies mid-step. It does NOT
-# touch a run already claimed -- the renewer being down is a risk to that run,
+# ANY state but `fresh` refuses a CLAIM (unless `covered`, below): that only
+# delays a campaign, and a campaign claimed with no renewer is the one that
+# dies mid-step. It does NOT touch a run already claimed -- the renewer being
+# down is a risk to that run,
 # not a verdict on it: it keeps its keepalive stamps and its steps, and the
-# alarm names it. Each state means a different fix, so each has its own alarm:
+# alarm names it. Nor does it stop recovery, which is why the fire still polls
+# `--recovery-only`: a lapsed lease is what fails the renewer's `progress`, and
+# only a same-run recovery re-mints that lease, so refusing the recovery leaves
+# each waiting on the other. Each state means a different fix, so each has its
+# own alarm:
 #   absent      no heartbeat has ever been written: the series was never
 #               created, or every tick fails before it knows the out-dir.
 #               Alarmed only after RENEWER_STALE_SECONDS of absence seen by
@@ -589,6 +595,49 @@ RENEWER_FAILED_STATUS = "renew-failed"
 RENEWER_FAILED_TICKS_LIMIT = 2
 RENEWER_TRIGGER_PREFIX = "controller_renewer_"
 RENEWER_WATCH = ["wrapper", "renewer-watch.json"]
+# A phase-dispatch owner step runs in its own session, so it never holds up
+# this series and every fire keeps stamping its run: the renewer only bridges
+# a gap between fires, which the gate's own windows can cover. A legacy-route
+# owner turn blocks the series for the whole step, so a claim that could take
+# that route still needs the renewer.
+PHASE_DISPATCH_FIRE_GAP_SECONDS = 3600
+
+
+def renewer_coverage(states, claimed, renewed, folded):
+    """(numbers, None) when the renewer is not needed, else (None, reason or None)."""
+    path = CHILD_ENV.get("SMOKE_CONTROLLER_OWNER_DISPATCH_CUTOVER_JSON")
+    if not path:
+        return None, None
+    cut, err = read_json(path)
+    if not (isinstance(cut, dict) and cut.get("enabled") is True and isinstance(cut.get("legacyRuns"), list)):
+        return None, "a new claim could take the legacy route: owner dispatch cutover {}".format(
+            err or "is not enabled")
+    bound = PHASE_DISPATCH_FIRE_GAP_SECONDS
+    rc, out, err = run(["bash", GATE_CMD, "liveness"], 15, GATE_ENV)
+    windows = ctl.last_json_line(out) or {}
+    detail = {"requiredSeconds": bound}
+    for key in ("leaseTtlSeconds", "progressStaleSeconds"):
+        value = windows.get(key)
+        if not (isinstance(value, int) and not isinstance(value, bool)):
+            return None, "the gate did not report its liveness windows: rc={} {}".format(rc, (err or "").strip()[:120])
+        detail[key] = value
+    if min(detail["leaseTtlSeconds"], detail["progressStaleSeconds"]) < bound:
+        return None, "the gate's lease TTL {}s / liveness window {}s are under {}s".format(
+            detail["leaseTtlSeconds"], detail["progressStaleSeconds"], bound)
+    # Any run holding a slot, whoever claimed it, is one this fire's poll may
+    # recover into the controller's hands.
+    held = sorted({st["activeRunId"] for st in states.values() if isinstance(st.get("activeRunId"), str)})
+    for run_id in held:
+        if ctl.owner_route_for(folded, run_id, cut) != "phase-dispatch":
+            return None, "{} would take the legacy owner route".format(run_id)
+    for run_id in claimed:
+        expires = renewed.get(run_id)
+        if expires is None:
+            return None, "this fire's progress stamp for {} did not renew its lease".format(run_id)
+        left = int((expires - now).total_seconds())
+        if left < bound:
+            return None, "the lease renewed for {} runs {}s, under {}s".format(run_id, left, bound)
+    return detail, None
 
 
 def renewer_health():
@@ -651,12 +700,17 @@ def renewer_health():
     return "fresh", detail
 
 
-def renewer_gate(states):
-    """True when this fire may poll. Otherwise records why in the summary and
+def renewer_gate(states, renewed, folded):
+    """True when this fire may claim. Otherwise records why in the summary and
     queues ONE operator alarm per outage (absent: only past its grace)."""
-    state, detail = renewer_health()
+    claimed = sorted(st["activeRunId"] for st in states.values()
+                     if isinstance(st.get("activeRunId"), str) and st.get("activeClaimant") == "controller")
+    covered, uncovered = renewer_coverage(states, claimed, renewed, folded)
+    state, detail = ("covered", covered) if covered else renewer_health()
     summary["renewer"] = dict(detail, state=state)
-    if state == "fresh":
+    if uncovered:
+        summary["renewer"]["notCovered"] = uncovered
+    if state in ("fresh", "covered"):
         try:
             ctl.unlink_contained(OUT, RENEWER_WATCH)
         except (OSError, ctl.ControllerError):
@@ -685,8 +739,6 @@ def renewer_gate(states):
             kept = False
     outage = "@" + want["outageSince"] if kept else ""
     summary["renewer"]["outageSince"] = want["outageSince"]
-    claimed = sorted(st["activeRunId"] for st in states.values()
-                     if isinstance(st.get("activeRunId"), str) and st.get("activeClaimant") == "controller")
     if state == "absent":
         since = since or now
         waited = int((now - since).total_seconds())
@@ -712,6 +764,8 @@ def renewer_gate(states):
         key = "unreadable" + outage
     if claimed:
         reason += "; claimed run(s) at risk of losing their lease on a long owner step: " + ", ".join(claimed)
+    if uncovered:
+        reason += "; the gate lease does not cover it either: " + uncovered
     summary.setdefault("pollSkipped", "claim renewer {}: not claiming".format(state))
     queue_alarm({"schemaVersion": 1, "trigger": RENEWER_TRIGGER_PREFIX + state, "reason": reason,
                  "renewerKey": key, "renewer": dict(detail, state=state), "claimedRuns": claimed}, {})
@@ -833,27 +887,37 @@ def main():
     # -- keep our claims live, then poll (the poll may reclaim a stale run) --------
     tokens = {ob["runId"]: ob["detail"].get("ownerToken") for ob in folded.values()
               if ob.get("kind") == "run" and ob.get("slot") == "claim" and ob.get("state") not in ("done", "abandoned")}
+    renewed = {}
     for st in states.values():
         run_id = st.get("activeRunId")
         if st.get("activeClaimant") == "controller" and tokens.get(run_id) and \
                 tokens[run_id] == st.get("activeLeaseOwner"):
             rc, out, err = run(["bash", GATE_CMD, "progress", run_id, tokens[run_id]], 20, GATE_ENV)
-            if not (ctl.last_json_line(out) or {}).get("ok"):
+            stamp = ctl.last_json_line(out) or {}
+            if not stamp.get("ok"):
                 log("progress stamp for {} failed: {}".format(run_id, (err or out or "").strip()[:120]))
+            elif isinstance(stamp.get("lease"), dict):
+                renewed[run_id] = ctl.parse_iso(stamp["lease"].get("expiresAt"))
     poll = None
     poll_path = None
     # After the keepalive stamps above, so a claimed run is kept live whatever
-    # the renewer's state; before the poll, which is the only thing it gates.
-    renewer_ok = renewer_gate(states)
+    # the renewer's state; before the poll, whose claiming is all it gates.
+    renewer_ok = renewer_gate(states, renewed, folded)
     pending_alarms = alarm_queue()
+    poll_argv = ["bash", GATE_CMD, "poll"]
     if not renewer_ok:
-        pass  # renewer_gate recorded pollSkipped
+        # Past the pending check on purpose: renewer_gate re-queues its own
+        # alarm on every fire of an outage, so that check would refuse this
+        # poll for as long as the outage it exists to clear.
+        summary["pollMode"] = "recovery-only"
+        poll_argv.append("--recovery-only")
     elif pending_alarms:
         # Queued alarms are drained into the journal BEFORE the next poll: a
         # queue that never drains must not let polls keep claiming runs.
         summary["pollSkipped"] = "{} queued gate alarm(s) to drain first".format(len(pending_alarms))
-    else:
-        rc, out, err = run(["bash", GATE_CMD, "poll"], POLL_TIMEOUT, GATE_ENV)
+        poll_argv = None
+    if poll_argv:
+        rc, out, err = run(poll_argv, POLL_TIMEOUT, GATE_ENV)
         poll = ctl.last_json_line(out) if rc is not None else None
         if not isinstance(poll, dict):
             log("gate poll gave no result: rc={} {}".format(rc, (err or "").strip()[:160]))

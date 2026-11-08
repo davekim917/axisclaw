@@ -21,6 +21,7 @@ import {
   type AttentionItem,
   type AttentionSourceEnv,
 } from '../../attention-sources.js';
+import { shownThreadTitle } from '../../generated-title.js';
 import { log } from '../../log.js';
 import type { AgentGroup, SessionMode } from '../../types.js';
 import type { AuthHandler, AuthedRequestContext } from '../router.js';
@@ -29,6 +30,7 @@ import { isSnoozed, readThreadSnoozes } from '../thread-snooze.js';
 import { ASSIGN_DEDUPE_MS, assignmentKey, readItemAssignments, readUserDisplayNames } from '../db/item-assignments.js';
 import { readThreadClosures, type ThreadCloseState } from '../thread-close.js';
 import { requiredConfirmations } from '../thread-close-guard.js';
+import { sessionAskCause } from '../../modules/open-asks/asks.js';
 import {
   deriveContainerStatus,
   readSessionTranscript,
@@ -299,6 +301,7 @@ interface ThreadSessionRow {
   agent_provider: string | null;
   title: string | null;
   title_generated_at: string | null;
+  thread_title: string | null;
   last_active: string | null;
   last_outbound_at: string | null;
   last_outbound_kind: string | null;
@@ -378,6 +381,7 @@ async function selectScopedSessions(
       SELECT s.id, s.agent_group_id, s.messaging_group_id, s.thread_id, s.task_routing_platform_id, s.agent_provider,
              s.title, s.title_generated_at, s.last_active, s.last_outbound_at, s.last_outbound_kind,
              s.archived_at, s.created_at, s.done_proposal,
+             tt.title         AS thread_title,
              t.status         AS attached_task_status,
              t.needs_input    AS attached_task_needs_input,
              t.steer_question AS attached_task_steer_question,
@@ -395,6 +399,7 @@ async function selectScopedSessions(
                WHERE child_session_id IS NOT NULL
                  AND status IN ('pending', 'running')
             ) t ON t.child_session_id = s.id AND t.rn = 1
+   LEFT JOIN thread_titles tt ON tt.thread_id = s.thread_id
        WHERE ${conditions.join(' AND ')}
     ), thread_page AS (
       SELECT thread_key
@@ -406,7 +411,7 @@ async function selectScopedSessions(
     )
     SELECT id, agent_group_id, messaging_group_id, thread_id, task_routing_platform_id, agent_provider,
            title, title_generated_at, last_active, last_outbound_at, last_outbound_kind,
-           archived_at, created_at, done_proposal,
+           archived_at, created_at, done_proposal, thread_title,
            attached_task_status, attached_task_needs_input, attached_task_steer_question
       FROM scoped_sessions
      WHERE thread_key IN (SELECT thread_key FROM thread_page)
@@ -827,22 +832,9 @@ function activityMs(row: ThreadSessionRow): number {
   );
 }
 
-type NeedsOperatorCause = 'task_needs_input' | 'ask_question';
-
-function sessionNeedsOperatorCause(row: ThreadSessionRow): NeedsOperatorCause | null {
-  if (row.attached_task_needs_input === 1) return 'task_needs_input';
-  if (
-    row.last_outbound_kind === 'chat-sdk:ask_question' &&
-    (parseUtcTimestampMs(row.last_active) ?? 0) < (parseUtcTimestampMs(row.last_outbound_at) ?? 0)
-  ) {
-    return 'ask_question';
-  }
-  return null;
-}
-
-/** One predicate shared with {@link sessionNeedsOperatorCause}, so the state gate and the reason can never disagree. */
+/** One predicate shared with {@link sessionAskCause}, so the state gate and the reason can never disagree. */
 function sessionNeedsOperator(row: ThreadSessionRow): boolean {
-  return sessionNeedsOperatorCause(row) !== null;
+  return sessionAskCause(row) !== null;
 }
 
 const ASK_QUESTION_REASON_TEXT = 'The agent asked a question and is waiting for a reply.';
@@ -866,7 +858,7 @@ export function deriveNeedsYouReason(
     return { cause: 'parked_note', text: claim.note, parked_ms: parkedMs };
   }
   for (const row of ordered) {
-    const cause = sessionNeedsOperatorCause(row);
+    const cause = sessionAskCause(row);
     if (cause === 'task_needs_input') {
       return { cause, text: row.attached_task_steer_question?.trim() || TASK_NEEDS_INPUT_REASON_TEXT };
     }
@@ -1081,18 +1073,7 @@ export async function buildThreadList(
       });
     }
 
-    // Titles are generated per session; the freshest wins, falling back to session activity for rows with no
-    // `title_generated_at`.
-    let title: string | null = null;
-    let titleAt = -Infinity;
-    for (const row of ordered) {
-      if (!row.title) continue;
-      const at = parseUtcTimestampMs(row.title_generated_at) ?? activityMs(row);
-      if (at > titleAt) {
-        titleAt = at;
-        title = row.title;
-      }
-    }
+    const title = shownThreadTitle(ordered[0]?.thread_title, ordered, activityMs);
 
     let containerStatus: ContainerStatus = 'unknown';
     for (const row of ordered) {

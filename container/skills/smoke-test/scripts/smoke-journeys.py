@@ -12,6 +12,7 @@ wakes, WHICH journeys a change selects and which changed paths nothing claims.
             [--size light|standard|full] [--run-root <dir>] [--as-of <iso>]
             (changed paths: JSON array on stdin, never argv)
   floor-due <catalogue> <run-root> [--size ...] [--as-of <iso>]
+  core-flows <catalogue>   the review-trigger list: every floor journey plus every `coreFlow: true` one
   pin-run   <run-dir> <gate-pin-file>
   pin-check <pin-file> [--pr <n> --head <sha> --repo-slug <slug>] [--as-path <final path>]
             | --owner <primary-pin-file> ... (the one owning-pin rule) | --candidate (stdin)
@@ -62,6 +63,7 @@ SHOTS_CAP = 8
 JOURNEY_REQUIRED_TEXT = ("title", "proves", "entryPath", "endState", "seed", "restore")
 JOURNEY_KEYS = set(JOURNEY_REQUIRED_TEXT) | {
     "id", "evidence", "steps", "seats", "consumes", "maxIntervalDays", "checkpoints", "captureRecipes",
+    "coreFlow",
 }
 RECIPE_KEYS = {"name", "path", "steps", "finalPath"}
 TOP_KEYS = {"schemaVersion", "journeys", "excludePaths"}
@@ -139,6 +141,9 @@ def catalogue_warnings(cat):
             warnings.append("excludePaths {!r} is a bare top-level or extension-wide wildcard; it hides every such path from every journey -- name the narrow area instead".format(g))
         if not _is_text(reason):
             warnings.append("excludePaths {!r} carries no reason".format(g))
+    for j in cat.get("journeys", []):
+        if j.get("evidence") == "native-manual" and j.get("maxIntervalDays") is not None:
+            warnings.append("journey {}: a native-manual floor journey is due in every campaign, and no agent can walk it, so it goes overdue and blocks; mark it `coreFlow: true` without maxIntervalDays to keep its review trigger".format(j.get("id")))
     rules = _globs.compile_rule_list([g for g, _ in entries])
     for j in cat.get("journeys", []):
         for g in j.get("consumes", []):
@@ -207,6 +212,8 @@ def validate_catalogue(cat):
             errors.append("{}: seats must be a list of strings".format(where))
         if not _text_list(j.get("checkpoints"), allow_empty=evidence != "browser"):
             errors.append("{}: checkpoints must be a list of strings (non-empty for a browser journey)".format(where))
+        if "coreFlow" in j and j["coreFlow"] is not True:
+            errors.append("{}: coreFlow must be true when present".format(where))
         interval = j.get("maxIntervalDays")
         if interval is not None and (
             isinstance(interval, bool) or not isinstance(interval, (int, float)) or interval <= 0
@@ -1150,15 +1157,18 @@ def _without_notes(value):
     return value
 
 
+def _is_core_flow(j):
+    return j.get("maxIntervalDays") is not None or j.get("coreFlow") is True
+
+
 def _floor_view(cat):
-    """The COMPLETE floor entries, by id. Not just the claim: a floor journey
-    whose steps, endState, seed or checkpoints were thinned still "proves" the
-    same sentence while testing less, so every field is the human's call. Dict
-    equality ignores key order; only `_` notes are left out."""
-    return {
-        j["id"]: _without_notes(j)
-        for j in (cat or {}).get("journeys", []) if j.get("maxIntervalDays") is not None
-    }
+    """The COMPLETE floor and core-flow entries, by id. Not just the claim: a
+    floor journey whose steps, endState, seed or checkpoints were thinned
+    still "proves" the same sentence while testing less, so every field is the
+    human's call. A core flow is a review trigger, so dropping or thinning one
+    weakens review the same way. Dict equality ignores key order; only `_`
+    notes are left out."""
+    return {j["id"]: _without_notes(j) for j in (cat or {}).get("journeys", []) if _is_core_flow(j)}
 
 
 def cmd_publish(args):
@@ -1192,7 +1202,7 @@ def cmd_publish(args):
         except (ValueError, UnicodeDecodeError, KeyError, TypeError, AttributeError):
             floor_changed = True
         if floor_changed and not _is_text(args.floor_authority):
-            emit({"ok": False, "error": "this proposal changes floor membership or a floor journey (any field but a `_` note; a first publish that declares floor journeys included); that is a human call -- pass --floor-authority <where it was approved>"}, 1)
+            emit({"ok": False, "error": "this proposal changes floor or core-flow membership, or a floor or core-flow journey (any field but a `_` note; a first publish that declares floor journeys included); that is a human call -- pass --floor-authority <where it was approved>"}, 1)
         _write_atomic(os.path.abspath(args.catalogue), new_raw)
     emit({"ok": True, "catalogue": args.catalogue, "sha256": new_digest, "priorSha256": prior_digest,
           "journeyCount": len(proposed["journeys"]), "floorAuthority": args.floor_authority or None,
@@ -1222,6 +1232,9 @@ def main():
     p.add_argument("run_root")
     p.add_argument("--size", default="standard")
     p.add_argument("--as-of")
+
+    p = sub.add_parser("core-flows")
+    p.add_argument("catalogue")
 
     p = sub.add_parser("pin-run")
     p.add_argument("run_dir")
@@ -1257,6 +1270,14 @@ def main():
         emit({"ok": cat is not None, "sha256": digest, "errors": errors,
               "warnings": catalogue_warnings(cat) if cat else [],
               "journeyCount": len(cat["journeys"]) if cat else 0}, 0 if cat is not None else 1)
+    if args.command == "core-flows":
+        cat, digest, _, errors = load_catalogue(args.catalogue)
+        if cat is None:
+            emit({"ok": False, "errors": errors}, 1)
+        emit({"ok": True, "sha256": digest, "coreFlows": [
+            {"id": j["id"], "title": j["title"], "evidence": j["evidence"],
+             "floor": j.get("maxIntervalDays") is not None, "coreFlow": j.get("coreFlow") is True}
+            for j in sorted(cat["journeys"], key=lambda j: j["id"]) if _is_core_flow(j)]})
     if args.command == "floor-due":
         cat, _, _, errors = load_catalogue(args.catalogue)
         if cat is None:

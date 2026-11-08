@@ -10,6 +10,13 @@ vi.mock('../../container-runner.js', async (importOriginal) => ({
   wakeContainer: vi.fn().mockResolvedValue(undefined),
 }));
 
+// The Claude handler reads the install's .env, whose values win over process.env; a checkout with one must not
+// change what these tests see.
+vi.mock('../../env.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../env.js')>()),
+  readEnvFileMatching: () => ({}),
+}));
+
 vi.mock('../../config.js', async () => {
   const actual = await vi.importActual('../../config.js');
   return {
@@ -29,6 +36,8 @@ import { handleProviderRetryPrimary } from './retry-primary.js';
 import { handleProviderTurnCompleted } from './turn-completed.js';
 import { handleCodexAccountExhausted } from './codex-account.js';
 import { isCodexAccountExhausted } from '../../codex-accounts.js';
+import { handleClaudeAccountExhausted } from './claude-account.js';
+import { claudeTokenFingerprint, isClaudeAccountSpent } from '../../claude-accounts.js';
 
 const GID = 'ag-pf';
 const FOLDER = 'pf-group';
@@ -362,10 +371,86 @@ describe('codex_account_exhausted handler', () => {
     expect(isCodexAccountExhausted(`${HOME}/.codex`)).toBe(false);
   });
 
+  it('holds the mark until the reset the container reported', async () => {
+    const reset = Date.now() + 6 * 60 * 60_000;
+    await handleCodexAccountExhausted(
+      { home: '/home/node/.codex-fallback-1', resetAt: new Date(reset).toISOString() },
+      session,
+    );
+    expect(isCodexAccountExhausted(`${HOME}/.codex-secondary`, reset - 1)).toBe(true);
+    expect(isCodexAccountExhausted(`${HOME}/.codex-secondary`, reset)).toBe(false);
+  });
+
   it('ignores a path that is not one of the group Codex homes', async () => {
     await handleCodexAccountExhausted({ home: `${HOME}/.codex` }, session);
     await handleCodexAccountExhausted({ home: '/home/node/.codex-fallback-2' }, session);
     await handleCodexAccountExhausted({}, session);
     expect(isCodexAccountExhausted(`${HOME}/.codex`)).toBe(false);
+  });
+});
+
+describe('claude_account_exhausted handler', () => {
+  const saved = {
+    primary: process.env.CLAUDE_CODE_OAUTH_TOKEN,
+    second: process.env.CLAUDE_CODE_OAUTH_TOKEN_2,
+  };
+
+  beforeEach(async () => {
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = 'invented-claude-primary';
+    process.env.CLAUDE_CODE_OAUTH_TOKEN_2 = 'invented-claude-second';
+    await initMigratedTestDb();
+    await createAgentGroup({
+      id: GID,
+      name: FOLDER,
+      folder: FOLDER,
+      agent_provider: null,
+      created_at: new Date().toISOString(),
+    });
+    writeConfig({});
+  });
+  afterEach(async () => {
+    for (const [name, value] of [
+      ['CLAUDE_CODE_OAUTH_TOKEN', saved.primary],
+      ['CLAUDE_CODE_OAUTH_TOKEN_2', saved.second],
+    ] as const) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+    await closeDb();
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+  });
+
+  it('marks the reported token until the reported reset', async () => {
+    const reset = new Date(Date.now() + 2 * 60 * 60_000).toISOString();
+    await handleClaudeAccountExhausted(
+      {
+        slot: 'CLAUDE_CODE_OAUTH_TOKEN_2',
+        fingerprint: claudeTokenFingerprint('invented-claude-second'),
+        resetAt: reset,
+      },
+      session,
+    );
+    expect(isClaudeAccountSpent('invented-claude-second')).toBe(true);
+    expect(isClaudeAccountSpent('invented-claude-second', Date.parse(reset))).toBe(false);
+    expect(isClaudeAccountSpent('invented-claude-primary')).toBe(false);
+  });
+
+  it('ignores a token this group no longer forwards, even under a slot name it still uses', async () => {
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = 'invented-claude-primary-b';
+    process.env.CLAUDE_CODE_OAUTH_TOKEN_2 = 'invented-claude-second-b';
+    await handleClaudeAccountExhausted(
+      {
+        slot: 'CLAUDE_CODE_OAUTH_TOKEN_2',
+        fingerprint: claudeTokenFingerprint('invented-claude-replaced'),
+        resetAt: null,
+      },
+      session,
+    );
+    await handleClaudeAccountExhausted({ slot: 'CLAUDE_CODE_OAUTH_TOKEN_2', resetAt: null }, session);
+    await handleClaudeAccountExhausted({}, session);
+    expect(isClaudeAccountSpent('invented-claude-replaced')).toBe(false);
+    expect(isClaudeAccountSpent('invented-claude-primary-b')).toBe(false);
+    expect(isClaudeAccountSpent('invented-claude-second-b')).toBe(false);
   });
 });

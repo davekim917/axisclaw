@@ -1,31 +1,54 @@
 /**
- * Haiku-generated session titles for the inbox board, refreshed by a sweep: each tick picks up to
- * {@link CONCURRENCY_CAP} sessions with no title, or with a title older than the cooldown AND at least
- * REFRESH_MIN_NEW_MESSAGES new messages. A sweep rather than on-write keeps LLM cost bounded; a stale title beats a
- * churning one.
+ * The one generator of titles, Haiku on a sweep. Each tick picks up to {@link CONCURRENCY_CAP} titles to generate:
+ * unsettled threads first (src/thread-title.ts), whose title goes to the thread's row and platform, then a refresh for
+ * a session whose title is older than the cooldown AND behind at least REFRESH_MIN_NEW_MESSAGES new messages, then
+ * sessions with no title. A sweep rather than on-write keeps LLM cost bounded; a stale title beats a churning one.
  */
 import { getDb } from '../db/connection.js';
+import { isTaskThread } from '../db/sessions.js';
+import {
+  listUnsettledThreadsDue,
+  stampThreadTitleTurn,
+  UNSETTLED_ROW_SQL,
+  unsettledSince,
+  type UnsettledThread,
+} from '../db/thread-titles.js';
+import { shownThreadTitle } from '../generated-title.js';
 import { log } from '../log.js';
 import { readSessionInbound, readSessionOutbound, type MessageTailRow } from '../modules/mailbox/index.js';
 import { callHaiku, claudeCliAvailable, listClaudeStructuredCredentialSlots } from '../llm.js';
+import { applyThreadTitle, threadTitleDue, threadTitleLabel } from '../thread-title.js';
+import {
+  inboundTurn,
+  keepUnlessChanged,
+  outboundTurn,
+  TITLE_SYSTEM_PROMPT,
+  titleInput,
+  titlePrompt,
+  type TitleInput,
+  type TitleTurn,
+} from '../title-input.js';
 
 // Candidates per tick. They run one at a time: concurrent bursts from this sweep tripped the keys' rate limits.
 export const CONCURRENCY_CAP = 3;
 export const COOLDOWN_HOURS = 1;
 export const REFRESH_MIN_NEW_MESSAGES = 10;
 const FAILURE_BACKOFF_MINUTES = 15;
-const MAX_MESSAGES_PER_SLICE = 12;
+const AWAITING_REPLY_BACKOFF_MINUTES = 2;
+const REFRESH_SLOTS_PER_TICK = 1;
+const REFRESH_ACTIVE_WITHIN_HOURS = 24;
+const SCAN_ROWS = CONCURRENCY_CAP * 4;
+export const THREAD_SCAN_ROWS = CONCURRENCY_CAP * 16;
+const SLICE_HEAD_ROWS = 12;
+const SLICE_TAIL_ROWS = 24;
+const MAX_THREAD_SESSIONS = 4;
 const HAIKU_MAX_TITLE_CHARS = 60;
 const HAIKU_TIMEOUT_MS = 6000;
-
-const SYSTEM_PROMPT = `Generate a short (≤60 char) plain-text label that captures the topic of the conversation. No quotes, no prefix, no markdown — just the topic.
-
-Good labels: "EXAMPLE-71 rollout fix", "Slack auto-wire debug", "Snowflake credential audit".
-Bad labels: "Conversation about X" (filler), "Here's a label: ..." (preamble), "**bold**" (markdown).`;
 
 interface CandidateRow {
   id: string;
   agent_group_id: string;
+  thread_id: string | null;
   title: string | null;
   title_generated_at: string | null;
   title_basis_seq: number | null;
@@ -80,6 +103,8 @@ function resetCooldownEscalation(): void {
 export function _resetCooldownForTest(): void {
   _cooldownUntilMs = 0;
   _lastCooldownMs = 0;
+  refreshScanOffset = 0;
+  threadScanOffset = 0;
 }
 
 export function _getCooldownStateForTest(): { cooldownUntilMs: number; lastCooldownMs: number } {
@@ -135,29 +160,88 @@ export function postProcessTitle(raw: string): string {
   return s.slice(0, HAIKU_MAX_TITLE_CHARS);
 }
 
-/**
- * Up to `cap` sessions needing a title, gated purely on columns; the new-message threshold is checked per session in
- * `shouldGenerate`.
- */
-async function pickCandidates(cap: number): Promise<CandidateRow[]> {
-  const cooldownIso = new Date(Date.now() - COOLDOWN_HOURS * 3600_000).toISOString();
-  // Gate on `title_generated_at` so a failure-backoff stamp keeps a NULL-title row out. ORDER is load-bearing:
-  // untitled first, then most recently active. Oldest-first picks empty shells that are skipped every tick, starving
-  // every real session forever.
+const CANDIDATE_COLUMNS = 's.id, s.agent_group_id, s.thread_id, s.title, s.title_generated_at, s.title_basis_seq';
+
+function pickUntitled(): Promise<CandidateRow[]> {
+  const nowMs = Date.now();
+  const cooldownIso = new Date(nowMs - COOLDOWN_HOURS * 3600_000).toISOString();
+  // Gate on `title_generated_at` so a failure-backoff stamp keeps a NULL-title row out. ORDER is load-bearing: most
+  // recently active first. Oldest-first picks empty shells that are skipped every tick, starving every real session
+  // forever.
   return getDb().all<CandidateRow>(
-    `SELECT id, agent_group_id, title, title_generated_at, title_basis_seq
-       FROM sessions
-      WHERE status = 'active'
-        AND (title_generated_at IS NULL OR title_generated_at < ?)
-      ORDER BY (title IS NOT NULL), COALESCE(last_active, created_at) DESC
+    `SELECT ${CANDIDATE_COLUMNS}
+       FROM sessions s
+      WHERE s.status = 'active'
+        AND s.title IS NULL
+        AND (s.title_generated_at IS NULL OR s.title_generated_at < ?)
+        AND NOT EXISTS (SELECT 1 FROM thread_titles t WHERE t.thread_id = s.thread_id AND ${UNSETTLED_ROW_SQL})
+      ORDER BY COALESCE(s.last_active, s.created_at) DESC
       LIMIT ?`,
     cooldownIso,
-    cap * 4,
+    ...unsettledSince(nowMs),
+    SCAN_ROWS,
+  );
+}
+
+/**
+ * Where the refresh scan resumes. Most of these rows sit under the new-message floor, which only their session DBs can
+ * tell, so a fixed window would stay full of them and hide every row behind it.
+ */
+let refreshScanOffset = 0;
+
+/**
+ * Where the thread scan resumes. Rows with nothing new stay in the query, so a fixed window would hide every thread
+ * behind them; a page that fills the slots is read again, because its served rows drop out of it.
+ */
+let threadScanOffset = 0;
+
+async function pickRefreshes(): Promise<CandidateRow[]> {
+  const nowMs = Date.now();
+  const rows = await getDb().all<CandidateRow>(
+    `SELECT ${CANDIDATE_COLUMNS}
+       FROM sessions s
+      WHERE s.status = 'active'
+        AND s.title IS NOT NULL
+        AND COALESCE(s.thread_id, '') NOT LIKE 'system:%'
+        AND (s.title_generated_at IS NULL OR s.title_generated_at < ?)
+        AND datetime(s.last_active) >= datetime(?)
+        AND (s.title_generated_at IS NULL OR datetime(s.last_active) > datetime(s.title_generated_at))
+        AND NOT EXISTS (SELECT 1 FROM thread_titles t
+                         WHERE t.thread_id = s.thread_id AND (t.title IS NOT NULL OR ${UNSETTLED_ROW_SQL}))
+      ORDER BY s.last_active DESC
+      LIMIT ? OFFSET ?`,
+    new Date(nowMs - COOLDOWN_HOURS * 3600_000).toISOString(),
+    new Date(nowMs - REFRESH_ACTIVE_WITHIN_HOURS * 3600_000).toISOString(),
+    ...unsettledSince(nowMs),
+    SCAN_ROWS,
+    refreshScanOffset,
+  );
+  refreshScanOffset = rows.length < SCAN_ROWS ? 0 : refreshScanOffset + SCAN_ROWS;
+  return rows;
+}
+
+interface ThreadSession {
+  id: string;
+  agent_group_id: string;
+  thread_id: string;
+  title: string | null;
+  title_generated_at: string | null;
+}
+
+function listThreadSessions(threadId: string): Promise<ThreadSession[]> {
+  return getDb().all<ThreadSession>(
+    `SELECT id, agent_group_id, thread_id, title, title_generated_at
+       FROM sessions
+      WHERE thread_id = ? AND status = 'active'
+      ORDER BY COALESCE(last_active, created_at) DESC
+      LIMIT ?`,
+    threadId,
+    MAX_THREAD_SESSIONS,
   );
 }
 
 interface SliceResult {
-  text: string;
+  turns: TitleTurn[];
   maxSeq: number;
   /**
    * True when no inbound row has `trigger = 1`: the session never woke the agent (e.g. bot notifications into a
@@ -166,20 +250,36 @@ interface SliceResult {
   neverWoken: boolean;
 }
 
+function turnsFrom(
+  sessionId: string,
+  rows: MessageTailRow[],
+  toTurn: (row: MessageTailRow) => TitleTurn | null,
+): TitleTurn[] {
+  return rows.flatMap((row) => {
+    try {
+      return toTurn(row) ?? [];
+    } catch (err) {
+      log.warn('session-title: skipped an unreadable row', { sessionId, seq: row.seq, err });
+      return [];
+    }
+  });
+}
+
 /**
- * The last N inbound and outbound contents in seq order as one prompt slice. `maxSeq` is -1 for an empty slice ("skip
- * for now"). Best-effort: IO failures return an empty slice.
+ * A session's opening rows and its latest ones as title turns. `maxSeq` is -1 for a session with no rows ("skip for
+ * now"). Best-effort: IO failures return an empty slice.
  */
-function readSessionSlice(agentGroupId: string, sessionId: string): SliceResult {
+function readSessionSlice(agentGroupId: string, sessionId: string, threadId: string | null): SliceResult {
   const location = { agentGroupId, sessionId };
 
-  let inboundLines: MessageTailRow[] = [];
-  let outboundLines: MessageTailRow[] = [];
+  let inboundRows: MessageTailRow[] = [];
+  let outboundRows: MessageTailRow[] = [];
+  let outboundTail: MessageTailRow[] = [];
   let neverWoken = false;
 
   try {
     readSessionInbound(location, (mailbox) => {
-      inboundLines = mailbox.listInboundTail(MAX_MESSAGES_PER_SLICE);
+      inboundRows = [...mailbox.listInboundHead(SLICE_HEAD_ROWS), ...mailbox.listInboundTail(SLICE_TAIL_ROWS)];
       // A missing `trigger` column on an old DB fails closed to "has woken": it must never suppress a real title or
       // trip the read-failed warning.
       try {
@@ -196,7 +296,10 @@ function readSessionSlice(agentGroupId: string, sessionId: string): SliceResult 
   }
 
   try {
-    outboundLines = readSessionOutbound(location, (mailbox) => mailbox.listOutboundTail(MAX_MESSAGES_PER_SLICE)) ?? [];
+    readSessionOutbound(location, (mailbox) => {
+      outboundRows = mailbox.listOutboundChatHead(SLICE_HEAD_ROWS, isTaskThread(threadId) ? null : threadId);
+      outboundTail = mailbox.listOutboundTail(1);
+    });
   } catch (err) {
     log.warn('session-title: outbound.db read failed', {
       sessionId,
@@ -204,24 +307,19 @@ function readSessionSlice(agentGroupId: string, sessionId: string): SliceResult 
     });
   }
 
-  const merged = [...inboundLines, ...outboundLines].sort((a, b) => a.seq - b.seq);
-  if (merged.length === 0) return { text: '', maxSeq: -1, neverWoken };
+  return {
+    turns: [...turnsFrom(sessionId, inboundRows, inboundTurn), ...turnsFrom(sessionId, outboundRows, outboundTurn)],
+    maxSeq: Math.max(-1, ...[...inboundRows, ...outboundTail].map((row) => row.seq)),
+    neverWoken,
+  };
+}
 
-  const tail = merged.slice(-MAX_MESSAGES_PER_SLICE);
-  const lines: string[] = [];
-  for (const row of tail) {
-    let text: string;
-    try {
-      const parsed = JSON.parse(row.content) as { text?: unknown; prompt?: unknown; question?: unknown };
-      text = String(parsed.text ?? parsed.prompt ?? parsed.question ?? '').trim();
-    } catch {
-      text = row.content;
-    }
-    if (!text) continue;
-    const prefix = row.kind === 'chat-sdk' || row.kind === 'system' ? 'agent: ' : 'user: ';
-    lines.push(prefix + text.slice(0, 200));
-  }
-  return { text: lines.join('\n'), maxSeq: tail[tail.length - 1]!.seq, neverWoken };
+function threadInput(slice: SliceResult, sessions: ThreadSession[], sessionId: string): TitleInput {
+  const others = sessions.filter((session) => session.id !== sessionId);
+  const turns = others.flatMap(
+    (session) => readSessionSlice(session.agent_group_id, session.id, session.thread_id).turns,
+  );
+  return titleInput([...slice.turns, ...turns], Date.now());
 }
 
 async function persistTitle(sessionId: string, title: string, basisSeq: number, generatedAt: string): Promise<void> {
@@ -238,13 +336,23 @@ async function persistTitle(sessionId: string, title: string, basisSeq: number, 
   );
 }
 
+async function forgetTitleBasis(sessionId: string): Promise<void> {
+  await getDb().run(`UPDATE sessions SET title_basis_seq = NULL WHERE id = ?`, sessionId);
+}
+
+function carryTitleToThread(thread: UnsettledThread, title: string): void {
+  void applyThreadTitle(thread, title)
+    .then((applied) => (applied ? undefined : forgetTitleBasis(thread.session_id)))
+    .catch((err: unknown) => log.warn('session-title: thread title update failed', { err }));
+}
+
 /**
  * Stamps `title_generated_at` so the cooldown predicate hides the row for FAILURE_BACKOFF_MINUTES; otherwise a
  * session that keeps failing is re-picked every tick and starves fresher ones. Never writes a fake `title`: NULL is
  * the truth.
  */
-async function stampFailureBackoff(sessionId: string): Promise<void> {
-  const stamp = new Date(Date.now() - (COOLDOWN_HOURS * 60 - FAILURE_BACKOFF_MINUTES) * 60_000).toISOString();
+async function stampFailureBackoff(sessionId: string, minutes = FAILURE_BACKOFF_MINUTES): Promise<void> {
+  const stamp = new Date(Date.now() - (COOLDOWN_HOURS * 60 - minutes) * 60_000).toISOString();
   await getDb().run(`UPDATE sessions SET title_generated_at = ? WHERE id = ?`, stamp, sessionId);
 }
 
@@ -288,59 +396,117 @@ async function _runSessionTitleSweepLocked(): Promise<{ generated: number; skipp
     return { generated: 0, skipped: 0 };
   }
 
-  const candidates = await pickCandidates(CONCURRENCY_CAP);
-  if (candidates.length === 0) return { generated: 0, skipped: 0 };
-
   let generated = 0;
   let skipped = 0;
   const tasks: Array<() => Promise<TaskOutcome>> = [];
 
-  for (const row of candidates) {
-    if (tasks.length >= CONCURRENCY_CAP) break;
-    const slice = readSessionSlice(row.agent_group_id, row.id);
-    // Empty, contentless, or never-woken session: stamp a backoff so it leaves the candidate pool, or a backlog of
-    // such shells occupies the LIMIT and starves real sessions forever. A stamped shell that later gains content
-    // re-enters after the cooldown.
-    if (slice.maxSeq < 0 || !slice.text || slice.neverWoken) {
+  const titleTask = (
+    sessionId: string,
+    input: string,
+    currentLabel: string | null,
+    basisSeq: number,
+    onTitle?: (title: string) => void,
+  ): (() => Promise<TaskOutcome>) => {
+    return async () => {
       try {
-        await stampFailureBackoff(row.id);
-      } catch {
-        /* stamp failure is non-fatal — next tick will retry */
-      }
-      skipped++;
-      continue;
-    }
-    // Not enough new messages: leave it on its natural cooldown; re-stamping would churn its refresh clock.
-    if (!shouldGenerate(row, slice.maxSeq)) {
-      skipped++;
-      continue;
-    }
-    tasks.push(async (): Promise<TaskOutcome> => {
-      try {
-        const raw = await callTitleBackend(SYSTEM_PROMPT, slice.text);
-        const title = postProcessTitle(raw);
+        const raw = await callTitleBackend(TITLE_SYSTEM_PROMPT, titlePrompt(currentLabel, input));
+        const title = keepUnlessChanged(currentLabel, postProcessTitle(raw));
         if (!title) {
+          await stampFailureBackoff(sessionId);
           skipped++;
-          return { sessionId: row.id, ok: true };
+          return { sessionId, ok: true };
         }
-        await persistTitle(row.id, title, slice.maxSeq, new Date().toISOString());
+        await persistTitle(sessionId, title, basisSeq, new Date().toISOString());
         generated++;
-        return { sessionId: row.id, ok: true };
+        onTitle?.(title);
+        return { sessionId, ok: true };
       } catch (err) {
         try {
-          await stampFailureBackoff(row.id);
+          await stampFailureBackoff(sessionId);
         } catch {
           /* stamp failure is non-fatal — next tick will retry */
         }
         skipped++;
         return {
-          sessionId: row.id,
+          sessionId,
           ok: false,
           transient: isTransientBackendFailure(err),
           errMessage: err instanceof Error ? err.message : String(err),
         };
       }
-    });
+    };
+  };
+
+  const seenThreads = new Set<string>();
+  const threadRows = await listUnsettledThreadsDue(Date.now(), THREAD_SCAN_ROWS, threadScanOffset);
+  for (const thread of threadRows) {
+    if (tasks.length >= CONCURRENCY_CAP) break;
+    if (seenThreads.has(thread.thread_id)) continue;
+    const slice = readSessionSlice(thread.agent_group_id, thread.session_id, thread.thread_id);
+    if (slice.maxSeq < 0 || slice.turns.length === 0 || slice.neverWoken) continue;
+    seenThreads.add(thread.thread_id);
+    if (!threadTitleDue(thread, slice.maxSeq)) continue;
+    const sessions = await listThreadSessions(thread.thread_id);
+    const input = threadInput(slice, sessions, thread.session_id);
+    if (input.awaitingReply) continue;
+    await stampThreadTitleTurn(thread.thread_id, Date.now());
+    tasks.push(
+      titleTask(thread.session_id, input.text, threadTitleLabel(thread), slice.maxSeq, (title) =>
+        carryTitleToThread(thread, title),
+      ),
+    );
+  }
+
+  threadScanOffset =
+    threadRows.length < THREAD_SCAN_ROWS
+      ? 0
+      : tasks.length < CONCURRENCY_CAP
+        ? threadScanOffset + THREAD_SCAN_ROWS
+        : threadScanOffset;
+
+  const stepAside = async (sessionId: string, minutes?: number): Promise<void> => {
+    try {
+      await stampFailureBackoff(sessionId, minutes);
+    } catch {
+      /* stamp failure is non-fatal — next tick will retry */
+    }
+    skipped++;
+  };
+
+  const takeSession = async (row: CandidateRow): Promise<boolean> => {
+    const slice = readSessionSlice(row.agent_group_id, row.id, row.thread_id);
+    // Empty, contentless, or never-woken session: stamp a backoff so it leaves the candidate pool, or a backlog of
+    // such shells occupies the LIMIT and starves real sessions forever. A stamped shell that later gains content
+    // re-enters after the cooldown.
+    if (slice.maxSeq < 0 || slice.turns.length === 0 || slice.neverWoken) {
+      await stepAside(row.id);
+      return false;
+    }
+    // Not enough new messages: leave it on its natural cooldown; re-stamping would churn its refresh clock.
+    if (!shouldGenerate(row, slice.maxSeq)) {
+      skipped++;
+      return false;
+    }
+    const sessions = row.thread_id ? await listThreadSessions(row.thread_id) : [];
+    const input = threadInput(slice, sessions, row.id);
+    if (input.awaitingReply) {
+      await stepAside(row.id, AWAITING_REPLY_BACKOFF_MINUTES);
+      return false;
+    }
+    const label = shownThreadTitle(null, [row, ...sessions], () => 0);
+    tasks.push(titleTask(row.id, input.text, label, slice.maxSeq));
+    return true;
+  };
+
+  let refreshSlots = REFRESH_SLOTS_PER_TICK;
+  for (const row of await pickRefreshes()) {
+    if (refreshSlots === 0 || tasks.length >= CONCURRENCY_CAP) break;
+    if (await takeSession(row)) refreshSlots--;
+  }
+
+  for (const row of await pickUntitled()) {
+    if (tasks.length >= CONCURRENCY_CAP) break;
+    await takeSession(row);
   }
 
   const outcomes: TaskOutcome[] = [];

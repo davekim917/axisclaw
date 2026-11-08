@@ -61,17 +61,42 @@ every field optional and replaces only those filled in; a basic rotation needs b
 Only secret values go in the form. A part that is not secret (a user id, subdomain, account id) belongs in
 chat or config. No step asks the user to encode or join anything themselves.
 
+## Lane tokens (`--reserved-for`)
+
+```
+ncl secrets intake --reserved-for <approved-run-agent> --host-pattern <api-host> --path-pattern <exact path> [--header <h>] [--value-format '<fmt>']
+ncl secrets intake --reserved-for <approved-run-agent> --host-pattern <api-host> --host-wide [--header <h>] [--value-format '<fmt>']
+ncl secrets intake --reserved-for <approved-run-agent> --rotate
+… [--compose basic --field '<id>|<Label>' --field '<secret>|<Label>']   # with any of the above
+… [--entered-by <namespaced user id>]   # with any of the above
+```
+
+An approved-run lane's token is named `<agent> token`, and only that agent may be injected it (`src/reserved-secrets.ts`). `--reserved-for` is how one arrives through the form:
+
+- **Host callers only.** `intake` is open to every caller, so this refusal is the boundary: an agent's request is refused whatever its `cli_scope`.
+- The name comes from the agent, so `--name`, `--groups` and `--workgroups` are refused with it, and so are `--field` and `--compose`, except `--compose basic` with its two fields, for an API that takes HTTP Basic such as an OAuth client's token exchange: the two parts are joined into the one token, sent as `Basic {value}`.
+- **A new token needs `--path-pattern` naming one exact path, with no `*`, unless the operator asks for `--host-wide` by name.** A lane key is usually member-wide on its platform, so the gateway path is a real second limit, and the exact path is the default.
+- **`--host-wide`** stores no path rule. OneCLI reads that as `*`, so the gateway injects the token on every path of that one host, and the card and the form say so. It is for a lane that calls more than one path, whose token is used only by host code and never enters a sandbox: the lane's own allowlist is then the boundary, and nothing at the gateway backs it up. The Render lanes qualify: `render-request.ts` is the whole write policy, and reads go only to listed resources. It is refused without `--reserved-for`, with `--path-pattern`, and with `--rotate`.
+- Only an owner or global admin can enter it, unless `--entered-by` names one more person; the form's one field is labelled with the agent.
+- **`--entered-by <user>`** names the one other person who may enter it, for a key only they can make (on Render, only a workspace Admin can read production connection details). The user must be known to the host and be a scoped admin of an agent group of a target that runs as this agent, so the target entry goes in first; an owner or global admin is refused, since they can already enter it. The card goes to that user's own Slack or Discord DM and nowhere else: with no reachable DM, nothing is posted. They are admitted for that one intake, and only while still an admin of a group that qualified them; no role changes. Rotation works the same way.
+- After the vault write, the host creates the OneCLI agent if it is missing (`ensureOnecliAgent`) and adds the one grant without removing anything the agent holds (`grantOnecliSecretToAgent`). It then checks that the agent, and no other, would be injected it (`tokenHeldOnlyBy`). Only then is the intake `stored`. Any failure on a new token removes it from the vault again, and the intake is `failed`.
+- An exact path injects the token on that one path only, so a lane that calls several needs `--host-wide`: the Render env-var lane calls `/v1/users` and `/v1/services/<id>/env-vars/<key>`. The Snowflake lane polls `/api/v2/statements/<handle>` after a 202, but its documented scope is `/api/v2/statements*`, which this form can't store; a host-wide token would be wider than that scope.
+- A new token is refused if its name reached the vault after the card was posted. If OneCLI kept a create whose answer was lost, the host finds it by name and removes it.
+- `--rotate` replaces only the value; host and path stay as stored, so widening a token means deleting it and asking for a new one. It needs exactly one vault entry by that name, and runs the holder check before the write, so a stray holder never receives the new value, and again after. A check that fails after the write reports the new value stored and runs refused until the stray grant is fixed.
+
 ## Who may enter a secret
 
 - An **owner or global admin**: any intake.
+- The **user an approved-run lane token names with `--entered-by`**: that one intake, new or rotation (see above).
 - An **admin of the requesting agent's group** (`user_roles` scoped admin): that agent's new secrets. Enable a
   user by granting them admin on the group. Plain group members cannot.
-- **Rotation is owner or global admin only.** A rotation changes the value every holder uses, and who holds a
+- **Rotation is owner or global admin only**, apart from a lane token's `--entered-by` user. A rotation changes the value every holder uses, and who holds a
   secret is decided by OneCLI agent grants, some made outside any `container.json` or workgroup declaration —
   so no declaration scan can prove a secret is the workgroup's alone.
 
-Every store by a group admin sends an owner a DM, right after the vault write and before any other follow-up,
-naming who, which secret, the host and the grants — never the value. A failed notice is logged at error. A key
+Every store by a group admin sends an owner a DM, right after the vault write and before any other follow-up. A store
+or rotation by an `--entered-by` user does too, once the lane token's attach and holder checks finish, or when they
+end with the value possibly live. Each notice names who, which secret, the host and the grants — never the value. A failed notice is logged at error. A key
 a group admin stores for their workgroup is used by every agent in it.
 
 An agent's new-secret request goes into its own thread on Slack or Discord, the platforms that open the form.
@@ -87,6 +112,39 @@ clears its button (`clearActions`), since a Discord text edit otherwise keeps th
 
 The **host pattern**: one exact host, no wildcards. The gateway injects the key into any request to that host,
 so a wrong or hostile host gets the key. It is the one decision the form cannot make for you.
+
+## Several hosts, one key
+
+Some APIs take the same key on several hosts. A vault secret has one host, so `--host-pattern` repeats, up to
+four times, and one pasted value is stored once per host as `<name>-1of<n>` … `<name>-<n>of<n>`. Each host is
+listed on the card with the header it will be sent as. `host=format` gives that host its own value format, and
+the others use `--value-format`. The set is stored whole or not at all: if a host's write fails, the secrets
+already written are deleted. If the vault can't confirm what it kept, the intake reports an unknown state and
+says to check by hand; it never claims that nothing was stored. The intake grants every member. `ncl secrets grant`
+takes one vault name at a time, so granting a set later means naming each member.
+`--rotate --name <name>` rotates the whole set with one value, and refuses unless every member from 1 to `n` is
+in the vault exactly once. A partial set never gets a new value, because its hosts would then disagree. A rotation
+that fails partway is reported as partly stored and names the members that already have the new value. A
+member whose update got no answer is reported as unknown, since it may have changed. A
+`--reserved-for` lane token keeps one host.
+
+## A client-credentials pair
+
+A client-credentials integration (`ncl integrations add-client`) needs a new client ID and secret when its key is
+rotated, and the refresher has to read them back, which the vault can't do. So this card writes to the host store
+instead:
+
+```bash
+ncl secrets intake --client-credentials <integration>
+```
+
+Only the host can ask for it, and only for an existing client-credentials integration; it takes no other flag. The
+card goes to an owner's DM on a surface of the integration's own workgroup, and is refused if there is none. Only an
+owner or global admin can fill it in. A token is minted from the new pair first,
+so a pair the token endpoint refuses changes nothing and the integration keeps its current pair. Submit also refuses,
+storing nothing, when the integration no longer has the host and group the card showed; post a new card then. A pair it accepts replaces the
+old one in `data/mcp-oauth/<name>.json` (0600), and the new token reaches the vault straight away, with no restart.
+If anything else goes wrong the outcome is reported as unknown; `ncl integrations list` shows where it landed.
 
 ## Grants
 

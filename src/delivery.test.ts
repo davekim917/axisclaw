@@ -12,13 +12,17 @@ import Database from 'better-sqlite3';
 import fs from 'fs';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
-vi.mock('./container-runner.js', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('./container-runner.js')>()),
-  wakeContainer: vi.fn().mockResolvedValue(undefined),
-  isContainerRunning: vi.fn().mockReturnValue(false),
-  killContainer: vi.fn(),
-  buildAgentGroupImage: vi.fn().mockResolvedValue(undefined),
-}));
+vi.mock('./container-runner.js', async (importOriginal) => {
+  const real = await importOriginal<typeof import('./container-runner.js')>();
+  return {
+    ...real,
+    wakeContainer: vi.fn().mockResolvedValue(undefined),
+    isContainerRunning: vi.fn().mockReturnValue(false),
+    isSessionContainerLive: vi.fn(real.isSessionContainerLive),
+    killContainer: vi.fn(),
+    buildAgentGroupImage: vi.fn().mockResolvedValue(undefined),
+  };
+});
 
 // The 💭 status path below is the live task list's off-switch fallback
 // (NANOCLAW_TASK_LIST=0), so this file pins the switch off to keep covering it;
@@ -47,6 +51,7 @@ vi.mock('./modules/mailbox/ops/delivery.js', async (importOriginal) => {
 
 import { closeDb, createAgentGroup, createMessagingGroup, initMigratedTestDb } from './db/index.js';
 import { getDeliveredIds } from './modules/mailbox/ops/delivery.js';
+import { dispatchSeriesId } from './modules/mailbox/ops/task-dispatch.js';
 import { completeAnsweredPendingRows } from './modules/mailbox/ops/sweep.js';
 import { resolveSession, resolveTaskSession, withMailboxSession, writeSessionMessage } from './session-manager.js';
 import { openInboundDb as openInboundDbAt } from './modules/mailbox/openers.js';
@@ -66,7 +71,7 @@ import {
 } from './delivery.js';
 import { unguarded } from './guard/index.js';
 import { createChannelDeliveryAdapter } from './channels/channel-registry.js';
-import { isContainerRunning } from './container-runner.js';
+import { isSessionContainerLive } from './container-runner.js';
 import { renderWorkOutcome } from './outcome-reporting-schema.js';
 import { onOutboundDelivered, type DeliveredOutbound } from './delivery-events.js';
 import { _clearSecretsForTest, registerSecrets } from './secret-scrubber.js';
@@ -2089,6 +2094,45 @@ describe('keyed thread anchors (content.threadKey, migration 081)', () => {
     expect(row.last_used_at > earlier).toBe(true);
   });
 
+  it.each([
+    [
+      'a keyed post from a dispatched work session is a workstream',
+      dispatchSeriesId('watch/t1'),
+      { threadKey: 't1' },
+      true,
+    ],
+    ['an unkeyed post from a dispatched work session is not', dispatchSeriesId('watch/t1'), {}, false],
+    ['a keyed post from a report series is not', 'report-series-1', { threadKey: 't1' }, false],
+    [
+      'a keyed handoff from a watcher series is a workstream',
+      'watcher-series-1',
+      { threadKey: 't1', reporting: { version: 1, purpose: 'handoff' } },
+      true,
+    ],
+    ['an unkeyed handoff is not', 'watcher-series-1', { reporting: { version: 1, purpose: 'handoff' } }, false],
+    [
+      'a keyed post with another purpose from a watcher series is not',
+      'watcher-series-1',
+      { threadKey: 't1', reporting: { version: 1, purpose: 'reply' } },
+      false,
+    ],
+  ])('%s', async (_, series, key, expected) => {
+    const session = await taskSession(series);
+    seedKey('ag-1', 't1', 'plat-root', now());
+    insertChat('ag-1', session.id, 'out-2', { text: 'the answer', ...key });
+    const seen: unknown[] = [];
+    setDeliveryAdapter({
+      async deliver(_ct, _pid, _tid, _kind, _content, _files, _instance, workstreamThread) {
+        seen.push(workstreamThread);
+        return 'plat-2';
+      },
+    });
+
+    await deliverSessionMessages(session);
+
+    expect(seen.map(Boolean)).toEqual([expected]);
+  });
+
   it('archives a keyed follow-up under the thread it landed in, so read_thread finds it', async () => {
     const session = await taskSession();
     seedKey('ag-1', 'job-a-run-1', 'plat-root', now());
@@ -2575,9 +2619,7 @@ describe('delivery sweep gate — arming rules (A6-A12)', () => {
     // Isolates the live-container bypass: the cache is armed to the CURRENT
     // stat, so the change signal says "nothing moved". The only thing that can
     // cause a poll here is the liveness check — if it were deleted, this test
-    // fails. `isContainerRunning` is authoritative because spawn records its
-    // in-memory entry before the central row is updated, so a swept snapshot
-    // can still read 'stopped' for a container that is already writing.
+    // fails.
     const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
     setDeliveryAdapter({
       async deliver() {
@@ -2603,15 +2645,11 @@ describe('delivery sweep gate — arming rules (A6-A12)', () => {
       },
     });
 
-    // The session row still says stopped — exactly the staleness window.
-    vi.mocked(isContainerRunning).mockReturnValue(true);
-    try {
-      const outcome = await sweepDeliverSession(session, Date.now());
-      expect(outcome).not.toBe('skipped');
-      expect(calls).toHaveLength(1);
-    } finally {
-      vi.mocked(isContainerRunning).mockReturnValue(false);
-    }
+    // The session row still says stopped; the registry says live.
+    vi.mocked(isSessionContainerLive).mockReturnValueOnce(true);
+    const outcome = await sweepDeliverSession(session, Date.now());
+    expect(outcome).not.toBe('skipped');
+    expect(calls).toHaveLength(1);
   });
 
   it('A10 polls when a hot journal exists', async () => {

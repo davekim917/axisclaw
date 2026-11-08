@@ -11,6 +11,11 @@ const SUBSCRIPTION_BLOCKED_PATTERN_BODY =
 export const SUBSCRIPTION_BLOCKED_RE = new RegExp(`^\\s*${SUBSCRIPTION_BLOCKED_PATTERN_BODY}`, 'i');
 export const SUBSCRIPTION_BLOCKED_EMBEDDED_RE = new RegExp(SUBSCRIPTION_BLOCKED_PATTERN_BODY, 'i');
 
+/** The API refused the credential itself. The CLI renders this as a result, so it never arrives as a thrown error. */
+export function isCredentialRejection(record: { is_error?: unknown; api_error_status?: unknown }): boolean {
+  return record.is_error === true && record.api_error_status === 401;
+}
+
 /** Only known account-local failures with no inference are safe to rotate. */
 export function isPreInferenceCredentialFailure(stdout: string): boolean {
   let result: unknown;
@@ -20,7 +25,10 @@ export function isPreInferenceCredentialFailure(stdout: string): boolean {
     return false;
   }
   if (typeof result !== 'object' || result === null || Array.isArray(result)) return false;
-  const record = result as Record<string, unknown>;
+  return isPreInferenceCredentialResult(result as Record<string, unknown>);
+}
+
+export function isPreInferenceCredentialResult(record: Record<string, unknown>): boolean {
   if (record.is_error !== true || typeof record.result !== 'string') return false;
   const usage = record.usage;
   if (typeof usage !== 'object' || usage === null || Array.isArray(usage)) return false;
@@ -29,7 +37,9 @@ export function isPreInferenceCredentialFailure(stdout: string): boolean {
   if (!zeroUsageFields.every((field) => usageRecord[field] === 0)) return false;
   if (!allNumbersZero(usageRecord.output_tokens_details) || !allNumbersZero(usageRecord.server_tool_use)) return false;
   if (!allNumbersZero(record.modelUsage)) return false;
-  return QUOTA_RESULT_RE.test(record.result) || SUBSCRIPTION_BLOCKED_RE.test(record.result);
+  return (
+    isCredentialRejection(record) || QUOTA_RESULT_RE.test(record.result) || SUBSCRIPTION_BLOCKED_RE.test(record.result)
+  );
 }
 
 function allNumbersZero(value: unknown, depth = 0): boolean {

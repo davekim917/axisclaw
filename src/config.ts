@@ -164,6 +164,8 @@ export const CONTAINER_PIDS_LIMIT = Math.max(
   ) || DEFAULT_CONTAINER_PIDS_LIMIT,
 );
 export const ONECLI_URL = process.env.ONECLI_URL || envConfig.ONECLI_URL;
+/** The OneCLI control API (`/v1`). Under OneCLI 2.x it is the api service (port 10256, set via ONECLI_URL) and only `ONECLI_API_KEY` opens it. */
+export const ONECLI_API_BASE = (ONECLI_URL || 'http://127.0.0.1:10254').replace(/\/+$/, '');
 export const ONECLI_API_KEY = process.env.ONECLI_API_KEY || envConfig.ONECLI_API_KEY;
 // The OneCLI secret (name or id) that injects on opencode.ai for a group whose own container.json and workgroup
 // declare none. Unset grants no fleet default.

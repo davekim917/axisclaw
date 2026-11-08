@@ -4,7 +4,7 @@ Issues and pull requests are welcome here.
 
 ## How a contribution lands
 
-Anderton Agent is developed in a private repository, and this one is exported from it every night. A pull request here is not merged here directly:
+AxisClaw is developed in a private repository, and this one is exported from it every night. A pull request here is not merged here directly:
 
 1. You open a pull request on this repository.
 2. The maintainer applies it to the private repository, where it goes through the same CI and review as any other change.

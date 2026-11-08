@@ -1,12 +1,11 @@
 /**
- * The write side of the OneCLI vault. Verified against onecli@1.4.1:
+ * The write side of the OneCLI vault. Verified against OneCLI 1.45.0 and 2.16.0 (same routes on both):
  *
- *   POST   /api/secrets            → 201 `{id, name, …, preview}`
- *   PATCH  /api/secrets/{id}       → 200; a body with only `value` leaves
- *                                    hostPattern, pathPattern and
- *                                    injectionConfig untouched
- *   DELETE /api/secrets/{id}       → 204
- *   PUT    /api/secrets/{id}       → 404
+ *   POST   /v1/secrets            → 201 `{id, name, …, preview}`
+ *   PATCH  /v1/secrets/{id}       → 200; a body with only `value` leaves
+ *                                   hostPattern, pathPattern and
+ *                                   injectionConfig untouched
+ *   DELETE /v1/secrets/{id}       → 204
  *
  * Not the `onecli secrets update` CLI: the value would sit in the process
  * table. `curl` rather than `fetch`: host `fetch` must never traverse the
@@ -14,7 +13,7 @@
  */
 import { execFile } from 'child_process';
 
-import { ONECLI_URL } from './config.js';
+import { ONECLI_API_BASE } from './config.js';
 import { curlConfigEscape, onecliAuthConfigLine, sanitizeCurlFailure } from './onecli-curl.js';
 
 const CURL_CONNECT_TIMEOUT_SECONDS = 2;
@@ -32,10 +31,6 @@ export interface OnecliInjectionSpec {
   headerName: string;
   /** `{value}` is substituted by the gateway. */
   valueFormat: string;
-}
-
-function base(): string {
-  return (ONECLI_URL || 'http://127.0.0.1:10254').replace(/\/$/, '');
 }
 
 /**
@@ -74,8 +69,8 @@ function curlJson(
   path: string,
   body?: unknown,
 ): Promise<{ status: number; body: unknown }> {
-  const label = `${method} /api/${path.replace(/^\//, '')}`;
-  const config = curlConfig(method, `${base()}/api/${path.replace(/^\//, '')}`, body);
+  const label = `${method} /v1/${path.replace(/^\//, '')}`;
+  const config = curlConfig(method, `${ONECLI_API_BASE}/v1/${path.replace(/^\//, '')}`, body);
 
   return new Promise((resolve, reject) => {
     const child = execFile('curl', ['-K', '-'], { encoding: 'utf-8' }, (error, stdout) => {
@@ -115,6 +110,16 @@ function curlJson(
 
 /** Metadata-only listing — the same route `src/onecli-secrets.ts` reads. */
 export async function findOnecliSecretByName(name: string): Promise<OnecliSecretRef | undefined> {
+  return (await findOnecliSecretsByName(name))[0];
+}
+
+/** Every vault entry carrying this name, read fresh; OneCLI does not make names unique. */
+export async function findOnecliSecretsByName(name: string): Promise<OnecliSecretRef[]> {
+  return (await listOnecliSecrets()).filter((row) => row.name === name).map(({ id, name }) => ({ id, name }));
+}
+
+/** Every vault entry's name and host, read fresh; never a value. */
+export async function listOnecliSecrets(): Promise<Array<OnecliSecretRef & { hostPattern: string | null }>> {
   const { status, body } = await curlJson('GET', 'secrets?limit=10000');
   if (status !== 200) throw new Error(`OneCLI secrets list failed with HTTP ${status}`);
   const rows = Array.isArray(body)
@@ -122,11 +127,30 @@ export async function findOnecliSecretByName(name: string): Promise<OnecliSecret
     : Array.isArray((body as { data?: unknown })?.data)
       ? (body as { data: unknown[] }).data
       : [];
+  const found: Array<OnecliSecretRef & { hostPattern: string | null }> = [];
   for (const row of rows) {
-    const r = row as { id?: unknown; name?: unknown };
-    if (typeof r.name === 'string' && r.name === name && typeof r.id === 'string') return { id: r.id, name: r.name };
+    const r = row as { id?: unknown; name?: unknown; hostPattern?: unknown };
+    if (typeof r.name === 'string' && typeof r.id === 'string') {
+      found.push({ id: r.id, name: r.name, hostPattern: typeof r.hostPattern === 'string' ? r.hostPattern : null });
+    }
   }
-  return undefined;
+  return found;
+}
+
+/**
+ * The secret to adopt for `hostPattern`, if any. A value-only PATCH keeps a secret's host, so a same-named secret on
+ * another host would send the new token there; that is refused, and so is one whose host the listing does not show.
+ */
+export async function existingSecretOnHost(name: string, hostPattern: string): Promise<OnecliSecretRef | undefined> {
+  const copies = (await listOnecliSecrets()).filter((row) => row.name === name);
+  const elsewhere = copies.find((row) => row.hostPattern?.toLowerCase() !== hostPattern.toLowerCase());
+  if (elsewhere) {
+    throw new Error(
+      `Vault secret "${name}" injects on ${elsewhere.hostPattern ?? 'an unknown host'}, not ${hostPattern}; delete it or use another secret name.`,
+    );
+  }
+  const first = copies[0];
+  return first && { id: first.id, name: first.name };
 }
 
 /**
@@ -134,7 +158,7 @@ export async function findOnecliSecretByName(name: string): Promise<OnecliSecret
  * is sent only on CREATE, so an adopted secret keeps the matching rule it already serves.
  */
 export async function putOnecliBearerSecret(spec: OnecliInjectionSpec, value: string): Promise<OnecliSecretRef> {
-  const existing = await findOnecliSecretByName(spec.name);
+  const existing = await existingSecretOnHost(spec.name, spec.hostPattern);
   if (existing) {
     await updateOnecliSecretValue(existing, value);
     return existing;
@@ -142,8 +166,14 @@ export async function putOnecliBearerSecret(spec: OnecliInjectionSpec, value: st
   return createOnecliSecret(spec, value);
 }
 
-export async function updateOnecliSecretValue(ref: OnecliSecretRef, value: string): Promise<void> {
-  const { status } = await curlJson('PATCH', `secrets/${encodeURIComponent(ref.id)}`, { value });
+/** With `match`, the secret's host and path move to it with the new value; without, they stay as they are. */
+export async function updateOnecliSecretValue(
+  ref: OnecliSecretRef,
+  value: string,
+  match?: Pick<OnecliInjectionSpec, 'hostPattern' | 'pathPattern'>,
+): Promise<void> {
+  const body = match ? { value, hostPattern: match.hostPattern, pathPattern: match.pathPattern ?? null } : { value };
+  const { status } = await curlJson('PATCH', `secrets/${encodeURIComponent(ref.id)}`, body);
   if (status !== 200) throw new Error(`OneCLI secret update failed with HTTP ${status} for "${ref.name}"`);
 }
 

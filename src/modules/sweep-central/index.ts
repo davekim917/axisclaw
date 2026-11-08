@@ -78,25 +78,12 @@ function registerCentralSweepDuties(): void {
     name: id.T15,
     phase: 'tick:housekeeping',
     order: 80,
-    // Titles sessions lacking one (or with a ≥1h-old title and ≥10 new
-    // messages). Capped at 3 per tick to bound API spend.
+    // Titles young threads, then sessions lacking one (or with a ≥1h-old title
+    // and ≥10 new messages). Capped at 3 per tick to bound API spend.
     run: () => {
       void import('../../dashboard/session-title-sweep.js')
         .then((mod) => mod.runSessionTitleSweep())
         .catch((err) => log.warn('session-title sweep failed', { err }));
-    },
-  });
-
-  registerSweepDuty({
-    name: id.T16,
-    phase: 'tick:housekeeping',
-    order: 90,
-    // Regenerates from the STORED original first_message, never a later
-    // follow-up. Capped at 3/tick so permanently-broken threads can't hog quota.
-    run: () => {
-      void import('../../topic-title.js')
-        .then((mod) => mod.retryPendingThreadTitles())
-        .catch((err) => log.warn('thread-title retry sweep failed', { err }));
     },
   });
 

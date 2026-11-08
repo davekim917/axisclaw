@@ -276,6 +276,23 @@ export function latestInboundMessageId(db: Database.Database): string | null {
   return row?.id ?? null;
 }
 
+export interface DeliveredPost {
+  message_out_id: string;
+  platform_message_id: string;
+}
+
+/** A post's outbound row id is also its archive row's id. */
+export function listDeliveredSince(db: Database.Database, since: string, limit: number): DeliveredPost[] {
+  return db
+    .prepare(
+      `SELECT message_out_id, platform_message_id FROM delivered
+        WHERE status = 'delivered' AND platform_message_id IS NOT NULL AND datetime(delivered_at) >= datetime(?)
+        ORDER BY delivered_at DESC
+        LIMIT ?`,
+    )
+    .all(since, limit) as DeliveredPost[];
+}
+
 /** A session parked on the stale boundary is not idle if something still recurs. */
 export function hasPendingRecurrence(db: Database.Database): boolean {
   return (
@@ -317,6 +334,23 @@ export function listOutboundTail(db: Database.Database, limit: number): MessageT
   return db.prepare(`SELECT ${TAIL_COLUMNS} FROM messages_out ${TAIL_FILTER}`).all(limit) as MessageTailRow[];
 }
 
+const HEAD_FILTER = "content IS NOT NULL AND content <> '' ORDER BY seq ASC LIMIT ?";
+
+export function listInboundHead(db: Database.Database, limit: number): MessageTailRow[] {
+  return db
+    .prepare(`SELECT ${TAIL_COLUMNS} FROM messages_in WHERE kind <> 'system' AND ${HEAD_FILTER}`)
+    .all(limit) as MessageTailRow[];
+}
+
+export function listOutboundChatHead(db: Database.Database, limit: number, threadId: string | null): MessageTailRow[] {
+  return db
+    .prepare(
+      `SELECT ${TAIL_COLUMNS} FROM messages_out
+        WHERE kind = 'chat' AND (? IS NULL OR thread_id = ?) AND ${HEAD_FILTER}`,
+    )
+    .all(threadId, threadId, limit) as MessageTailRow[];
+}
+
 export interface MessageFeedRow {
   seq: number;
   id: string;
@@ -325,6 +359,7 @@ export interface MessageFeedRow {
   platform_id: string | null;
   channel_type: string | null;
   thread_id: string | null;
+  timestamp: string;
   content: string;
 }
 
@@ -341,7 +376,7 @@ function listFeed(db: Database.Database, columns: string, table: string, afterSe
 export function listOutboundFeed(db: Database.Database, afterSeq: number | null, limit: number): MessageFeedRow[] {
   return listFeed(
     db,
-    'seq, id, kind, in_reply_to, platform_id, channel_type, thread_id, content',
+    'seq, id, kind, in_reply_to, platform_id, channel_type, thread_id, timestamp, content',
     'messages_out',
     afterSeq,
     limit,
@@ -352,7 +387,7 @@ export function listOutboundFeed(db: Database.Database, afterSeq: number | null,
 export function listInboundFeed(db: Database.Database, afterSeq: number | null, limit: number): MessageFeedRow[] {
   return listFeed(
     db,
-    'seq, id, kind, NULL AS in_reply_to, platform_id, channel_type, thread_id, content',
+    'seq, id, kind, NULL AS in_reply_to, platform_id, channel_type, thread_id, timestamp, content',
     'messages_in',
     afterSeq,
     limit,
@@ -412,4 +447,36 @@ export function getLatestTaskDeliveryRoute(db: Database.Database): TaskDeliveryR
       )
       .get() as TaskDeliveryRoute | undefined) ?? null
   );
+}
+
+export interface TaskEvent {
+  originSessionId: string | null;
+  prompt: string | null;
+}
+
+/** The newest task row's prompt, and its dispatcher only while every task row in the session names the same one. */
+export function getLatestTaskEvent(db: Database.Database): TaskEvent | null {
+  const row = db
+    .prepare(
+      `SELECT json_extract(content, '$.originSessionId') AS origin, json_extract(content, '$.prompt') AS prompt
+         FROM messages_in WHERE kind = 'task' AND json_valid(content)
+     ORDER BY rowid DESC LIMIT 1`,
+    )
+    .get() as { origin: unknown; prompt: unknown } | undefined;
+  if (!row) return null;
+  const origin = typeof row.origin === 'string' && row.origin ? row.origin : null;
+  const foreign =
+    origin !== null &&
+    db
+      .prepare(
+        `SELECT 1 FROM messages_in WHERE kind = 'task' AND (
+            NOT json_valid(content)
+            OR json_extract(content, '$.originSessionId') IS NOT ?
+          ) LIMIT 1`,
+      )
+      .get(origin) !== undefined;
+  return {
+    originSessionId: foreign ? null : origin,
+    prompt: typeof row.prompt === 'string' ? row.prompt : null,
+  };
 }

@@ -184,15 +184,13 @@ describe('claudeSpawnEnv', () => {
       '-e',
       'NANOCLAW_EFFORT_OVERRIDE=medium',
       '-e',
-      'CLAUDE_CODE_AUTO_COMPACT_WINDOW=600000',
+      'CLAUDE_CODE_AUTO_COMPACT_WINDOW=800000',
       '-e',
       'CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=2',
       '-e',
       'CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS=5',
       '-e',
       'CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL=1h',
-      '-e',
-      'CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1',
       '-e',
       'CLAUDE_CODE_FORK_SUBAGENT=0',
     ]);
@@ -211,14 +209,13 @@ describe('claudeSpawnEnv', () => {
       ANTHROPIC_DEFAULT_SONNET_MODEL: DEFAULT_SONNET_MODEL,
       ANTHROPIC_DEFAULT_HAIKU_MODEL: 'claude-haiku-5-5',
       ANTHROPIC_DEFAULT_FABLE_MODEL: DEFAULT_FABLE_MODEL,
-      CLAUDE_CODE_AUTO_COMPACT_WINDOW: '600000',
+      CLAUDE_CODE_AUTO_COMPACT_WINDOW: '800000',
       CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH: '2',
       CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS: '5',
       CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL: '1h',
-      CLAUDE_CODE_ENABLE_FUNCTION_HOOKS: '1',
       CLAUDE_CODE_FORK_SUBAGENT: '0',
     });
-    expect(env).toHaveLength(22);
+    expect(env).toHaveLength(20);
   });
 
   it('claude_spawn_env_matches_the_live_fleet_baseline', () => {

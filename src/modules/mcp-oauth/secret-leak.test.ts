@@ -99,7 +99,7 @@ vi.mock('child_process', async () => {
       queueMicrotask(() => {
         const isList = record.stdin.includes('--request GET');
         if (gateway.mode !== 'down' && isList) {
-          done(null, `[{"id":"secret-1","name":"Dropbox-MCP-Acme"}]\n200`, '');
+          done(null, `[{"id":"secret-1","name":"Dropbox-MCP-Acme","hostPattern":"mcp.dropbox.com"}]\n200`, '');
         } else if (gateway.mode === 'write-echoes') {
           done(null, `${JSON.stringify({ error: 'rejected', request: record.stdin })}\n500`, '');
         } else {
@@ -183,7 +183,7 @@ describe('a curl failure is rethrown without the command line', () => {
     expect(err).toBeInstanceOf(Error);
     expect(everyRendering(err)).not.toContain(SENTINEL);
     expect((err as Error).message).toBe(
-      'OneCLI GET /api/secrets?limit=10000 failed: curl exit code 7 (could not connect)',
+      'OneCLI GET /v1/secrets?limit=10000 failed: curl exit code 7 (could not connect)',
     );
   });
 });
@@ -197,6 +197,7 @@ describe('a failed refresh publishes nothing sensitive', () => {
       agent_group_id: 'ag-1',
       mcp_url: 'https://mcp.dropbox.com/mcp',
       resource: 'https://mcp.dropbox.com/mcp',
+      grant_type: 'authorization_code',
       authorization_endpoint: 'https://www.dropbox.com/oauth2/authorize',
       token_endpoint: 'https://api.dropboxapi.com/oauth2/token',
       registration_endpoint: null,

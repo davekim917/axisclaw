@@ -182,13 +182,27 @@ progress_ok() {
 progress_at() { jq -r '.activeProgressAt // ""' "$C/state/pr-$PR-state.json"; }
 
 # An owner step that started `age` seconds ago and is being worked right now.
-in_flight_at() { # <started-epoch>
+in_flight_at() { # <started-epoch> [step, default lanes]
+  local step="${2:-lanes}"
   jrec run claim enqueued "$1" '{"origin":"poll-wake","pr":7,"ownerToken":"'"$TOKEN"'"}'
-  jrec owner lanes intent "$1"
-  jrec owner lanes enqueued "$1" '{"brief":"controller/brief-lanes.md","outcome":"brief_written"}'
-  ack lanes
+  jrec owner "$step" intent "$1"
+  jrec owner "$step" enqueued "$1" '{"brief":"controller/brief-'"$step"'.md","outcome":"brief_written"}'
+  ack "$step"
   owner_writes "$1"
 }
+
+# The lanes ceiling is the controller's own lanes SLA, read from it, so the
+# renewer stops exactly when the legacy route calls the step overdue.
+LANES_SLA="$(python3 - "$SCRIPT_DIR/smoke-campaign-controller.py" <<'PY'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("ctl", sys.argv[1])
+ctl = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(ctl)
+print(ctl.owner_step_sla("lanes"))
+PY
+)"
+[[ "$LANES_SLA" =~ ^[0-9]+$ ]] && [ "$LANES_SLA" -gt 3600 ] || {
+  echo "FAIL: the controller has no lanes SLA above the 3600s default: '$LANES_SLA'" >&2; exit 1; }
 
 # One tick with the owner having just written, which is what a working turn
 # looks like between ticks.
@@ -297,7 +311,7 @@ echo "== 4. the ceiling =="
 new_case ceiling
 START="$(/usr/bin/date -u +%s)"
 claim_files "$START"
-in_flight_at "$START"
+in_flight_at "$START" synthesis
 # Ticking normally right up to the ceiling — the lease has to stay live for
 # the boundary to mean anything.
 for OFFSET in 300 600 900 1200 1500 1800 2100 2400 2700 3000 3300 3400; do
@@ -319,11 +333,34 @@ FAKE_CLOCK_OFFSET=4600
 tick
 [ "$(lease_held)" = false ] || fail "the lease must lapse once the ceiling is passed"
 ok
+# A full campaign's lanes step walks every lane and runs for hours, so its
+# ceiling is the controller's lanes SLA. Same shape: renewed while the owner
+# writes, past the old 3600 s, up to that SLA, and left to lapse after it.
+new_case lanes-ceiling
+START="$(/usr/bin/date -u +%s)"
+claim_files "$START"
+in_flight_at "$START"
+for OFFSET in $(seq 600 600 $((LANES_SLA - 600))) $((LANES_SLA - 200)); do
+  FAKE_CLOCK_OFFSET="$OFFSET"
+  tick_working
+  [ "$(field '.data.renewed | length')" = 1 ] || fail "a working lanes step was not renewed at +$OFFSET: $LAST"
+done
+[ "$(lease_held)" = true ] || fail "the lanes lease must still be held just inside its ceiling"
+ok
+FAKE_CLOCK_OFFSET=$((LANES_SLA + 100))
+tick_working
+[ "$(field '.data.renewed | length')" = 0 ] || fail "renewed lanes past its ceiling: $LAST"
+grep -q "past the ${LANES_SLA}s ceiling" <<<"$(field '.data.skipped[0].reason')" ||
+  fail "wrong lanes ceiling reason: $LAST"
+FAKE_CLOCK_OFFSET=$((LANES_SLA + 1000))
+tick
+[ "$(lease_held)" = false ] || fail "the lanes lease must lapse once its ceiling is passed"
+ok
 # The override can only clamp DOWN. 60 is honoured; 99999 is ignored.
 new_case ceiling-override
 START="$(/usr/bin/date -u +%s)"
 claim_files "$START"
-in_flight_at "$START"
+in_flight_at "$START" synthesis
 FAKE_CLOCK_OFFSET=120
 owner_writes
 SMOKE_CONTROLLER_RENEW_CEILING_SECONDS=60 tick
@@ -332,6 +369,24 @@ FAKE_CLOCK_OFFSET=5000
 owner_writes
 SMOKE_CONTROLLER_RENEW_CEILING_SECONDS=99999 tick
 [ "$(field '.data.renewed | length')" = 0 ] || fail "the ceiling was raised above 3600"
+ok
+# The same override clamps the lanes ceiling DOWN, and never raises it.
+new_case lanes-ceiling-override
+START="$(/usr/bin/date -u +%s)"
+claim_files "$START"
+in_flight_at "$START"
+FAKE_CLOCK_OFFSET=120
+owner_writes
+SMOKE_CONTROLLER_RENEW_CEILING_SECONDS=60 tick
+[ "$(field '.data.renewed | length')" = 0 ] || fail "a lowered ceiling was not honoured for lanes"
+FAKE_CLOCK_OFFSET=$((LANES_SLA + 100))
+owner_writes
+SMOKE_CONTROLLER_RENEW_CEILING_SECONDS=99999 tick
+# The lease has lapsed by now, so "renewed nothing" alone would also hold for a
+# raised ceiling refused by the gate; the skip reason is the ceiling's own.
+[ "$(field '.data.renewed | length')" = 0 ] || fail "the lanes ceiling was raised above $LANES_SLA"
+grep -q "past the ${LANES_SLA}s ceiling" <<<"$(field '.data.skipped[0].reason')" ||
+  fail "a 99999 override must leave the lanes ceiling at $LANES_SLA: $LAST"
 ok
 
 echo "== 5. no owner turn holds the step =="
@@ -577,7 +632,7 @@ ok
 new_case env-cannot-clobber-internals
 START="$(/usr/bin/date -u +%s)"
 claim_files "$START"
-in_flight_at "$START"
+in_flight_at "$START" synthesis
 write_env live "export CEILING_MAX='9999'" "export NOW='not-a-timestamp'" \
   "export JOURNAL='/nonexistent/journal.ndjson'" "export RESULT_RENEWED='[\"forged\"]'"
 FAKE_CLOCK_OFFSET=3700

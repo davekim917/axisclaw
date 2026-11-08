@@ -129,7 +129,15 @@ synthesis() { # verdict [jq-merge]
 # owner acks every brief it finds, as the router's first act.
 VERDICT=GO
 FINDING=""   # a confirmed finding id on lane B1 (non-blocking, dispositioned)
+# Each write in the world carries its tick's time, as a real owner's would:
+# the controller reads owner liveness from run-tree mtimes against its --now.
 world() { # tick
+  local at
+  at="$(tick_time "$1")"
+  world_writes "$1"
+  [ ! -d "$R" ] || find "$R" -type f -newermt "$at" -exec touch -d "$at" {} +
+}
+world_writes() { # tick
   local n="$1" b
   for b in "$R"/controller/brief-*.md; do
     [ -e "$b" ] && [ ! -e "${b%.md}.ack" ] && : >"${b%.md}.ack"
@@ -137,13 +145,14 @@ world() { # tick
   # SETTLE="intake lanes ...": on the phase-dispatch route, each named owner
   # step's session settles once the artifact it owes is on disk -- a tick
   # after the owner writes it, as a real session ends after its last write.
-  # A step it does not name never settles.
+  # A step it does not name never settles. STOPPED_OWNER=k: the lanes owner's
+  # session ends at tick k with no marker written.
   if [ -n "${SETTLE:-}" ]; then
     local st="{}" s
     for s in $SETTLE; do
       case "$s" in
         intake) [ -e "$R/completion-contract.json" ] ;;
-        lanes) [ -e "$R/markers/B1.json" ] ;;
+        lanes) [ -e "$R/markers/B1.json" ] || [ "$n" -ge "${STOPPED_OWNER:-99}" ] ;;
         preliminary) [ -e "$R/coordinator/preliminary.md" ] ;;
         *) false ;;
       esac && st="$(jq -c --arg s "$s" '.[$s]="settled"' <<<"$st")"
@@ -154,6 +163,13 @@ world() { # tick
   # the owner has done.
   if [ -n "${LATE_DISPOSITION:-}" ] && [ "$n" -ge "$LATE_DISPOSITION" ]; then
     mkdir -p "$R/challenger"; printf 'late\n' >"$R/challenger/disposition.md"
+    # LATE_CONCLUSION=<disposition>: it also says what the challenger concluded.
+    [ -z "${LATE_CONCLUSION:-}" ] || jq -cn --arg d "$LATE_CONCLUSION" \
+      '{schemaVersion:1,lane:"challenger",status:"completed",disposition:$d}' >"$R/challenger/challenge.complete.json"
+  fi
+  # STATUS_UNREADABLE_AT=k: from tick k the host cannot say how an owner is doing.
+  if [ -n "${STATUS_UNREADABLE_AT:-}" ] && [ "$n" -ge "$STATUS_UNREADABLE_AT" ]; then
+    jq -cn '{"ncl:get":[range(40) | "fail-before"]}' >"$C/fake/faults.json"
   fi
   # STALL=k: the owner sits on the lanes step k ticks longer (past the SLA).
   if [ -n "${STALL:-}" ] && [ "$n" -ge 3 ]; then
@@ -171,6 +187,8 @@ world() { # tick
       >"$R/controller/root-summary.md"
   fi
   [ "$n" -ge 2 ] || return 0
+  # ONE_MARKER: a first lane has finished, and no other.
+  [ -z "${ONE_MARKER:-}" ] || marker A1 1 pass
   # The critic answers only if its one-shot task was actually created (shadow
   # assumes every create, as its controller does).
   if [ ! -e "$R/contact-sheet/critic.json" ] && { [ "$MODE" = shadow ] \
@@ -636,11 +654,27 @@ fi
 if smoke_case 5b-owner-overdue; then
 # --- 5b. an alarm raised mid-run is receipted, and does not hold GO --------------
 new_case owner-overdue
-STALL=8 DEADLINE=2026-09-18T14:00:00Z campaign 20
+STALL=20 DEADLINE=2026-09-18T15:30:00Z campaign 34
 jr '[.[] | select(.kind=="send" and (.slot|startswith("alarm:overdue:")) and .state=="delivered")] | length == 1' \
   | grep -qx true || fail "the overdue alarm is receipted once its delivery row exists"
 [ "$(finish_verdict)" = '"GO"' ] || fail "a late-but-complete owner step still finishes GO: $(finish_verdict) $(dq '[.[]|select(.type=="finish")]')"
 alarm_raised overdue alarm:overdue:
+unset STALL
+
+fi
+if smoke_case 5d-lanes-dispatch-sla; then
+# --- 5d. phase-dispatch route: a lanes step is overdue only past its own SLA ----
+# A full campaign walks every lane in one lanes step, which takes hours. About
+# 90 minutes in, its dispatch is not alarmed; past the lanes SLA it is, once.
+new_case lanes-dispatch-sla-inside
+OWNER_DISPATCH=1 SETTLE="intake lanes preliminary" STALL=8 DEADLINE=2026-09-18T14:00:00Z campaign 20
+jr '[.[] | select(.kind=="send" and .slot=="alarm:owner-dispatch:lanes")] | length == 0' | grep -qx true \
+  || fail "a lanes step dispatched about 90 minutes ago is not overdue: $(jr '[.[] | select(.kind=="send" and (.slot|startswith("alarm:")))]')"
+new_case lanes-dispatch-sla-past
+OWNER_DISPATCH=1 SETTLE="intake lanes preliminary" STALL=20 DEADLINE=2026-09-18T15:30:00Z campaign 34
+alarm_raised "lanes dispatch past its SLA" alarm:owner-dispatch:lanes
+jr '[.[] | select(.kind=="send" and .slot=="alarm:owner-dispatch:lanes" and .state=="intent" and .attempt==null)] | length == 1' \
+  | grep -qx true || fail "a lanes step past its SLA is alarmed exactly once: $(jr '[.[] | select(.slot=="alarm:owner-dispatch:lanes")]')"
 unset STALL
 
 fi
@@ -1027,7 +1061,7 @@ OVERDUE="alarm:overdue:$(key "$RUN" owner lanes | cut -c1-12)"
 for point in "before-intent:send:$OVERDUE" "after-intent:send:$OVERDUE"; do
   smoke_case "10-overdue-alarm-${point%%:*}" || continue
   new_case "overdue-alarm-${point%%:*}"
-  STALL=8 DEADLINE=2026-09-18T14:00:00Z CRASH="$point" campaign 20
+  STALL=20 DEADLINE=2026-09-18T15:30:00Z CRASH="$point" campaign 34
   one_alarm "owner overdue, killed ${point%%:*}" "$OVERDUE"
   [ "$(finish_verdict)" = '"GO"' ] || fail "owner overdue: a late-but-complete step still finishes GO: $(finish_verdict)"
 done
@@ -1063,7 +1097,7 @@ transition() { # name
     dispatch-ambiguous) CRASH=after-intent:dispatch:critic campaign 10 ;;
     dispatch-failed)    jq -cn '{"ncl:create":["refuse"]}' >"$C/fake/faults.json"; campaign 10 ;;
     gate-refused)       jq -cn '{"gate:finish":["refuse"]}' >"$C/fake/faults.json"; FINDING=F1 campaign 12 ;;
-    overdue)            STALL=8 DEADLINE=2026-09-18T14:00:00Z campaign 20; unset STALL DEADLINE ;;
+    overdue)            STALL=20 DEADLINE=2026-09-18T15:30:00Z campaign 34; unset STALL DEADLINE ;;
     released)           claim; wake_json
                         inputs_from_fakes; step_ok "$(tick_time 0)" --poll-json "$C/wake.json"
                         jq -c '.activeRunId=null | .activeLeaseOwner=null | .activeClaimant=null' \
@@ -1396,19 +1430,19 @@ cite() { # <file> <line> <literal substring the cited line must contain>
     || fail "controller-owner-router.md cites $1:$2 for \"$3\", but that line is: ${got:-<absent>}"
 }
 ROUTER="$SCRIPT_DIR/../references/controller-owner-router.md"
-for c in 'smoke-pr-gate.sh:5673' 'smoke-campaign-controller.py:1778-1780' \
-         'smoke-run-scaffold.sh:270-272' 'smoke-campaign-controller.py:1767-1777'; do
+for c in 'smoke-pr-gate.sh:5738' 'smoke-campaign-controller.py:1805-1807' \
+         'smoke-run-scaffold.sh:270-272' 'smoke-campaign-controller.py:1794-1804'; do
   grep -Fq "$c" "$ROUTER" || fail "router doc no longer cites $c"
 done
-cite smoke-pr-gate.sh 5673 'OWNER_TOKEN="$(new_owner_token'
-cite smoke-pr-gate.sh 5702 'lease_acquire "$RUN_ID" "$OWNER_TOKEN"'
-cite smoke-pr-gate.sh 5707 'bind_pr_authority "$W_PR" "$RUN_ID" "$OWNER_TOKEN"'
-cite smoke-pr-gate.sh 5755 '.activeLeaseOwner=$owner'
+cite smoke-pr-gate.sh 5738 'OWNER_TOKEN="$(new_owner_token'
+cite smoke-pr-gate.sh 5767 'lease_acquire "$RUN_ID" "$OWNER_TOKEN"'
+cite smoke-pr-gate.sh 5772 'bind_pr_authority "$W_PR" "$RUN_ID" "$OWNER_TOKEN"'
+cite smoke-pr-gate.sh 5820 '.activeLeaseOwner=$owner'
 cite smoke-run-scaffold.sh 271 '[ "$owner" = "$DEFAULT_OWNER" ]'
 cite smoke-run-scaffold.sh 710 'adds NO new authority check of its own'
-cite smoke-campaign-controller.py 1723 'def _owner_wake'
-cite smoke-campaign-controller.py 1773 'os.unlink("brief-{}.ack"'
-cite smoke-campaign-controller.py 1778 'if c.get("wake"):'
+cite smoke-campaign-controller.py 1750 'def _owner_wake'
+cite smoke-campaign-controller.py 1800 'os.unlink("brief-{}.ack"'
+cite smoke-campaign-controller.py 1805 'if c.get("wake"):'
 
 
 fi
@@ -2801,5 +2835,47 @@ jr '[.[] | select(.kind=="gate" and .state=="failed_terminal")] | length == 0' |
 unset SMOKE_GATE_HOLD_FILE
 
 fi
+# --- 30. no lane finished by the deadline and the challenger filed ---------------
+# smoke-controller-reclaim-loop.test.sh replays the incident through the real
+# gate. This is the decision itself, row by row: `no-lane-work` needs a filed
+# disposition, a passed deadline, no marker, and positive evidence that nothing
+# is running. Anything short of that keeps the slot.
+no_lane_row() { # name ends|keeps
+  new_case "no-lane-$1"
+  LATE_DISPOSITION=2 STALL=30 DEADLINE="${DEADLINE:-2026-09-18T10:25:00Z}" campaign 10
+  if [ "$2" = ends ]; then
+    [ "$(finish_verdict)" = '"BLOCKED"' ] || fail "no-lane-$1: ends BLOCKED: $(finish_verdict) $(jr '[.[]|select(.kind=="gate")]')"
+    jr '[.[] | select(.kind=="gate" and .state=="done") | .slot] == ["finish"]' | grep -qx true \
+      || fail "no-lane-$1: finish carries it: $(jr '[.[] | select(.kind=="gate")]')"
+    dq '[.[] | select(.type=="finish")] | last | .failedChecks | length == 1 and (.[0] | startswith("no-lane-work: "))' \
+      | grep -qx true || fail "no-lane-$1: named no-lane-work: $(dq '[.[] | select(.type=="finish")]')"
+    [ ! -e "$R/synthesis.json" ] || fail "no-lane-$1: nothing is concluded for the owner"
+  else
+    jr '[.[] | select(.kind=="verdict" or .kind=="gate")] | length == 0' | grep -qx true \
+      || fail "no-lane-$1: keeps its slot, with no verdict: $(jr '[.[] | select(.kind=="verdict" or .kind=="gate")]')"
+    jq -e --arg run "$RUN" '.activeRunId == $run' "$C/state/pr-$PR-state.json" >/dev/null || fail "no-lane-$1: keeps its slot"
+  fi
+}
+for row in blocked-owner-running clear-owner-settled clear-owner-running clear-status-unreadable clear-brief-route \
+    blocked-with-marker blocked-before-deadline blocked-no-contract clear-no-contract; do
+  smoke_case "30-no-lane-$row" || continue
+  case "$row" in
+    blocked-owner-running)   OWNER_DISPATCH=1 SETTLE=intake LATE_CONCLUSION=BLOCKED no_lane_row "$row" ends ;;
+    clear-owner-settled)
+      # The lanes owner is admitted at 10:30, before this deadline, and settles.
+      OWNER_DISPATCH=1 SETTLE="intake lanes" STOPPED_OWNER=4 DEADLINE=2026-09-18T10:35:00Z LATE_CONCLUSION=CLEAR \
+        no_lane_row "$row" ends ;;
+    clear-owner-running)     OWNER_DISPATCH=1 SETTLE=intake LATE_CONCLUSION=CLEAR no_lane_row "$row" keeps ;;
+    clear-status-unreadable)
+      OWNER_DISPATCH=1 SETTLE="intake lanes" STOPPED_OWNER=4 DEADLINE=2026-09-18T10:35:00Z LATE_CONCLUSION=CLEAR \
+        STATUS_UNREADABLE_AT=4 no_lane_row "$row" keeps ;;
+    clear-brief-route)       LATE_CONCLUSION=CLEAR no_lane_row "$row" keeps ;;
+    blocked-with-marker)     OWNER_DISPATCH=1 SETTLE=intake ONE_MARKER=1 LATE_CONCLUSION=BLOCKED no_lane_row "$row" keeps ;;
+    blocked-before-deadline) OWNER_DISPATCH=1 SETTLE=intake DEADLINE=2026-09-18T14:00:00Z LATE_CONCLUSION=BLOCKED no_lane_row "$row" keeps ;;
+    blocked-no-contract)     NO_CONTRACT=1 LATE_CONCLUSION=BLOCKED no_lane_row "$row" ends ;;
+    clear-no-contract)       NO_CONTRACT=1 LATE_CONCLUSION=CLEAR no_lane_row "$row" keeps ;;
+  esac
+done
+
 smoke_cases_done
 echo "smoke campaign controller live tests passed"

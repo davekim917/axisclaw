@@ -431,6 +431,8 @@ def ncl(argv):
         return "dispatched", ncl_out({"ok": True, "data": {"admission": admission, "row_id": rid,
                                                        "session_id": rows["rows"][rid]["session"]}})
     if argv[:2] == ["tasks", "get"]:
+        if fault("ncl:get") == "fail-before":
+            return "fail", ncl_out({"ok": False, "error": {"message": "injected"}}, 1)
         row = load("dispatch.json", {"rows": {}})["rows"].get(opt(argv, "--id"))
         if row is None:
             return "unknown-row", ncl_out({"ok": False, "error": {"message": "no such row"}}, 1)
@@ -517,7 +519,13 @@ def gate(argv):
         if verb == "progress":
             st["activeProgressAt"] = now_iso()
             write(p, st)
-            return "progress", out({"ok": True, "runId": run})
+            ttl = os.environ.get("SMOKE_GATE_LEASE_TTL_SECONDS", "")
+            ttl = int(ttl) if re.fullmatch(r"0|[1-9][0-9]{0,17}", ttl) else 900
+            if f and f.startswith("lease-seconds:"):
+                ttl = int(f.split(":", 1)[1])
+            expires = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + ttl))
+            return "progress", out({"ok": True, "runId": run, "pr": st.get("pr"), "leaseRenewed": True,
+                                    "lease": {"runId": run, "expiresAt": expires}})
         if verb == "challenger-start":
             # The real verb's order and refusal codes (smoke-pr-gate.sh
             # challenger-start): a final start (confirmed, or one with no

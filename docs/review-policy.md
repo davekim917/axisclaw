@@ -22,7 +22,12 @@ what the bot says.
 
 ## Review availability
 
-A valid review is evidence; a silent or unavailable provider is not. When the
+A valid review is evidence; a silent or unavailable provider is not. A
+connector's thumbs-up or "no major issues" comment is the same kind of silence:
+it shows Codex did not object, not what it read. A `review`-verdict head needs a
+written review on that head, either a Codex review carrying a finding or a
+substitute receipt, and `merge-check` refuses without one (`review_not_written`).
+When the
 authenticated GitHub Codex connector reports its code-review usage limit for
 the current head, or its bounded foreground wait expires, immediately use an
 already accepted independent review route. Do not wait for a human quota reset
@@ -344,6 +349,22 @@ hides; a list kept in sync by hand; internals a caller can import; a format
 or assumption two modules must both know; code split by when it runs rather
 than by what it owns.
 
+On any PR, fix or feature, a timer that waits for a completion something
+already signals is one of these shapes: a poll, a cron or scheduled task, a
+sleep-and-check or retry-until-done loop, where the producer emits, or could
+be made to emit, an event, callback, webhook, status or message the consumer
+could be driven by. The owning primitive the finding names is that signal,
+or the producer to change. A timer whose job is time itself (a daily report,
+a TTL, a reconcile that catches out-of-band changes no event covers) is not
+a finding when the PR states that reason. Like the rest of this class, the
+finding stays below P1 and blocks only when the timer is destructive.
+
+On any PR, fix or feature, a new warehouse, compute pool or runner for one
+job where an existing one fits is one of these shapes, a second system. The
+finding names the existing one. A new one is not a finding when the PR
+states a reason the existing one cannot serve: a different cost owner to
+isolate, a size it cannot take, or a security boundary.
+
 Some always resolve to a check, never a note. A list kept in sync by hand
 gets a test that derives one from the other or fails when they disagree;
 importable internals get an import restriction that fails the build; a
@@ -371,6 +392,31 @@ changes. Typecheck and lint pass on changed behaviour, so they are not a
 pin. It weakens no assertion, case or fixture, and if the diff does not
 reduce what a reader must hold to change that code, it is reverted, not
 merged.
+
+## Bolted-on features
+
+On a feature PR (`feat:`), not a fix, the reviewer asks one question: would
+this code look like this if the feature had been in the original design? A
+feature added beside the design rather than into it is a candidate finding
+under the workaround class above, with the same burden and severity. Shapes
+to look for:
+
+- a special-case `if (newKind)` branch in code that already dispatches on
+  kind;
+- a flag or boolean duplicating what a type or discriminant already encodes;
+- a near-copy of a file, component or function for one variant;
+- an alias or local re-deriving a value the code already has;
+- a second system beside an existing one: logger, counter, retry, config
+  reader, tracker;
+- a test that only pins the workaround: it asserts the bolted-on path
+  stays separate, not a behaviour a fold-in must keep (that pin is the
+  stewardship rule above, and it stays).
+
+Each finding names the existing helper, type or system the feature folds
+into; one that cannot name it is taste, not a finding. A fold-in that
+changes an existing test states the contract change it makes; one that only
+weakens a test to pass is rejected. The check reads repository code (the
+existing system usually lives outside the diff), never production data.
 
 ## Reporting shape
 

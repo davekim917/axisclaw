@@ -12,19 +12,25 @@ import { getDb } from './connection.js';
  */
 export type McpOAuthStatus = 'pending' | 'active' | 'needs_login' | 'error';
 
+/** `client_credentials`: the host mints tokens from a held client id and secret, with no login or redirect. */
+type McpOAuthGrantType = 'authorization_code' | 'client_credentials';
+
 export interface McpOAuthIntegration {
   name: string;
   agent_group_id: string;
   mcp_url: string;
   /** RFC 8707 resource indicator. */
   resource: string | null;
-  authorization_endpoint: string;
+  grant_type: McpOAuthGrantType;
+  /** Null for `client_credentials`. */
+  authorization_endpoint: string | null;
   token_endpoint: string;
   registration_endpoint: string | null;
   issuer: string | null;
   /** Space-delimited, as on the wire. */
   scopes: string | null;
-  redirect_uri: string;
+  /** Null for `client_credentials`. */
+  redirect_uri: string | null;
   bearer_secret_name: string;
   bearer_secret_id: string | null;
   host_pattern: string;
@@ -38,7 +44,7 @@ export interface McpOAuthIntegration {
   updated_at: string;
 }
 
-const COLUMNS = `name, agent_group_id, mcp_url, resource, authorization_endpoint, token_endpoint,
+const COLUMNS = `name, agent_group_id, mcp_url, resource, grant_type, authorization_endpoint, token_endpoint,
   registration_endpoint, issuer, scopes, redirect_uri, bearer_secret_name, bearer_secret_id,
   host_pattern, path_pattern, status, status_detail, expires_at, last_refresh_at, created_at, updated_at`;
 
@@ -78,13 +84,14 @@ export async function upsertMcpOAuthIntegration(
   const now = new Date().toISOString();
   await getDb().run(
     `INSERT INTO mcp_oauth_integrations (${COLUMNS})
-       VALUES (@name, @agent_group_id, @mcp_url, @resource, @authorization_endpoint, @token_endpoint,
+       VALUES (@name, @agent_group_id, @mcp_url, @resource, @grant_type, @authorization_endpoint, @token_endpoint,
                @registration_endpoint, @issuer, @scopes, @redirect_uri, @bearer_secret_name, @bearer_secret_id,
                @host_pattern, @path_pattern, @status, @status_detail, @expires_at, @last_refresh_at, @now, @now)
      ON CONFLICT(name) DO UPDATE SET
        agent_group_id = excluded.agent_group_id,
        mcp_url = excluded.mcp_url,
        resource = excluded.resource,
+       grant_type = excluded.grant_type,
        authorization_endpoint = excluded.authorization_endpoint,
        token_endpoint = excluded.token_endpoint,
        registration_endpoint = excluded.registration_endpoint,

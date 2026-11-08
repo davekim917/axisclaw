@@ -461,6 +461,7 @@ interface MigrationReport {
 export type SharedDirMutationKind =
   | 'move'
   | 'source-cleanup'
+  | 'merge'
   | 'compat-link'
   | 'compat-link-replace'
   | 'sibling-link'
@@ -482,6 +483,7 @@ export interface SharedDirMutation {
 export const MOUNT_INVALIDATING_SHARED_DIR_MUTATIONS: ReadonlySet<SharedDirMutationKind> = new Set([
   'move',
   'source-cleanup',
+  'merge',
   'compat-link-replace',
   'sibling-link-replace',
 ]);
@@ -493,6 +495,25 @@ export interface SharedDirsPendingChange extends SharedDirMutation {
 export interface SharedDirsReconcileReport {
   workgroupId: string;
   mutations: SharedDirMutation[];
+  /** Seed dirs merged into a shared dir of the same name that already held other content. */
+  merges: SharedDirMerge[];
+}
+
+interface MergeTally {
+  copied: number;
+  duplicates: number;
+  collisions: number;
+  /** Fifos, sockets and devices: they hold no bytes to keep. */
+  skipped: number;
+  orphanPath: string | null;
+  unaccounted: string[];
+}
+
+export interface SharedDirMerge extends MergeTally {
+  workgroupId: string;
+  name: string;
+  source: string;
+  sharedPath: string;
 }
 
 /**
@@ -586,10 +607,18 @@ function planWorkgroupSharedDirs(
   // Crash recovery: a real dir already in wgDir was moved by an interrupted run
   // whose source is gone; re-include it so the cutover finishes. Staging dirs are
   // dot-named (`.<name>.partial`) and shared dirs never are, so the dotfile skip
-  // excludes incomplete copies only.
+  // excludes incomplete copies only. Agents create dirs in the shared mount on
+  // their own, so a seed that still holds a real dir of the name is adopted only
+  // when the shared dir already holds all of it (a source-removal cut short).
   try {
     for (const e of fs.readdirSync(wgDir, { withFileTypes: true })) {
-      if (e.isDirectory() && !e.name.startsWith('.') && !RESERVED_SHARED_DIR_NAMES.has(e.name)) {
+      const seedEntry = path.join(seedDir, e.name);
+      if (
+        e.isDirectory() &&
+        !e.name.startsWith('.') &&
+        !RESERVED_SHARED_DIR_NAMES.has(e.name) &&
+        (!isRealDir(seedEntry) || treeContainedIn(seedEntry, path.join(wgDir, e.name)))
+      ) {
         shared.add(e.name);
       }
     }
@@ -637,7 +666,7 @@ export function sharedDirsPendingChange(
       if (!isRealDir(src)) continue; // nothing real to move — the migrator skips it whole
       return { kind: 'move', name, invalidatesMounts: true };
     } else if (isRealDir(src)) {
-      return { kind: 'source-cleanup', name, invalidatesMounts: true }; // interrupted move
+      return { kind: treeContainedIn(src, dst) ? 'source-cleanup' : 'merge', name, invalidatesMounts: true };
     }
     const state = containerLinkState(src, `${WORKGROUP_CONTAINER_PATH}/${name}`);
     if (state === 'create' || state === 'replace') {
@@ -685,7 +714,7 @@ function migrateWorkgroup(
   groupsDir: string,
   dataDir: string,
 ): SharedDirsReconcileReport {
-  const report: SharedDirsReconcileReport = { workgroupId, mutations: [] };
+  const report: SharedDirsReconcileReport = { workgroupId, mutations: [], merges: [] };
   const plan = planWorkgroupSharedDirs(db, workgroupId, groupsDir, dataDir);
   if (!plan) return report; // no seed data to consolidate
   const { seedDir, wgDir, siblingFolders, shared, candidates } = plan;
@@ -731,12 +760,24 @@ function migrateWorkgroup(
         fs.rmSync(src, { recursive: true, force: true });
       }
     } else if (isRealDir(src)) {
-      // dst already exists AND src is still a real dir → a crash landed between
-      // the atomic move and the source cleanup. dst is complete (both paths
-      // create it atomically), so finish the cleanup. Safe: the migration runs
-      // before any container spawn, so src cannot have been modified since.
-      fs.rmSync(src, { recursive: true, force: true });
-      mutations.push({ kind: 'source-cleanup', name });
+      // An interrupted copy-strategy move and a dst some agent created on its
+      // own look the same here, so src goes only once every entry is proven in dst.
+      if (treeContainedIn(src, dst)) {
+        fs.rmSync(src, { recursive: true, force: true });
+        mutations.push({ kind: 'source-cleanup', name });
+      } else {
+        const orphanRoot = path.join(wgDir, `.orphaned-${name}-${fileStamp()}`);
+        const merge = mergeIntoShared(src, dst, orphanRoot);
+        if (merge.unaccounted.length === 0) fs.rmSync(src, { recursive: true, force: true });
+        mutations.push({ kind: 'merge', name });
+        const event: SharedDirMerge = { workgroupId, name, source: src, sharedPath: dst, ...merge };
+        log.error('reconcileWorkgroupSharedDirs: seed dir collided with a different shared dir', {
+          ...event,
+          unaccounted: event.unaccounted.slice(0, 20),
+        });
+        report.merges.push(event);
+        if (merge.unaccounted.length > 0) continue; // links stay on the kept src until a merge completes
+      }
     }
     switch (ensureContainerLink(src, `${WORKGROUP_CONTAINER_PATH}/${name}`)) {
       case 'created':
@@ -1173,6 +1214,143 @@ function sameInode(a: string, b: string): boolean {
   const sa = lstatOrNull(a);
   const sb = lstatOrNull(b);
   return !!sa && !!sb && sa.dev === sb.dev && sa.ino === sb.ino;
+}
+
+function fileStamp(): string {
+  return new Date().toISOString().replace(/[:.]/g, '-');
+}
+
+function mergeIntoShared(src: string, dst: string, orphanRoot: string): MergeTally {
+  const tally: MergeTally = { copied: 0, duplicates: 0, collisions: 0, skipped: 0, orphanPath: null, unaccounted: [] };
+  // `aside`: this entry collided with dst, so it and everything under it go under `orphanRoot`.
+  const walk = (rel: string, aside: boolean): void => {
+    try {
+      const from = path.join(src, rel);
+      const to = path.join(aside ? orphanRoot : dst, rel);
+      const s = fs.lstatSync(from);
+      const d = lstatOrNull(to);
+      if (s.isDirectory()) {
+        if (d && !d.isDirectory()) return aside ? void tally.unaccounted.push(rel) : walk(rel, true);
+        // A git repo, at any depth, is never merged into: its files are valid only
+        // together, and a loose ref copied in overrides the other repo's packed one.
+        if (d && !aside && (holdsGitRepo(from) || holdsGitRepo(to)) && !treeContainedIn(from, to)) {
+          return walk(rel, true);
+        }
+        if (!d) fs.mkdirSync(to, { recursive: aside });
+        if (aside) tally.orphanPath = orphanRoot;
+        for (const n of fs.readdirSync(from)) walk(path.join(rel, n), aside);
+        return;
+      }
+      if (!s.isFile() && !s.isSymbolicLink()) return void tally.skipped++;
+      if (d && treeContainedIn(from, to)) return void tally.duplicates++;
+      if (d) return aside ? void tally.unaccounted.push(rel) : walk(rel, true);
+      if (aside) fs.mkdirSync(path.dirname(to), { recursive: true });
+      if (!placeVerified(from, to)) return void tally.unaccounted.push(rel);
+      if (aside) {
+        tally.collisions++;
+        tally.orphanPath = orphanRoot;
+      } else {
+        tally.copied++;
+      }
+    } catch {
+      tally.unaccounted.push(rel);
+    }
+  };
+  walk('', false);
+  return tally;
+}
+
+/** A work tree (`.git` dir or gitfile) or a bare repo: git's own test is `HEAD` plus `objects/` and `refs/`. */
+function holdsGitRepo(dir: string): boolean {
+  return (
+    isGitRepo(dir) ||
+    (!!lstatOrNull(path.join(dir, 'HEAD'))?.isFile() &&
+      isRealDir(path.join(dir, 'objects')) &&
+      isRealDir(path.join(dir, 'refs')))
+  );
+}
+
+/** `link(2)` from a verified temp, not `rename`: an existing name is never replaced. */
+function placeVerified(from: string, to: string): boolean {
+  const s = lstatOrNull(from);
+  if (!s) return false;
+  try {
+    if (s.isSymbolicLink()) {
+      const text = fs.readlinkSync(from);
+      fs.symlinkSync(text, to);
+      return safeReadlink(to) === text;
+    }
+    if (!s.isFile()) return false;
+  } catch {
+    return false;
+  }
+  const tmp = path.join(path.dirname(to), `.${path.basename(to)}.${randomBytes(6).toString('hex')}.merging`);
+  try {
+    fs.copyFileSync(from, tmp, fs.constants.COPYFILE_EXCL);
+    fs.utimesSync(tmp, s.atime, s.mtime);
+    if (lstatOrNull(tmp)?.size !== s.size || fileSha256(tmp) !== fileSha256(from)) return false;
+    fs.linkSync(tmp, to);
+    return true;
+  } catch {
+    return false;
+  } finally {
+    fs.rmSync(tmp, { force: true });
+  }
+}
+
+function fileSha256(p: string): string {
+  const hash = createHash('sha256');
+  const fd = fs.openSync(p, 'r');
+  try {
+    const buf = Buffer.alloc(1 << 20);
+    for (let n = fs.readSync(fd, buf, 0, buf.length, null); n > 0; n = fs.readSync(fd, buf, 0, buf.length, null)) {
+      hash.update(buf.subarray(0, n));
+    }
+  } finally {
+    fs.closeSync(fd);
+  }
+  return hash.digest('hex');
+}
+
+function treeContainedIn(src: string, dst: string): boolean {
+  const s = lstatOrNull(src);
+  const d = lstatOrNull(dst);
+  if (!s || !d) return false;
+  if (s.isSymbolicLink()) return d.isSymbolicLink() && safeReadlink(src) === safeReadlink(dst);
+  if (s.isDirectory()) {
+    if (!d.isDirectory()) return false;
+    let names: string[];
+    try {
+      names = fs.readdirSync(src);
+    } catch {
+      return false;
+    }
+    return names.every((n) => treeContainedIn(path.join(src, n), path.join(dst, n)));
+  }
+  return s.isFile() && d.isFile() && s.size === d.size && sameBytes(src, dst);
+}
+
+function sameBytes(a: string, b: string): boolean {
+  let fa: number | null = null;
+  let fb: number | null = null;
+  try {
+    fa = fs.openSync(a, 'r');
+    fb = fs.openSync(b, 'r');
+    const ba = Buffer.alloc(1 << 20);
+    const bb = Buffer.alloc(1 << 20);
+    for (;;) {
+      const na = fs.readSync(fa, ba, 0, ba.length, null);
+      const nb = fs.readSync(fb, bb, 0, bb.length, null);
+      if (na !== nb) return false;
+      if (na === 0) return true;
+      if (!ba.subarray(0, na).equals(bb.subarray(0, nb))) return false;
+    }
+  } catch {
+    return false;
+  } finally {
+    if (fa !== null) fs.closeSync(fa);
+    if (fb !== null) fs.closeSync(fb);
+  }
 }
 
 function isGitRepo(dir: string): boolean {

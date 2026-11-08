@@ -20,8 +20,10 @@ import { resolveInboundDbPath } from './host-inbound.js';
 import { inboundHasMessage } from './ops/ingress.js';
 import {
   countLiveSeriesRows,
+  type DeliveredPost,
   getLatestSeriesRow,
   getLatestTaskDeliveryRoute,
+  getLatestTaskEvent,
   getLatestTaskRoutingStamp,
   getLatestTaskRow,
   getLiveSeriesRow,
@@ -33,14 +35,17 @@ import {
   hasWorkContinuation,
   latestInboundMessageId,
   latestReplyTimestampByTrigger,
+  listDeliveredSince,
   listDuplicateLiveTaskSeriesIds,
   listInboundFeed,
+  listInboundHead,
   listInboundTail,
   listLatestRecurringSeriesRows,
   listLiveOneOffTaskRows,
   listLiveTaskRows,
   listLiveTaskRowsForSeries,
   listOutboundFeed,
+  listOutboundChatHead,
   listOutboundTail,
   listProcessingClaimedMessageIds,
   listRecentTaskFires,
@@ -50,6 +55,7 @@ import {
   type ScheduledTaskRow,
   type SessionTurnUsageRow,
   type TaskDeliveryRoute,
+  type TaskEvent,
   type TaskFireRow,
   type TaskRoutingStamp,
 } from './ops/reads.js';
@@ -102,13 +108,16 @@ export interface InboundSessionRead {
   getLatestTaskRow(seriesId: string): ScheduledTaskRow | null;
   listRecentTaskFires(seriesId: string, limit: number): TaskFireRow[];
   latestInboundMessageId(): string | null;
+  listDeliveredSince(since: string, limit: number): DeliveredPost[];
   hasPendingRecurrence(): boolean;
   hasTriggeredInboundRow(): boolean;
+  listInboundHead(limit: number): MessageTailRow[];
   listInboundTail(limit: number): MessageTailRow[];
   listInboundFeed(afterSeq: number | null, limit: number): MessageFeedRow[];
   countLiveSeriesRows(seriesId: string): number;
   getLatestTaskRoutingStamp(seriesId: string): TaskRoutingStamp | null;
   getLatestTaskDeliveryRoute(): TaskDeliveryRoute | null;
+  getLatestTaskEvent(): TaskEvent | null;
 }
 
 export interface OutboundSessionRead {
@@ -118,6 +127,7 @@ export interface OutboundSessionRead {
   hasWorkContinuation(): boolean;
   latestReplyTimestampByTrigger(): Map<string, string>;
   listTurnUsageSince(afterId: number): SessionTurnUsageRow[];
+  listOutboundChatHead(limit: number, threadId: string | null): MessageTailRow[];
   listOutboundTail(limit: number): MessageTailRow[];
   listOutboundFeed(afterSeq: number | null, limit: number): MessageFeedRow[];
 }
@@ -198,13 +208,16 @@ export function readSessionInbound<T>(
       getLatestTaskRow: (seriesId) => getLatestTaskRow(db, seriesId),
       listRecentTaskFires: (seriesId, limit) => listRecentTaskFires(db, seriesId, limit),
       latestInboundMessageId: () => latestInboundMessageId(db),
+      listDeliveredSince: (since, limit) => listDeliveredSince(db, since, limit),
       hasPendingRecurrence: () => hasPendingRecurrence(db),
       hasTriggeredInboundRow: () => hasTriggeredInboundRow(db),
+      listInboundHead: (limit) => listInboundHead(db, limit),
       listInboundTail: (limit) => listInboundTail(db, limit),
       listInboundFeed: (afterSeq, limit) => listInboundFeed(db, afterSeq, limit),
       countLiveSeriesRows: (seriesId) => countLiveSeriesRows(db, seriesId),
       getLatestTaskRoutingStamp: (seriesId) => getLatestTaskRoutingStamp(db, seriesId),
       getLatestTaskDeliveryRoute: () => getLatestTaskDeliveryRoute(db),
+      getLatestTaskEvent: () => getLatestTaskEvent(db),
     });
   } finally {
     db.close();
@@ -228,6 +241,7 @@ export function readSessionOutbound<T>(
       hasWorkContinuation: () => hasWorkContinuation(db),
       latestReplyTimestampByTrigger: () => latestReplyTimestampByTrigger(db),
       listTurnUsageSince: (afterId) => listTurnUsageSince(db, afterId),
+      listOutboundChatHead: (limit, threadId) => listOutboundChatHead(db, limit, threadId),
       listOutboundTail: (limit) => listOutboundTail(db, limit),
       listOutboundFeed: (afterSeq, limit) => listOutboundFeed(db, afterSeq, limit),
     });

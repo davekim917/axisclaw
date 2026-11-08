@@ -13,6 +13,7 @@ import { getDb } from '../../db/connection.js';
 import { readSessionInbound, readSessionOutbound, type MessageTailRow } from '../../modules/mailbox/index.js';
 import { heartbeatPath } from '../../session-manager.js';
 import { log } from '../../log.js';
+import { sessionAskCause } from '../../modules/open-asks/asks.js';
 import type { AuthHandler } from '../router.js';
 
 type AttentionState = 'needs_me' | 'active' | 'idle' | 'stale';
@@ -138,10 +139,7 @@ function deriveAttentionState(
   const lastInboundMs = row.last_active ? Date.parse(row.last_active) : 0;
   const lastOutboundMs = row.last_outbound_at ? Date.parse(row.last_outbound_at) : 0;
 
-  if (row.attached_task_needs_input === 1) return 'needs_me';
-  if (row.last_outbound_kind === 'chat-sdk:ask_question' && lastInboundMs < lastOutboundMs) {
-    return 'needs_me';
-  }
+  if (sessionAskCause(row) !== null) return 'needs_me';
 
   // A queued (`pending`) attached task counts as in flight too.
   if (containerStatus === 'running') return 'active';

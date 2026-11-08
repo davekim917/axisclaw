@@ -3,13 +3,20 @@ import { readFileSync } from 'fs';
 import { describe, expect, test, vi, beforeEach, afterEach } from 'vitest';
 
 import {
+  agentsHoldingSecret,
+  assertNotReservedIdentity,
   applyOnecliSecrets,
+  assertSecretNotReserved,
+  enforceReservedSecret,
+  reservedAgentStrays,
+  reservedVaultSecrets,
+  secretsHeldBy,
   ensureOnecliAgent,
+  grantOnecliSecretToAgent,
   mergeWorkgroupAndGroupSecrets,
   resolveSecretUuids,
   resolveSpawnSecrets,
   slackUserTokenSecrets,
-  typesafeKeyPlaceholderEnv,
   __resetCachesForTest,
   __setSecretsCacheForTest,
   __test,
@@ -89,14 +96,16 @@ function respondDeferred(fn: (bin: unknown, argv: unknown) => string): { release
 // execFileSync call shaped as [bin, args].
 const isAgentsListCall = (c: unknown[]): boolean =>
   c[0] === 'curl' &&
-  (c[1] as string[]).some((a) => String(a).includes('/api/agents?')) &&
+  (c[1] as string[]).some((a) => String(a).includes('/v1/agents?')) &&
   !(c[1] as string[]).some((a) => String(a).includes('/grants'));
 const isSecretsListCall = (c: unknown[]): boolean =>
-  c[0] === 'curl' && (c[1] as string[]).some((a) => String(a).includes('/api/secrets'));
+  c[0] === 'curl' && (c[1] as string[]).some((a) => String(a).includes('/v1/secrets'));
 const isAgentGrantsCall = (c: unknown[]): boolean =>
   c[0] === 'curl' && (c[1] as string[]).some((a) => String(a).includes('/grants'));
 const isAgentCreateCall = (c: unknown[]): boolean =>
-  c[0] === 'curl' && (c[1] as string[]).some((a) => String(a).includes('/v1/agents'));
+  c[0] === 'curl' &&
+  (c[1] as string[]).includes('POST') &&
+  (c[1] as string[]).some((a) => String(a).endsWith('/v1/agents'));
 const grantMutation = (c: unknown[]): { method: string; url: string } | undefined => {
   if (c[0] !== 'curl') return undefined;
   const argv = c[1] as string[];
@@ -156,11 +165,11 @@ function setupCliResponses(): void {
     if (bin === 'curl') {
       const url = argv.join(' ');
       if (url.includes('/grants')) {
-        const agentId = url.match(/\/api\/agents\/([^/]+)\/grants/)?.[1];
+        const agentId = url.match(/\/v1\/agents\/([^/]+)\/grants/)?.[1];
         return JSON.stringify({ agentId, mode: 'grants', connections: [], secrets: [] });
       }
-      if (url.includes('/api/agents')) return JSON.stringify(AGENT_FIXTURE);
-      if (url.includes('/api/secrets')) return JSON.stringify(SECRET_FIXTURE);
+      if (url.includes('/v1/agents')) return JSON.stringify(AGENT_FIXTURE);
+      if (url.includes('/v1/secrets')) return JSON.stringify(SECRET_FIXTURE);
       return '';
     }
     return '';
@@ -224,7 +233,7 @@ describe('ensureOnecliAgent', async () => {
       const argv = (rawArgs ?? []) as string[];
       if (bin !== 'curl') return '';
       const url = argv.join(' ');
-      if (url.includes('/api/agents?')) return JSON.stringify({ data: [] });
+      if (url.includes('/v1/agents?')) return JSON.stringify({ data: [] });
       if (url.includes('/v1/agents')) {
         return `${JSON.stringify({
           id: '33333333-3333-3333-3333-333333333333',
@@ -251,7 +260,7 @@ describe('ensureOnecliAgent', async () => {
       const argv = (rawArgs ?? []) as string[];
       if (bin !== 'curl') return '';
       const url = argv.join(' ');
-      if (url.includes('/api/agents?')) {
+      if (url.includes('/v1/agents?')) {
         listCalls++;
         return listCalls === 1
           ? JSON.stringify({ data: [] })
@@ -278,7 +287,7 @@ describe('ensureOnecliAgent', async () => {
       const argv = (rawArgs ?? []) as string[];
       if (bin !== 'curl') return '';
       const url = argv.join(' ');
-      if (url.includes('/api/agents?')) return JSON.stringify({ data: [] });
+      if (url.includes('/v1/agents?')) return JSON.stringify({ data: [] });
       if (url.includes('/v1/agents')) return `${JSON.stringify({ error: 'unavailable' })}\n503`;
       return '';
     });
@@ -318,15 +327,15 @@ describe('applyOnecliSecrets — happy path', async () => {
     expect(rawCalls.map(grantMutation).filter(Boolean)).toEqual([
       {
         method: 'PUT',
-        url: 'http://127.0.0.1:10254/api/agents/11111111-1111-1111-1111-111111111111/grants/secrets/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+        url: 'http://127.0.0.1:10254/v1/agents/11111111-1111-1111-1111-111111111111/grants/secrets/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
       },
       {
         method: 'PUT',
-        url: 'http://127.0.0.1:10254/api/agents/11111111-1111-1111-1111-111111111111/grants/secrets/cccccccc-cccc-cccc-cccc-cccccccccccc',
+        url: 'http://127.0.0.1:10254/v1/agents/11111111-1111-1111-1111-111111111111/grants/secrets/cccccccc-cccc-cccc-cccc-cccccccccccc',
       },
       {
         method: 'PUT',
-        url: 'http://127.0.0.1:10254/api/agents/11111111-1111-1111-1111-111111111111/grants/secrets/dddddddd-dddd-dddd-dddd-dddddddddddd',
+        url: 'http://127.0.0.1:10254/v1/agents/11111111-1111-1111-1111-111111111111/grants/secrets/dddddddd-dddd-dddd-dddd-dddddddddddd',
       },
     ]);
   });
@@ -372,8 +381,8 @@ describe('applyOnecliSecrets — happy path', async () => {
           ],
         });
       }
-      if (url.includes('/api/agents')) return JSON.stringify(AGENT_FIXTURE);
-      if (url.includes('/api/secrets')) return JSON.stringify(SECRET_FIXTURE);
+      if (url.includes('/v1/agents')) return JSON.stringify(AGENT_FIXTURE);
+      if (url.includes('/v1/secrets')) return JSON.stringify(SECRET_FIXTURE);
       return '';
     });
 
@@ -382,16 +391,62 @@ describe('applyOnecliSecrets — happy path', async () => {
     expect(mockedExec.mock.calls.map(grantMutation).filter(Boolean)).toEqual([
       {
         method: 'DELETE',
-        url: 'http://127.0.0.1:10254/api/agents/11111111-1111-1111-1111-111111111111/grants/secrets/bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb',
+        url: 'http://127.0.0.1:10254/v1/agents/11111111-1111-1111-1111-111111111111/grants/secrets/bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb',
       },
       {
         method: 'PUT',
-        url: 'http://127.0.0.1:10254/api/agents/11111111-1111-1111-1111-111111111111/grants/secrets/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+        url: 'http://127.0.0.1:10254/v1/agents/11111111-1111-1111-1111-111111111111/grants/secrets/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
       },
     ]);
     expect(mockedExec.mock.calls.flatMap((call) => call[1] as string[]).join(' ')).not.toContain(
       'connection-that-must-not-change',
     );
+  });
+});
+
+describe('grantOnecliSecretToAgent', async () => {
+  const HELD = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+  const AGENT_URL = 'http://127.0.0.1:10254/v1/agents/11111111-1111-1111-1111-111111111111/grants/secrets';
+
+  function holding(secretIds: string[]): void {
+    respond((bin: unknown, rawArgs: unknown) => {
+      const url = ((rawArgs ?? []) as string[]).join(' ');
+      if (bin !== 'curl') return '';
+      if (url.includes('/grants/secrets/')) return '';
+      if (url.includes('/grants')) {
+        const agentId = url.match(/\/v1\/agents\/([^/]+)\/grants/)?.[1];
+        return JSON.stringify({
+          agentId,
+          mode: 'grants',
+          connections: [],
+          secrets: secretIds.map((secretId) => ({ secretId })),
+        });
+      }
+      if (url.includes('/v1/agents')) return JSON.stringify(AGENT_FIXTURE);
+      return '';
+    });
+  }
+
+  test('adds the one grant and removes nothing the agent already holds', async () => {
+    holding([HELD]);
+    await grantOnecliSecretToAgent('example-retail', { id: 'cccccccc-cccc-cccc-cccc-cccccccccccc', name: 'Hex' });
+    expect(mockedExec.mock.calls.map(grantMutation).filter(Boolean)).toEqual([
+      { method: 'PUT', url: `${AGENT_URL}/cccccccc-cccc-cccc-cccc-cccccccccccc` },
+    ]);
+  });
+
+  test('changes nothing when the agent already holds it', async () => {
+    holding([HELD]);
+    await grantOnecliSecretToAgent('example-retail', { id: HELD, name: 'Datafold-ExampleRetail' });
+    expect(mockedExec.mock.calls.map(grantMutation).filter(Boolean)).toEqual([]);
+  });
+
+  test("refuses another agent's reserved token before touching the vault", async () => {
+    holding([]);
+    await expect(
+      grantOnecliSecretToAgent('example-retail', { id: HELD, name: 'approved-run-example token' }),
+    ).rejects.toThrow(/reserved to OneCLI agent approved-run-example/);
+    expect(mockedExec).not.toHaveBeenCalled();
   });
 });
 
@@ -469,10 +524,10 @@ describe('applyOnecliSecrets — caching', async () => {
       if (bin === 'curl') {
         const url = argv.join(' ');
         if (url.includes('/grants')) {
-          const agentId = url.match(/\/api\/agents\/([^/]+)\/grants/)?.[1];
+          const agentId = url.match(/\/v1\/agents\/([^/]+)\/grants/)?.[1];
           return JSON.stringify({ agentId, mode: 'grants', connections: [], secrets: [] });
         }
-        if (url.includes('/api/agents')) {
+        if (url.includes('/v1/agents')) {
           callsToAgentsList++;
           if (callsToAgentsList === 1) return JSON.stringify(AGENT_FIXTURE);
           // Second call: include a new agent
@@ -488,7 +543,7 @@ describe('applyOnecliSecrets — caching', async () => {
             ],
           });
         }
-        if (url.includes('/api/secrets')) return JSON.stringify(SECRET_FIXTURE);
+        if (url.includes('/v1/secrets')) return JSON.stringify(SECRET_FIXTURE);
         return '';
       }
       return '';
@@ -678,11 +733,11 @@ describe('resolveSpawnSecrets — exactly one OpenCode secret per agent', async 
       }
       const url = argv.join(' ');
       if (url.includes('/grants')) {
-        const agentId = url.match(/\/api\/agents\/([^/]+)\/grants/)?.[1];
+        const agentId = url.match(/\/v1\/agents\/([^/]+)\/grants/)?.[1];
         return JSON.stringify({ agentId, mode: 'grants', connections: [], secrets: [] });
       }
-      if (url.includes('/api/agents')) return JSON.stringify(AGENT_FIXTURE);
-      if (url.includes('/api/secrets')) return JSON.stringify({ data: OPENCODE_ROWS });
+      if (url.includes('/v1/agents')) return JSON.stringify(AGENT_FIXTURE);
+      if (url.includes('/v1/secrets')) return JSON.stringify({ data: OPENCODE_ROWS });
       return '';
     });
 
@@ -805,11 +860,11 @@ describe('#315 — secrets listing is cached, never at the cost of fail-closed',
       if (bin !== 'curl') return '';
       const url = argv.join(' ');
       if (url.includes('/grants')) {
-        const agentId = url.match(/\/api\/agents\/([^/]+)\/grants/)?.[1];
+        const agentId = url.match(/\/v1\/agents\/([^/]+)\/grants/)?.[1];
         return JSON.stringify({ agentId, mode: 'grants', connections: [], secrets: [] });
       }
-      if (url.includes('/api/agents')) return JSON.stringify(AGENT_FIXTURE);
-      if (url.includes('/api/secrets')) {
+      if (url.includes('/v1/agents')) return JSON.stringify(AGENT_FIXTURE);
+      if (url.includes('/v1/secrets')) {
         secretsListCalls++;
         if (secretsListCalls === 1) return JSON.stringify(SECRET_FIXTURE);
         return JSON.stringify({
@@ -827,7 +882,7 @@ describe('#315 — secrets listing is cached, never at the cost of fail-closed',
     expect(secretsListCalls).toBe(2);
     expect(mockedExec.mock.calls.map(grantMutation).filter(Boolean)).toContainEqual({
       method: 'PUT',
-      url: 'http://127.0.0.1:10254/api/agents/11111111-1111-1111-1111-111111111111/grants/secrets/eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee',
+      url: 'http://127.0.0.1:10254/v1/agents/11111111-1111-1111-1111-111111111111/grants/secrets/eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee',
     });
   });
 
@@ -870,8 +925,8 @@ describe('#315 — concurrent spawns of one identity stay serialized', () => {
           secrets: granted.map((secretId) => ({ secretId })),
         });
       }
-      if (url.includes('/api/agents')) return JSON.stringify(AGENT_FIXTURE);
-      if (url.includes('/api/secrets')) return JSON.stringify(SECRET_FIXTURE);
+      if (url.includes('/v1/agents')) return JSON.stringify(AGENT_FIXTURE);
+      if (url.includes('/v1/secrets')) return JSON.stringify(SECRET_FIXTURE);
       return '';
     });
 
@@ -911,11 +966,11 @@ describe('#315 — the secrets cache staleness window is bounded and specified',
       if (bin !== 'curl') return '';
       const url = argv.join(' ');
       if (url.includes('/grants')) {
-        const agentId = url.match(/\/api\/agents\/([^/]+)\/grants/)?.[1];
+        const agentId = url.match(/\/v1\/agents\/([^/]+)\/grants/)?.[1];
         return JSON.stringify({ agentId, mode: 'grants', connections: [], secrets: [] });
       }
-      if (url.includes('/api/agents')) return JSON.stringify(AGENT_FIXTURE);
-      if (url.includes('/api/secrets')) {
+      if (url.includes('/v1/agents')) return JSON.stringify(AGENT_FIXTURE);
+      if (url.includes('/v1/secrets')) {
         if (!renamed) return JSON.stringify(SECRET_FIXTURE);
         return JSON.stringify({
           data: SECRET_FIXTURE.data.map((secret) =>
@@ -954,7 +1009,7 @@ describe('#319 review r2 — cold-cache stampede', () => {
     const deferred = respondDeferred((bin: unknown, rawArgs: unknown) => {
       const argv = (rawArgs ?? []) as string[];
       if (bin !== 'curl') return '';
-      return argv.join(' ').includes('/api/agents') ? JSON.stringify(AGENT_FIXTURE) : '';
+      return argv.join(' ').includes('/v1/agents') ? JSON.stringify(AGENT_FIXTURE) : '';
     });
 
     // Eight distinct identities, so the per-identity lock cannot help.
@@ -979,7 +1034,7 @@ describe('#319 review r2 — cold-cache stampede', () => {
     const deferred = respondDeferred((bin: unknown, rawArgs: unknown) => {
       const argv = (rawArgs ?? []) as string[];
       if (bin !== 'curl') return '';
-      return argv.join(' ').includes('/api/secrets') ? JSON.stringify(SECRET_FIXTURE) : '';
+      return argv.join(' ').includes('/v1/secrets') ? JSON.stringify(SECRET_FIXTURE) : '';
     });
 
     const pending = Promise.all(Array.from({ length: 8 }, () => resolveSecretUuids(['Anthropic'])));
@@ -999,7 +1054,7 @@ describe('#319 review r2 — cold-cache stampede', () => {
     respond((bin: unknown, rawArgs: unknown) => {
       const argv = (rawArgs ?? []) as string[];
       if (bin !== 'curl') return '';
-      if (!argv.join(' ').includes('/api/secrets')) return '';
+      if (!argv.join(' ').includes('/v1/secrets')) return '';
       attempt++;
       if (attempt === 1) throw new Error('gateway unreachable');
       return JSON.stringify(SECRET_FIXTURE);
@@ -1022,7 +1077,7 @@ describe('#319 review r2 — cold-cache stampede', () => {
     respond((bin: unknown, rawArgs: unknown) => {
       const argv = (rawArgs ?? []) as string[];
       if (bin !== 'curl') return '';
-      if (!argv.join(' ').includes('/api/secrets')) return '';
+      if (!argv.join(' ').includes('/v1/secrets')) return '';
       listings++;
       if (listings === 1) return JSON.stringify(SECRET_FIXTURE);
       return JSON.stringify({
@@ -1041,46 +1096,202 @@ describe('#319 review r2 — cold-cache stampede', () => {
   });
 });
 
-describe('typesafeKeyPlaceholderEnv — gated on the api.typesafe.ai grant', () => {
-  const typesafe = {
-    id: 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
-    name: 'TypeSafe',
-    type: 'generic',
-    hostPattern: 'api.typesafe.ai',
-    pathPattern: null,
-  };
-  const other = {
-    id: 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb',
-    name: 'Pocket',
-    type: 'generic',
-    hostPattern: 'public.heypocketai.com',
-    pathPattern: null,
-  };
-  beforeEach(() => __setSecretsCacheForTest([typesafe, other] as never));
+const RETAIL = '11111111-1111-1111-1111-111111111111';
+const CODEX = '22222222-2222-2222-2222-222222222222';
+const LANE = '33333333-3333-3333-3333-333333333333';
+const HEX = 'cccccccc-cccc-cccc-cccc-cccccccccccc';
+const DATAFOLD = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+const TOKEN = 'ffffffff-ffff-ffff-ffff-ffffffffffff';
+const TOKEN_NAME = 'approved-run-acme token';
 
-  test('a Claude container granted TypeSafe gets a placeholder key', () => {
-    expect(typesafeKeyPlaceholderEnv('claude', ['Pocket', 'TypeSafe'])).toEqual([
-      '-e',
-      'TYPESAFE_API_KEY=onecli-gateway-injected',
+/**
+ * A vault where an agent can hold a secret two ways: a single-secret grant (`/grants`, removable by DELETE) or
+ * another rule (`rules`), which only the effective-credentials reflection shows. It also holds a lane agent and its
+ * reserved token. Records every grant mutation.
+ */
+function fakeVault(opts: {
+  grants?: Record<string, string[]>;
+  rules?: Record<string, Array<{ id: string; rule: string }>>;
+  extraSecrets?: Array<{ id: string; name: string; hostPattern?: string }>;
+}): { deletes: string[]; puts: string[] } {
+  const grants = Object.fromEntries(Object.entries(opts.grants ?? {}).map(([k, v]) => [k, [...v]]));
+  const log = { deletes: [] as string[], puts: [] as string[] };
+  const agents = { data: [...AGENT_FIXTURE.data, { id: LANE, name: 'lane', identifier: 'approved-run-acme' }] };
+  const secrets = {
+    data: [...SECRET_FIXTURE.data, { id: TOKEN, name: TOKEN_NAME }, ...(opts.extraSecrets ?? [])],
+  };
+  respond((bin: unknown, rawArgs: unknown) => {
+    const argv = (rawArgs ?? []) as string[];
+    if (bin !== 'curl') return '';
+    const url = argv.join(' ');
+    const mutation = grantMutation(['curl', argv]);
+    if (mutation) {
+      const [, agent, secret] = mutation.url.match(/\/agents\/([^/]+)\/grants\/secrets\/([^/?\s]+)/) ?? [];
+      if (mutation.method === 'DELETE') {
+        log.deletes.push(mutation.url);
+        grants[agent] = (grants[agent] ?? []).filter((id) => id !== secret);
+      }
+      if (mutation.method === 'PUT') log.puts.push(mutation.url);
+      return '';
+    }
+    const effective = url.match(/\/v1\/agents\/([^/]+)\/effective-credentials/)?.[1];
+    if (effective) {
+      const held = [
+        ...(grants[effective] ?? []).map((id) => ({ id, provenance: [{ kind: 'rule', rule: { name: 'grant' } }] })),
+        ...(opts.rules?.[effective] ?? []).map((r) => ({
+          id: r.id,
+          provenance: [{ kind: 'rule', rule: { name: r.rule } }],
+        })),
+      ].map((x) => ({ kind: 'secret', name: 'x', host: 'x', status: 'usable', ...x }));
+      return JSON.stringify({ agentId: effective, mode: 'selective', secrets: held, connections: [] });
+    }
+    const agentId = url.match(/\/v1\/agents\/([^/]+)\/grants/)?.[1];
+    if (agentId) {
+      return JSON.stringify({
+        agentId,
+        mode: 'grants',
+        connections: [],
+        secrets: (grants[agentId] ?? []).map((secretId) => ({ secretId })),
+      });
+    }
+    if (url.includes('/v1/agents')) return JSON.stringify(agents);
+    if (url.includes('/v1/secrets')) return JSON.stringify(secrets);
+    return '';
+  });
+  return log;
+}
+
+describe('agentsHoldingSecret', () => {
+  test('names every agent the gateway would inject the secret for, by grant or by any other rule', async () => {
+    fakeVault({ grants: { [RETAIL]: [HEX] }, rules: { [CODEX]: [{ id: HEX, rule: 'Every workspace secret' }] } });
+    expect(await agentsHoldingSecret('Hex')).toEqual(['example-retail', 'example-labs-codex']);
+  });
+
+  test('names nobody for a secret no rule grants', async () => {
+    fakeVault({ grants: { [RETAIL]: [DATAFOLD] } });
+    expect(await agentsHoldingSecret('Hex')).toEqual([]);
+  });
+
+  test('fails closed when the secret is not in the vault', async () => {
+    fakeVault({});
+    await expect(agentsHoldingSecret('Missing')).rejects.toThrow('not found in vault');
+  });
+
+  test('fails closed, with no partial answer, when any one agent’s credentials cannot be read', async () => {
+    fakeVault({ grants: { [RETAIL]: [HEX] } });
+    const answer = mockedExec.getMockImplementation() as (...args: unknown[]) => unknown;
+    mockedExec.mockImplementation((bin: unknown, rawArgs: unknown, options: unknown, callback: unknown) => {
+      if (((rawArgs ?? []) as string[]).join(' ').includes(`/v1/agents/${CODEX}/effective-credentials`)) {
+        throw new Error('gateway refused');
+      }
+      return answer(bin, rawArgs, options, callback);
+    });
+
+    await expect(agentsHoldingSecret('Hex')).rejects.toThrow('gateway refused');
+  });
+});
+
+describe('secretsHeldBy', () => {
+  const SLACK = '44444444-4444-4444-4444-444444444444';
+  const FILES = '55555555-5555-5555-5555-555555555555';
+  const UNLISTED = '66666666-6666-6666-6666-666666666666';
+
+  test('lists each secret the gateway would inject for the agent once, with its host as the vault lists it now', async () => {
+    __setSecretsCacheForTest([{ id: SLACK, name: 'Slack-User-Token-Example', hostPattern: 'api.example.com' }]);
+    fakeVault({
+      grants: { [RETAIL]: [SLACK, HEX] },
+      rules: {
+        [RETAIL]: [
+          { id: SLACK, rule: 'Workgroup secrets' },
+          { id: FILES, rule: 'Workgroup secrets' },
+          { id: UNLISTED, rule: 'Old rule' },
+        ],
+      },
+      extraSecrets: [
+        { id: SLACK, name: 'Slack-User-Token-Example', hostPattern: 'slack.com' },
+        { id: FILES, name: 'Slack-User-Token-Example-Files', hostPattern: 'files.slack.com' },
+      ],
+    });
+
+    expect(await secretsHeldBy('example-retail')).toEqual([
+      { id: SLACK, name: 'Slack-User-Token-Example', hostPattern: 'slack.com' },
+      { id: HEX, name: 'Hex', hostPattern: null },
+      { id: FILES, name: 'Slack-User-Token-Example-Files', hostPattern: 'files.slack.com' },
+      { id: UNLISTED, name: '', hostPattern: null },
+    ]);
+    expect(await secretsHeldBy('not-an-agent')).toEqual([]);
+  });
+});
+
+describe('a reserved token', () => {
+  test('the vault listing names every reserved token and its agent, and nothing else', async () => {
+    fakeVault({});
+    expect(await reservedVaultSecrets()).toEqual([{ secret: TOKEN_NAME, owner: 'approved-run-acme' }]);
+  });
+
+  test("the sweep removes every grant but its agent's, naming each holder before its grant goes", async () => {
+    const vault = fakeVault({ grants: { [LANE]: [TOKEN], [CODEX]: [TOKEN] } });
+    const heard: Array<{ identifier: string; deletesSoFar: number }> = [];
+    expect(
+      await enforceReservedSecret(TOKEN_NAME, 'approved-run-acme', (identifier) =>
+        heard.push({ identifier, deletesSoFar: vault.deletes.length }),
+      ),
+    ).toEqual({ removed: ['example-labs-codex'], unremovable: [] });
+    expect(heard).toEqual([{ identifier: 'example-labs-codex', deletesSoFar: 0 }]);
+    expect(vault.deletes).toEqual([expect.stringContaining(`/v1/agents/${CODEX}/grants/secrets/${TOKEN}`)]);
+  });
+
+  test('a holder that cannot be recorded keeps its grant, so the next pass still sees the exposure', async () => {
+    const vault = fakeVault({ grants: { [CODEX]: [TOKEN] } });
+    await expect(
+      enforceReservedSecret(TOKEN_NAME, 'approved-run-acme', () => {
+        throw new Error('outbox not writable');
+      }),
+    ).rejects.toThrow('outbox not writable');
+    expect(vault.deletes).toEqual([]);
+  });
+
+  test('every copy of a duplicated name is removed, not only the last one the vault lists', async () => {
+    const copy = 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee';
+    const vault = fakeVault({ grants: { [CODEX]: [TOKEN, copy] }, extraSecrets: [{ id: copy, name: TOKEN_NAME }] });
+    await enforceReservedSecret(TOKEN_NAME, 'approved-run-acme', () => undefined);
+    expect(vault.deletes).toEqual([
+      expect.stringContaining(`/grants/secrets/${TOKEN}`),
+      expect.stringContaining(`/grants/secrets/${copy}`),
     ]);
   });
 
-  test('a grant by UUID counts the same as by name', () => {
-    expect(typesafeKeyPlaceholderEnv('claude', [typesafe.id])).toHaveLength(2);
+  test('an agent still injectable after its grants are removed is reported with the rule that grants it', async () => {
+    fakeVault({ grants: { [CODEX]: [TOKEN] }, rules: { [CODEX]: [{ id: TOKEN, rule: 'Every workspace secret' }] } });
+    expect(await enforceReservedSecret(TOKEN_NAME, 'approved-run-acme', () => undefined)).toEqual({
+      removed: ['example-labs-codex'],
+      unremovable: [{ identifier: 'example-labs-codex', via: 'rule "Every workspace secret"' }],
+    });
   });
 
-  test("no TypeSafe grant, no key: the plugin never sends that group's text", () => {
-    expect(typesafeKeyPlaceholderEnv('claude', ['Pocket'])).toEqual([]);
-    expect(typesafeKeyPlaceholderEnv('claude', [])).toEqual([]);
+  test('a lane agent holding anything but its own token is reported, which is how a renamed token shows', async () => {
+    fakeVault({ grants: { [LANE]: [TOKEN, HEX] } });
+    expect(await reservedAgentStrays()).toEqual([{ agent: 'approved-run-acme', secret: 'Hex' }]);
   });
 
-  test('non-Claude providers never get it', () => {
-    expect(typesafeKeyPlaceholderEnv('codex', ['TypeSafe'])).toEqual([]);
-    expect(typesafeKeyPlaceholderEnv('opencode', ['TypeSafe'])).toEqual([]);
+  test('a spawn declaring it for another agent is refused before any grant changes', async () => {
+    const vault = fakeVault({ grants: { [CODEX]: [HEX] } });
+    await expect(applyOnecliSecrets('example-labs-codex', [TOKEN_NAME])).rejects.toThrow(
+      'reserved to OneCLI agent approved-run-acme',
+    );
+    expect([...vault.deletes, ...vault.puts]).toEqual([]);
   });
 
-  test('a cold cache yields no key (safe fallback, not a throw)', () => {
-    __resetCachesForTest();
-    expect(typesafeKeyPlaceholderEnv('claude', ['TypeSafe'])).toEqual([]);
+  test('no container may run as any lane agent', () => {
+    expect(() => assertNotReservedIdentity('approved-run-acme')).toThrow('reserved to the approved-run lane');
+    expect(() => assertNotReservedIdentity('approved-run-other')).toThrow('reserved to the approved-run lane');
+    expect(() => assertNotReservedIdentity('example-labs-codex')).not.toThrow();
+    expect(() => assertNotReservedIdentity(undefined)).not.toThrow();
+  });
+
+  test('a grant by name is refused for anyone but its agent', () => {
+    expect(() => assertSecretNotReserved(TOKEN_NAME, null)).toThrow('reserved to OneCLI agent approved-run-acme');
+    expect(() => assertSecretNotReserved(TOKEN_NAME, 'approved-run-acme')).not.toThrow();
+    expect(() => assertSecretNotReserved('Hex', null)).not.toThrow();
   });
 });

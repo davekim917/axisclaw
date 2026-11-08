@@ -1,7 +1,34 @@
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
-import { ClaudeProvider } from './claude.js';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { MEMORY_SESSION_HOOK } from '../memory/session-hook.js';
+import { activeCredentialRing } from './claude-credential-ring.js';
+import { _setSdkQueryForTesting, ClaudeProvider } from './claude.js';
 import { getCredentialSlot, setCredentialSlot } from '../modules/mailbox/session-state.js';
 import { initTestSessionDb } from '../modules/mailbox/testing.js';
+
+/** A slot is saved once it serves a turn, so a respawn can never resume one that was only rotated onto. */
+async function serveATurn(provider: ClaudeProvider): Promise<void> {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-rotation-'));
+  const savedHome = process.env.HOME;
+  process.env.HOME = home;
+  _setSdkQueryForTesting((() =>
+    (async function* () {
+      yield { type: 'result', subtype: 'success', is_error: false, result: 'served' };
+    })()) as unknown as NonNullable<Parameters<typeof _setSdkQueryForTesting>[0]>);
+  try {
+    provider.registerMemorySessionHook(MEMORY_SESSION_HOOK);
+    const query = provider.query({ prompt: 'hi', cwd: home });
+    for await (const event of query.events) if (event.type === 'result') break;
+    query.end();
+  } finally {
+    _setSdkQueryForTesting();
+    if (savedHome === undefined) delete process.env.HOME;
+    else process.env.HOME = savedHome;
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+}
 
 // Circular OAuth rotation (incident 2026-06-25): forward-only rotation could
 // land on a spend-capped fallback and dead-end there for the container's life.
@@ -168,6 +195,9 @@ describe('ClaudeProvider credential slot persists across a simulated respawn', (
   beforeEach(() => {
     initTestSessionDb();
   });
+  afterEach(() => {
+    delete process.env.CLAUDE_CODE_OAUTH_TOKEN_0;
+  });
 
   const savedOauth = process.env.CLAUDE_CODE_OAUTH_TOKEN;
   afterEach(() => {
@@ -181,11 +211,14 @@ describe('ClaudeProvider credential slot persists across a simulated respawn', (
     CLAUDE_CODE_OAUTH_TOKEN_3: 'three',
   };
 
-  it('a rotation persists the slot name, and a fresh instance restores onto it', () => {
+
+  it('a slot that served a turn is saved, and a fresh instance restores onto it', async () => {
     const first = new ClaudeProvider({ env: oauthEnv });
     first.resetRotationCycle();
     first.rotateApiKey(); // → two
     first.rotateApiKey(); // → three
+    expect(getCredentialSlot('claude')).toBeUndefined();
+    await serveATurn(first);
     expect(getCredentialSlot('claude')).toBe('CLAUDE_CODE_OAUTH_TOKEN_3');
 
     // Simulate a respawn: a brand-new instance, same env. The constructor
@@ -204,6 +237,21 @@ describe('ClaudeProvider credential slot persists across a simulated respawn', (
       position: 1,
       ringSize: 3,
     });
+  });
+
+  it('keeps every slot readable from process.env after the active one overwrites the primary', () => {
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = 'primary';
+    process.env.CLAUDE_CODE_OAUTH_TOKEN_2 = 'two';
+    try {
+      const provider = new ClaudeProvider({ env: { CLAUDE_CODE_OAUTH_TOKEN: 'primary', CLAUDE_CODE_OAUTH_TOKEN_2: 'two' } });
+      provider.resetRotationCycle();
+      provider.rotateApiKey(); // → two
+
+      expect(process.env.CLAUDE_CODE_OAUTH_TOKEN).toBe('two');
+      expect(activeCredentialRing(process.env).map((slot) => slot.value)).toEqual(['two', 'primary']);
+    } finally {
+      delete process.env.CLAUDE_CODE_OAUTH_TOKEN_2;
+    }
   });
 
   it('an unknown persisted slot (env changed since it was written) is ignored, staying on the primary', () => {
@@ -235,5 +283,63 @@ describe('ClaudeProvider credential slot persists across a simulated respawn', (
       position: 2,
       ringSize: 3,
     });
+  });
+});
+
+describe('ClaudeProvider never restores a slot the host marked spent', () => {
+  const savedOauth = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+  beforeEach(() => {
+    initTestSessionDb();
+  });
+  afterEach(() => {
+    delete process.env.CLAUDE_SPENT_SLOTS;
+    delete process.env.CLAUDE_CODE_OAUTH_TOKEN_0;
+    if (savedOauth === undefined) delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    else process.env.CLAUDE_CODE_OAUTH_TOKEN = savedOauth;
+  });
+
+  const oauthEnv = {
+    CLAUDE_CODE_OAUTH_TOKEN: 'primary',
+    CLAUDE_CODE_OAUTH_TOKEN_2: 'two',
+    CLAUDE_CODE_OAUTH_TOKEN_3: 'three',
+  };
+
+  it('restores the persisted slot when the host has not marked it', () => {
+    setCredentialSlot('claude', 'CLAUDE_CODE_OAUTH_TOKEN_3');
+    process.env.CLAUDE_SPENT_SLOTS = 'CLAUDE_CODE_OAUTH_TOKEN';
+    new ClaudeProvider({ env: oauthEnv }).restorePersistedCredentialSlot();
+    expect(process.env.CLAUDE_CODE_OAUTH_TOKEN).toBe('three');
+  });
+
+  it('starts on the first unmarked slot when the persisted one is marked', () => {
+    setCredentialSlot('claude', 'CLAUDE_CODE_OAUTH_TOKEN_2');
+    process.env.CLAUDE_SPENT_SLOTS = 'CLAUDE_CODE_OAUTH_TOKEN,CLAUDE_CODE_OAUTH_TOKEN_2';
+    const p = new ClaudeProvider({ env: oauthEnv });
+    p.restorePersistedCredentialSlot();
+    expect(process.env.CLAUDE_CODE_OAUTH_TOKEN).toBe('three');
+    p.resetRotationCycle();
+    expect(p.rotateApiKey()).toMatchObject({ rotated: true, slot: 'CLAUDE_CODE_OAUTH_TOKEN' });
+  });
+
+  it('replaces a marked persisted slot with the primary once the primary serves', async () => {
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = 'primary';
+    setCredentialSlot('claude', 'CLAUDE_CODE_OAUTH_TOKEN_2');
+    process.env.CLAUDE_SPENT_SLOTS = 'CLAUDE_CODE_OAUTH_TOKEN_2';
+    const p = new ClaudeProvider({ env: oauthEnv });
+    p.restorePersistedCredentialSlot();
+    expect(process.env.CLAUDE_CODE_OAUTH_TOKEN).toBe('primary');
+    await serveATurn(p);
+    expect(getCredentialSlot('claude')).toBe('CLAUDE_CODE_OAUTH_TOKEN');
+  });
+
+  it('starts past a marked primary when nothing was persisted, and stays on it otherwise', () => {
+    process.env.CLAUDE_SPENT_SLOTS = 'CLAUDE_CODE_OAUTH_TOKEN';
+    new ClaudeProvider({ env: oauthEnv }).restorePersistedCredentialSlot();
+    expect(process.env.CLAUDE_CODE_OAUTH_TOKEN).toBe('two');
+
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = 'primary';
+    process.env.CLAUDE_SPENT_SLOTS = 'CLAUDE_CODE_OAUTH_TOKEN_9';
+    new ClaudeProvider({ env: oauthEnv }).restorePersistedCredentialSlot();
+    expect(process.env.CLAUDE_CODE_OAUTH_TOKEN).toBe('primary');
   });
 });

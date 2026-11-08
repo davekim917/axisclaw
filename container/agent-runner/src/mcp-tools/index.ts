@@ -29,6 +29,8 @@ import './memory-write.js';
 import './work-continuation.js';
 import './wait.js';
 import './escalate.js';
+import './approved-run.js';
+import './post-as-owner.js';
 import './task-list.js';
 import { startMcpServer, mountSpawnTools } from './server.js';
 

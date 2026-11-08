@@ -1,4 +1,6 @@
 import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 import { taskListEnabled } from '../task-list.js';
 import { spawn, type ChildProcess } from 'child_process';
 import { pathToFileURL } from 'url';
@@ -40,6 +42,7 @@ import { attachTurnEffort } from './turn-effort.js';
 import { MCP_HEADER_ONLY_SECRET_VARS } from './secret-env.js';
 import { shouldPostInfraWarning } from '../modules/mailbox/index.js';
 import { MANAGED_GIT_OPENCODE_PLUGIN_PATH } from '../managed-git-guard.js';
+import { withCodexShimPath } from '../codex-shim-path.js';
 import { loadExcludedPlugins } from '../excluded-plugins.js';
 import { isExcludedPluginPath, type ExcludedPlugins } from '../plugin-exclusions.js';
 
@@ -260,12 +263,27 @@ export function buildOpencodeServerEnv(baseEnv: NodeJS.ProcessEnv, config: Recor
     env[k] = v;
   }
   env.OPENCODE_CONFIG_CONTENT = JSON.stringify(config);
+  const shimmedPath = withCodexShimPath(env.PATH);
+  if (shimmedPath !== undefined) env.PATH = shimmedPath;
   return env;
+}
+
+const GUARD_PLUGIN = '/workspace/plugins/bootstrap/plugins/workflow/hooks/guards/opencode-guard.ts';
+
+/** Each plugin a session must not run without, by the receipt it writes once its hooks are built. */
+export function requiredOpenCodePluginReceipts(): string[] {
+  return process.env.OPENCODE_ALLOW_UNGUARDED === '1' ? ['managed-git-guard'] : ['managed-git-guard', 'nanoclaw-guard'];
+}
+
+/** The required receipts missing from `dir`. */
+export function missingPluginReceipts(dir: string, required: readonly string[]): string[] {
+  return required.filter((name) => !fs.existsSync(path.join(dir, name)));
 }
 
 function spawnOpencodeServer(
   config: Record<string, unknown>,
   cwd: string | undefined,
+  receiptDir: string,
   timeoutMs = 10_000,
 ): Promise<{ url: string; proc: ChildProcess }> {
   return new Promise((resolve, reject) => {
@@ -274,7 +292,7 @@ function spawnOpencodeServer(
     const port = 0;
     // cwd is the agent workspace so OpenCode's file/shell tools default there, not to the Dockerfile WORKDIR.
     const proc = spawn('opencode', ['serve', `--hostname=${hostname}`, `--port=${port}`], {
-      env: buildOpencodeServerEnv(process.env, config),
+      env: { ...buildOpencodeServerEnv(process.env, config), NANOCLAW_OPENCODE_PLUGIN_RECEIPTS: receiptDir },
       cwd: cwd ?? process.cwd(),
     });
 
@@ -490,7 +508,6 @@ export function buildOpenCodeConfig(
   // OpenCode auto-approves every tool call, so this plugin's `tool.execute.before` throw is the only
   // destructive-action guard. An absent plugin refuses the spawn (the sweep retries) rather than running
   // unguarded; OPENCODE_ALLOW_UNGUARDED=1 is a dev-only escape hatch.
-  const GUARD_PLUGIN = '/workspace/plugins/bootstrap/plugins/workflow/hooks/guards/opencode-guard.ts';
   const guardAvailable = fs.existsSync(GUARD_PLUGIN);
   const allowUnguarded = process.env.OPENCODE_ALLOW_UNGUARDED === '1';
   if (!guardAvailable && !allowUnguarded) {
@@ -672,9 +689,21 @@ async function ensureSharedRuntime(
         destroySharedRuntime();
       }
       const config = buildOpenCodeConfig(options, turn);
-      const { url, proc } = await spawnOpencodeServer(config, cwd);
+      const receipts = fs.mkdtempSync(path.join(os.tmpdir(), 'opencode-plugin-receipts-'));
+      const { url, proc } = await spawnOpencodeServer(config, cwd, receipts);
       orphanProc = proc;
       const client = createOpencodeClient({ baseUrl: url, ...(cwd ? { directory: cwd } : {}) });
+      // OpenCode serves on when a plugin throws while loading. Listing tools waits for every plugin to load, so a
+      // missing receipt after it means that plugin's hooks were never built.
+      const tools = await client.tool.ids();
+      if (tools.error) throw new Error(`OpenCode: failed to list tools: ${JSON.stringify(tools.error)}`);
+      const missing = missingPluginReceipts(receipts, requiredOpenCodePluginReceipts());
+      if (missing.length) {
+        throw new Error(
+          `OpenCode: required plugin(s) did not load (${missing.join(', ')}); refusing to run without them. ` +
+            'Look for "failed to load plugin" in the session\'s OpenCode log.',
+        );
+      }
       const questionClient = createOpencodeQuestionClient({ baseUrl: url }) as unknown as QuestionClient;
       const sub = await client.event.subscribe();
       const stream = sub.stream as AsyncGenerator<{ type: string; properties: Record<string, unknown> }, void, void>;

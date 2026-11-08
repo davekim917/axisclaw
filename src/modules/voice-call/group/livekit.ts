@@ -20,6 +20,7 @@ export interface RoomGrant {
   room: string;
   roomJoin?: boolean;
   roomAdmin?: boolean;
+  roomCreate?: boolean;
   canPublish?: boolean;
   canSubscribe?: boolean;
   canPublishData?: boolean;
@@ -203,8 +204,8 @@ export function verifyToken(token: string | null): TokenClaims & { sub: string }
 }
 
 /** A RoomService call; a 404 means the participant or room is already gone, which is what every caller wants. */
-async function roomService(method: string, body: Record<string, unknown>, room: string): Promise<void> {
-  const token = mintToken({ video: { room, roomAdmin: true } }, 60);
+async function roomService(method: string, body: Record<string, unknown>, grant: RoomGrant): Promise<void> {
+  const token = mintToken({ video: grant }, 60);
   const res = await fetch(`${signalOrigin()}/twirp/livekit.RoomService/${method}`, {
     method: 'POST',
     headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
@@ -216,8 +217,9 @@ async function roomService(method: string, body: Record<string, unknown>, room: 
 }
 
 export const removeParticipant = (room: string, identity: string) =>
-  roomService('RemoveParticipant', { room, identity }, room);
+  roomService('RemoveParticipant', { room, identity }, { room, roomAdmin: true });
 
-export const deleteRoom = (room: string) => roomService('DeleteRoom', { room }, room);
+/** LiveKit refuses DeleteRoom without roomCreate; roomAdmin alone answers 401. */
+export const deleteRoom = (room: string) => roomService('DeleteRoom', { room }, { room, roomCreate: true });
 
 export const liveKitSignalPort = () => VOICE_GROUP_SIGNAL_PORT;

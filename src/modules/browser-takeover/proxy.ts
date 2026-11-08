@@ -4,7 +4,8 @@ import type { Duplex } from 'stream';
 import { BROWSER_TAKEOVER_ORIGIN, BROWSER_TAKEOVER_PORT } from '../../config.js';
 import { log } from '../../log.js';
 import { DASHBOARD_CONTAINER_PORT, openContainerLoopback } from './bridge.js';
-import { consumeTakeoverLink, resolveTakeoverBinding } from './service.js';
+import { escapeHtml } from '../mcp-oauth/loopback.js';
+import { consumeTakeoverLink, describeTakeoverLink, resolveTakeoverBinding } from './service.js';
 import { VIEWER_PAGE } from './viewer.js';
 
 export const TAKEOVER_COOKIE = '__Host-nc-browser-takeover';
@@ -12,6 +13,7 @@ export const DASHBOARD_TOKEN_COOKIE = '__Host-agent-browser-dashboard-token';
 const LINK_PATH_RE = /^\/t\/([A-Za-z0-9_-]{16,128})$/;
 const STREAM_PATH_RE = /^\/api\/session\/\d{1,5}\/stream$/;
 const SESSIONS_PATH = '/api/sessions';
+const ALIVE_PATH = '/alive';
 // The sidecar's dashboard allowlists exactly BROWSER_TAKEOVER_ORIGIN, and a tunnel may rewrite Host on the way in.
 const UPSTREAM_HOST = BROWSER_TAKEOVER_ORIGIN.replace(/^https?:\/\//, '');
 const CONFIRM_PAGE =
@@ -27,12 +29,14 @@ const VIEWER_CSP =
 
 export interface TakeoverProxyDeps {
   openUpstream: (containerName: string) => Duplex;
+  describeLink: typeof describeTakeoverLink;
   consumeLink: typeof consumeTakeoverLink;
   resolveBinding: typeof resolveTakeoverBinding;
 }
 
 const defaultDeps: TakeoverProxyDeps = {
   openUpstream: (name) => openContainerLoopback(name, DASHBOARD_CONTAINER_PORT),
+  describeLink: describeTakeoverLink,
   consumeLink: consumeTakeoverLink,
   resolveBinding: resolveTakeoverBinding,
 };
@@ -43,6 +47,18 @@ function bindingId(req: http.IncomingMessage): string | null {
     .map((p) => p.trim())
     .find((p) => p.startsWith(`${TAKEOVER_COOKIE}=`));
   return pair ? pair.slice(TAKEOVER_COOKIE.length + 1) : null;
+}
+
+function confirmPage(link: ReturnType<typeof describeTakeoverLink>): string {
+  if (!link || link.extraHosts.length === 0) return CONFIRM_PAGE;
+  const host = escapeHtml(link.host);
+  const extra = link.extraHosts.map(escapeHtml).join(', ');
+  return CONFIRM_PAGE.replace(
+    '<button',
+    () =>
+      `<p>This agent alone gets its session for <b>${host}</b> and your sign-in at <b>${extra}</b>. ` +
+      `That sign-in can open other apps that use it, not only ${host}.</p><button`,
+  );
 }
 
 const dashboardCookie = (token: string) => `${DASHBOARD_TOKEN_COOKIE}=${encodeURIComponent(token)}`;
@@ -68,7 +84,7 @@ function plain(res: http.ServerResponse, status: number, body: string): void {
  * arbitrary agent-browser commands) stays out of reach.
  */
 export function createTakeoverProxy(deps: TakeoverProxyDeps = defaultDeps): http.Server {
-  const { openUpstream, consumeLink, resolveBinding } = deps;
+  const { openUpstream, describeLink, consumeLink, resolveBinding } = deps;
   const bindingFor = (req: http.IncomingMessage) => {
     const id = bindingId(req);
     return id ? resolveBinding(id) : null;
@@ -89,7 +105,7 @@ export function createTakeoverProxy(deps: TakeoverProxyDeps = defaultDeps): http
         'Cache-Control': 'no-store',
         'Referrer-Policy': 'no-referrer',
       });
-      res.end(CONFIRM_PAGE);
+      res.end(confirmPage(describeLink(link[1])));
       return;
     }
     if (link && req.method === 'POST') {
@@ -125,6 +141,11 @@ export function createTakeoverProxy(deps: TakeoverProxyDeps = defaultDeps): http
         'Referrer-Policy': 'no-referrer',
       });
       res.end(VIEWER_PAGE);
+      return;
+    }
+    if (path === ALIVE_PATH) {
+      res.writeHead(204, { 'Cache-Control': 'no-store' });
+      res.end();
       return;
     }
     if (path !== SESSIONS_PATH) {

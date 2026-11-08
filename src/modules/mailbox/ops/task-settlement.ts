@@ -42,12 +42,17 @@ function readTaskOutcome(outbound: Database.Database, eventId: string): 'success
  * Host-owned facts only. With `futureInputs`, pending not-yet-due inputs are
  * counted, not treated as outstanding (a watcher's later wake is a separate
  * episode); everything else outstanding still blocks.
+ *
+ * `provider_executing` counts only while the container is live: the runner
+ * lowers it at turn end and resets it at startup, so a container that died
+ * mid-turn leaves it raised with nothing executing.
  */
 export function readTaskSettlement(
   inbound: Database.Database,
   outbound: Database.Database | null,
   eventId: string,
   threadId: string | null,
+  containerLive: boolean,
   observer = false,
   futureInputs = false,
 ): TaskSettlement {
@@ -88,7 +93,7 @@ export function readTaskSettlement(
       threadId,
       countDueMessages(inbound),
       getProcessingClaims(outbound).length,
-      state.provider_executing === 1,
+      containerLive && state.provider_executing === 1,
       readContinuationPresence(outbound) !== null,
     );
     // Re-arming clears the completed fire's recurrence in the same transaction,

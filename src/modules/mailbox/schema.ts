@@ -167,6 +167,14 @@ export function migrateMessagesInTable(db: Database.Database): void {
   // Unconditional: existing DBs skip the series_id branch above but still need
   // this index. Board read-only opens tolerate its absence.
   db.prepare('CREATE INDEX IF NOT EXISTS idx_messages_in_series_seq ON messages_in(series_id, seq DESC)').run();
+  // `repo_fence_epoch` and every other migrated column sit after `content`, so a table scan that reaches them walks
+  // each row's overflow chain: a sweep predicate on a long-lived session reads hundreds of MB. Also covers the
+  // ack-settlement read.
+  db.prepare('CREATE INDEX IF NOT EXISTS idx_messages_in_status ON messages_in(status, id)').run();
+  // The recurrence reads match nearly no rows; through the status index alone they fetch every settled row to reject it.
+  db.prepare(
+    'CREATE INDEX IF NOT EXISTS idx_messages_in_recurring ON messages_in(status) WHERE recurrence IS NOT NULL',
+  ).run();
 }
 
 /**

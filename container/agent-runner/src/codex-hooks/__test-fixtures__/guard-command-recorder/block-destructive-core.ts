@@ -9,7 +9,7 @@
  * module-level variable: the runner imports the core dynamically and bun
  * memoizes the module, so an export would carry state across tests.
  *
- * Pointed at via NANOCLAW_DESTRUCTIVE_GUARD_CORE in runner.test.ts.
+ * Pointed at via setGuardCorePathsForTest({ destructive }) in runner.test.ts.
  */
 import fs from 'fs';
 

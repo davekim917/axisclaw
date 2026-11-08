@@ -45,11 +45,6 @@ vi.mock('./message-archive.js', async (importOriginal) => ({
   archiveMessage: vi.fn(),
 }));
 
-vi.mock('./topic-title.js', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('./topic-title.js')>()),
-  maybeRenameNewThread: vi.fn(),
-}));
-
 import {
   initMigratedTestDb,
   closeDb,

@@ -39,7 +39,7 @@ STATE="${DRIVE_STATE_FILE:-$INSTALL_ROOT/data/workgroups-drive-state.tsv}"
 # Logs go to STDERR, never stdout. Helpers below return ids through stdout via
 # command substitution; a log line on stdout would be captured as the id. The
 # only stdout writer is the --dry-run report, printed at top level.
-log() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" >&2; }
+log() { TZ=UTC printf '%(%Y-%m-%dT%H:%M:%SZ)T %s\n' -1 "$*" >&2; }
 # Drive `q` string literals: backslash and apostrophe must be escaped.
 qesc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e "s/'/\\\\'/g"; }
 
@@ -118,9 +118,148 @@ if [[ $DRY_RUN -eq 0 ]]; then
   # kernel when the process dies, so a crash never leaves a stale lock.
   exec 9>>"$STATE.lock" || { log "FATAL cannot open lock $STATE.lock"; exit 1; }
   if ! flock -n 9; then log "SKIP another publisher run holds $STATE.lock; not overlapping it"; exit 0; fi
+
+  # Host-private staging dir: every upload is a snapshot taken here, never a
+  # path inside the agent-writable tree. gws refuses `--upload` for any path
+  # outside the current directory, so uploads run from here with a RELATIVE
+  # name. Not optional — an absolute path fails with a 400 "outside the current
+  # directory".
+  STAGE="$(mktemp -d)" && mkdir "$STAGE/f" || exit 1
+  ERRF="$STATE.err.$$"
+  trap 'rm -f "$ERRF"; rm -rf "$STAGE"' EXIT
+
+  # find_child <name> <parentId> <folders|files> -> prints id or empty
+  find_child() {
+    local name esc q extra
+    name="$1"; esc="$(qesc "$name")"
+    if [[ "$3" == folders ]]; then extra="and mimeType = 'application/vnd.google-apps.folder'"
+    else extra="and mimeType != 'application/vnd.google-apps.folder'"; fi
+    q="name = '$esc' $extra and '$2' in parents and trashed = false"
+    gws drive files list --params "$(jq -cn --arg q "$q" '{q:$q,fields:"files(id)",pageSize:1}')" \
+      2>/dev/null | jq -r '.files[0].id // empty'
+  }
+
+  # reply <kind> [a] [b] — one NUL-delimited answer to the main shell.
+  reply() { printf '%s\0%s\0%s\0' "$1" "${2:-}" "${3:-}" >&4; }
+
+  # dir_one <name> <parentId>: find or create one Drive folder.
+  # Replies ID <id> <1 if created> | ERR.
+  dir_one() {
+    local id
+    id="$(find_child "$1" "$2" folders)"
+    if [[ -n "$id" ]]; then reply ID "$id" 0; return; fi
+    id="$(gws drive files create --params '{"fields":"id"}' \
+          --json "$(jq -cn --arg n "$1" --arg p "$2" \
+            '{name:$n,mimeType:"application/vnd.google-apps.folder",parents:[$p]}')" \
+          2>/dev/null | jq -r '.id // empty')"
+    if [[ -z "$id" ]]; then reply ERR; else reply ID "$id" 1; fi
+  }
+
+  # file_one <rel> <is_allow> <parentId> <oldId> <parent created this run> <oldSha>
+  # Snapshots, hashes and (if changed) uploads one file. Replies MISSING |
+  # REFUSED <opened> | SNAPERR | OVERSIZE | SAME <sha> | FAILED |
+  # UPDATED <sha> <id> | ADDED <sha> <id>. Counters and state rows stay with
+  # the main shell.
+  file_one() {
+    local rel="$1" is_allow="$2" parent="$3" id="$4" newdir="$5" oldsha="$6"
+    local opened snap rc sha out name="${1##*/}"
+    # The tree is writable from agent containers, and any open by pathname
+    # follows symlinks: a path (or any directory above it) swapped for a
+    # symlink would publish whatever host file it points at, and a pathname
+    # check goes stale the moment it returns. So open once, confirm the
+    # descriptor is a regular file whose canonical path is exactly this
+    # repo-relative path — which for an allowlisted file also pins it inside
+    # its own data/workgroups/<workgroup> — and hash and upload a snapshot read
+    # from that descriptor. The -L/-f pre-check, immediately before the open,
+    # keeps a FIFO or device from ever being opened.
+    #
+    # A missing file is handled, not unreached: its old row must not be
+    # carried forward (one-way policy — log it, drop it from state, leave
+    # Drive alone).
+    if [[ ! -e "$rel" && ! -L "$rel" ]]; then log "SKIP missing $rel"; reply MISSING; return; fi
+    if [[ -L "$rel" || ! -f "$rel" ]]; then reply REFUSED "$(realpath -e -- "$rel" 2>/dev/null)"; return; fi
+    if ! exec 3<"$rel"; then log "SKIP missing $rel"; reply MISSING; return; fi
+    opened="$(readlink -- /proc/self/fd/3)"
+    if [[ ! -f /proc/self/fd/3 || "$opened" != "$REPO_REAL/$rel" ]]; then
+      exec 3<&-; reply REFUSED "$opened"; return
+    fi
+    snap="f/$name"
+    # An allowlisted file can grow between enumeration and this open, so its
+    # cap is enforced on the snapshot itself — copied one byte past the cap,
+    # which also bounds what a runaway file can put in the staging dir.
+    if [[ -n "$is_allow" ]]; then
+      head -c "$((MAX_BYTES + 1))" <&3 > "$STAGE/$snap"; rc=$?
+    else
+      cat <&3 > "$STAGE/$snap"; rc=$?
+    fi
+    exec 3<&-
+    if [[ $rc -ne 0 ]]; then log "ERROR snapshot $rel"; rm -f "$STAGE/$snap"; reply SNAPERR; return; fi
+    if [[ -n "$is_allow" && "$(stat -c %s "$STAGE/$snap")" -gt "$MAX_BYTES" ]]; then
+      log "SKIP oversize $rel (grew past $MAX_BYTES bytes after enumeration)"
+      rm -f "$STAGE/$snap"; reply OVERSIZE; return
+    fi
+    sha="$(sha256sum "$STAGE/$snap")"; sha="${sha%% *}"
+    if [[ "$oldsha" == "$sha" && -n "$id" ]]; then rm -f "$STAGE/$snap"; reply SAME "$sha"; return; fi
+    # A state miss is not proof of absence — a lost state file must not duplicate
+    # every file, so look the name up inside THIS parent id before creating,
+    # unless this run created that folder itself.
+    if [[ -z "$id" && -z "$newdir" ]]; then id="$(find_child "$name" "$parent" files)"; fi
+    # stderr goes to its own file, never merged into the parsed stdout: under
+    # systemd (no keyring session) gws prints "Using keyring backend: keyring" to
+    # stderr on every call, and a 2>&1 capture makes every successful upload look
+    # like unparseable JSON. That failed 10 real uploads silently.
+    if [[ -n "$id" ]]; then
+      out="$(cd "$STAGE" && gws drive files update --params "$(jq -cn --arg f "$id" '{fileId:$f,fields:"id"}')" \
+             --upload "$snap" 2>"$ERRF")"
+      rm -f "$STAGE/$snap"
+      if [[ -z "$(printf '%s' "$out" | jq -r '.id // empty' 2>/dev/null)" ]]; then
+        log "ERROR update $rel: $(head -c 200 "$ERRF") | $(printf '%s' "$out" | head -c 200)"
+        reply FAILED; return
+      fi
+      log "UPDATE $rel -> $id"; reply UPDATED "$sha" "$id"
+    else
+      out="$(cd "$STAGE" && gws drive files create --params '{"fields":"id"}' \
+             --json "$(jq -cn --arg n "$name" --arg p "$parent" '{name:$n,parents:[$p]}')" \
+             --upload "$snap" 2>"$ERRF")"
+      rm -f "$STAGE/$snap"
+      id="$(printf '%s' "$out" | jq -r '.id // empty' 2>/dev/null)"
+      if [[ -z "$id" ]]; then
+        log "ERROR create $rel: $(head -c 200 "$ERRF") | $(printf '%s' "$out" | head -c 200)"
+        reply FAILED; return
+      fi
+      log "ADD $rel -> $id"; reply ADDED "$sha" "$id"
+    fi
+  }
+
+  # Every process the per-file work spawns is a fork of the shell that runs
+  # it, and fork cost grows with that shell's heap: from the main shell, which
+  # by then holds ~60k-entry state maps, each fork costs tens of ms. So that
+  # work runs here, in a worker forked while the heap is still small. Replies
+  # go out on fd 4; its stdout is stderr, so no stray output can be read as
+  # a reply.
+  worker() {
+    exec 4>&1 1>&2
+    local op a b c d e f
+    while IFS= read -r -d '' op && IFS= read -r -d '' a && IFS= read -r -d '' b &&
+          IFS= read -r -d '' c && IFS= read -r -d '' d && IFS= read -r -d '' e &&
+          IFS= read -r -d '' f; do
+      case "$op" in
+        D) dir_one "$a" "$b" ;;
+        F) file_one "$a" "$b" "$c" "$d" "$e" "$f" ;;
+      esac
+    done
+  }
+  coproc WORKER { worker; }
+  # ask <op> <6 fields> — sets R_KIND R_A R_B from the worker's reply.
+  ask() {
+    printf '%s\0' "$@" >&"${WORKER[1]}"
+    IFS= read -r -d '' R_KIND <&"${WORKER[0]}" && IFS= read -r -d '' R_A <&"${WORKER[0]}" &&
+      IFS= read -r -d '' R_B <&"${WORKER[0]}" ||
+      { log "FATAL publish worker exited"; exit 1; }
+  }
 fi
 
-declare -A FOLDER OLD_SHA OLD_ID NEWDIR LIVE DONE IN_SET IS_ALLOW
+declare -A FOLDER OLD_SHA OLD_ID NEWDIR LIVE DONE IN_SET IS_ALLOW HASH
 DORDER=()
 # --- load previous state (read-only here; rewritten only by a real run) ---
 if [[ -f "$STATE" ]]; then
@@ -249,15 +388,7 @@ if [[ $DRY_RUN -eq 1 ]]; then
   exit 0
 fi
 
-# Host-private staging dir: every upload is a snapshot taken here, never a
-# path inside the agent-writable tree. gws refuses `--upload` for any path
-# outside the current directory, so uploads run from here with a RELATIVE
-# name. Not optional — an absolute path fails with a 400 "outside the current
-# directory".
-STAGE="$(mktemp -d)" && mkdir "$STAGE/f" || exit 1
-
 TMP="$STATE.tmp.$$"
-ERRF="$STATE.err.$$"
 : > "$TMP"
 # Re-emit cached folders: a cached folder is never re-resolved below, so
 # without this the next state file would carry zero D rows and the run after
@@ -271,30 +402,64 @@ for d in "${DORDER[@]}"; do printf 'D\t%s\t%s\n' "$d" "${FOLDER[$d]}" >> "$TMP";
 # runs the EXIT trap on an untrapped SIGTERM too. A SIGKILL skips the trap, so
 # progress is also checkpointed every CHECKPOINT_EVERY uploads.
 LIVE_READY=0
+# CARRY, once set, is every previous row still undecided after the skip pass;
+# a checkpoint then walks that handful instead of the whole previous state.
+CARRY_READY=0 CARRY=()
 persist() {
   local new="$STATE.new.$$" p
+  local -a rows
   cp -f "$TMP" "$new" 2>/dev/null || return 1
-  for p in "${!OLD_ID[@]}"; do
-    [[ -n "${DONE[$p]:-}" ]] && continue
-    [[ $LIVE_READY -eq 1 && -z "${LIVE[$p]:-}" ]] && continue
-    printf 'F\t%s\t%s\t%s\n' "$p" "${OLD_SHA[$p]}" "${OLD_ID[$p]}" >> "$new"
-  done
+  if [[ $CARRY_READY -eq 1 ]]; then rows=("${CARRY[@]}"); else rows=("${!OLD_ID[@]}"); fi
+  {
+    for p in "${rows[@]}"; do
+      [[ -n "${DONE[$p]:-}" ]] && continue
+      [[ $LIVE_READY -eq 1 && -z "${LIVE[$p]:-}" ]] && continue
+      printf 'F\t%s\t%s\t%s\n' "$p" "${OLD_SHA[$p]}" "${OLD_ID[$p]}"
+    done
+  } >> "$new"
   mv -f "$new" "$STATE"
 }
+emit_row() { printf 'F\t%s\t%s\t%s\n' "$1" "$2" "$3" >> "$TMP"; }
+
+# Hashes every candidate in ONE process, with the same checks file_one applies
+# before it snapshots: opened without following a final symlink and without
+# blocking on a FIFO, a regular file by descriptor, a /proc/self/fd path that
+# is exactly <repo>/<path>, and an allowlisted file read no further than one
+# byte past the cap. Input: NUL-delimited <cap or empty> <path> pairs. Output:
+# one NUL-terminated sha256 per pair, or "-" when any check fails, which sends
+# that file down file_one, where the failure is reported.
+HASHER='
+const fs = require("fs"), crypto = require("crypto");
+const root = process.argv[1];
+const f = fs.readFileSync(0, "latin1").split("\0");
+const buf = Buffer.alloc(1 << 20);
+const out = [];
+for (let i = 0; i + 1 < f.length; i += 2) {
+  const cap = f[i] === "" ? Infinity : Number(f[i]);
+  const rel = Buffer.from(f[i + 1], "latin1");
+  let fd = -1, res = "-";
+  try {
+    fd = fs.openSync(rel, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK | fs.constants.O_NOCTTY);
+    const real = fs.readlinkSync("/proc/self/fd/" + fd, { encoding: "buffer" });
+    if (fs.fstatSync(fd).isFile() && real.equals(Buffer.concat([Buffer.from(root + "/"), rel]))) {
+      const h = crypto.createHash("sha256");
+      let total = 0, n;
+      while ((n = fs.readSync(fd, buf, 0, Math.min(buf.length, cap + 1 - total), null)) > 0) {
+        total += n;
+        if (total > cap) break;
+        h.update(buf.subarray(0, n));
+      }
+      if (total <= cap) res = h.digest("hex");
+    }
+  } catch {}
+  if (fd >= 0) fs.closeSync(fd);
+  out.push(res);
+}
+process.stdout.write(out.join("\0") + (out.length ? "\0" : ""));
+'
 CHECKPOINT_EVERY="${DRIVE_CHECKPOINT_EVERY:-25}"
 [[ "$CHECKPOINT_EVERY" =~ ^[1-9][0-9]*$ ]] || CHECKPOINT_EVERY=25
 trap 'persist; rm -f "$TMP" "$ERRF"; rm -rf "$STAGE"' EXIT
-
-# find_child <name> <parentId> <folders|files> -> prints id or empty
-find_child() {
-  local name esc q extra
-  name="$1"; esc="$(qesc "$name")"
-  if [[ "$3" == folders ]]; then extra="and mimeType = 'application/vnd.google-apps.folder'"
-  else extra="and mimeType != 'application/vnd.google-apps.folder'"; fi
-  q="name = '$esc' $extra and '$2' in parents and trashed = false"
-  gws drive files list --params "$(jq -cn --arg q "$q" '{q:$q,fields:"files(id)",pageSize:1}')" \
-    2>/dev/null | jq -r '.files[0].id // empty'
-}
 
 # resolve_dir <relpath|.> — sets FOLDER[$1]. Runs in the MAIN shell (never a
 # command substitution) so the cache and the counters actually survive.
@@ -305,16 +470,15 @@ resolve_dir() {
   if [[ "$rel" == "." ]]; then
     parent=root; name="$ROOT_NAME"
   else
-    parent="${FOLDER[$(dirname "$rel")]:-}"; name="$(basename "$rel")"
+    local pd=.
+    [[ "$rel" == */* ]] && pd="${rel%/*}"
+    parent="${FOLDER[$pd]:-}"; name="${rel##*/}"
   fi
   if [[ -z "$parent" ]]; then log "ERROR no parent id for $rel"; return 1; fi
-  id="$(find_child "$name" "$parent" folders)"
-  if [[ -z "$id" ]]; then
-    id="$(gws drive files create --params '{"fields":"id"}' \
-          --json "$(jq -cn --arg n "$name" --arg p "$parent" \
-            '{name:$n,mimeType:"application/vnd.google-apps.folder",parents:[$p]}')" \
-          2>/dev/null | jq -r '.id // empty')"
-    if [[ -z "$id" ]]; then log "ERROR could not create folder $rel"; return 1; fi
+  ask D "$name" "$parent" "" "" "" ""
+  if [[ "$R_KIND" != ID ]]; then log "ERROR could not create folder $rel"; return 1; fi
+  id="$R_A"
+  if [[ "$R_B" == 1 ]]; then
     folders_made=$((folders_made+1)); log "MKDIR $rel -> $id"
     # Created by THIS run, so it holds nothing this run did not put there:
     # a file lookup inside it can be skipped (one API call saved per file on
@@ -351,87 +515,65 @@ for d in "${DIRS[@]}"; do
   resolve_dir "$d" || { log "FATAL cannot resolve folder $d"; exit 1; }
 done
 
-since_checkpoint=0
+# Only a file already on Drive can be skipped, so only those are hashed here.
+NEED=()
 for rel in "${SET[@]}"; do
-  src="$rel"
-  # A missing file is handled, not unreached: its old row must not be carried
-  # forward (one-way policy — log it, drop it from state, leave Drive alone).
-  if [[ ! -e "$src" && ! -L "$src" ]]; then log "SKIP missing $rel"; DONE["$rel"]=1; continue; fi
-  # The tree is writable from agent containers, and any open by pathname
-  # follows symlinks: a path (or any directory above it) swapped for a
-  # symlink would publish whatever host file it points at, and a pathname
-  # check goes stale the moment it returns. So open once, confirm the
-  # descriptor is a regular file whose canonical path is exactly this
-  # repo-relative path — which for an allowlisted file also pins it inside
-  # its own data/workgroups/<workgroup> — and hash and upload a snapshot read
-  # from that descriptor. The -L/-f pre-check keeps a FIFO or device from
-  # ever being opened.
-  if [[ -L "$src" || ! -f "$src" ]]; then refuse "$rel" "$(realpath -e -- "$src" 2>/dev/null)"; continue; fi
-  if ! exec 3<"$src"; then log "SKIP missing $rel"; DONE["$rel"]=1; continue; fi
-  opened="$(readlink -- /proc/self/fd/3)"
-  if [[ ! -f /proc/self/fd/3 || "$opened" != "$REPO_REAL/$rel" ]]; then
-    exec 3<&-; refuse "$rel" "$opened"; continue
-  fi
-  snap="f/$(basename "$rel")"
-  # An allowlisted file can grow between enumeration and this open, so its
-  # cap is enforced on the snapshot itself — copied one byte past the cap,
-  # which also bounds what a runaway file can put in the staging dir.
-  if [[ -n "${IS_ALLOW[$rel]:-}" ]]; then
-    head -c "$((MAX_BYTES + 1))" <&3 > "$STAGE/$snap"; rc=$?
-  else
-    cat <&3 > "$STAGE/$snap"; rc=$?
-  fi
-  exec 3<&-
-  if [[ $rc -ne 0 ]]; then log "ERROR snapshot $rel"; failed=$((failed+1)); rm -f "$STAGE/$snap"; continue; fi
-  if [[ -n "${IS_ALLOW[$rel]:-}" && "$(stat -c %s "$STAGE/$snap")" -gt "$MAX_BYTES" ]]; then
-    log "SKIP oversize $rel (grew past $MAX_BYTES bytes after enumeration)"
-    oversize=$((oversize+1)); DONE["$rel"]=1; rm -f "$STAGE/$snap"; continue
-  fi
-  sha="$(sha256sum "$STAGE/$snap" | cut -d' ' -f1)"
-  if [[ "${OLD_SHA[$rel]:-}" == "$sha" && -n "${OLD_ID[$rel]:-}" ]]; then
-    printf 'F\t%s\t%s\t%s\n' "$rel" "$sha" "${OLD_ID[$rel]}" >> "$TMP"
+  [[ -n "${OLD_ID[$rel]:-}" && -n "${OLD_SHA[$rel]:-}" ]] && NEED+=("$rel")
+done
+if [[ ${#NEED[@]} -gt 0 ]]; then
+  i=0
+  while IFS= read -r -d '' h; do
+    HASH["${NEED[$i]}"]="$h"; i=$((i+1))
+  done < <(for rel in "${NEED[@]}"; do
+             if [[ -n "${IS_ALLOW[$rel]:-}" ]]; then printf '%s\0' "$MAX_BYTES"; else printf '\0'; fi
+             printf '%s\0' "$rel"
+           done | node -e "$HASHER" "$REPO_REAL")
+  if [[ $i -ne ${#NEED[@]} ]]; then log "FATAL hasher returned $i of ${#NEED[@]} hashes"; exit 1; fi
+fi
+
+since_checkpoint=0
+WORK=()
+for rel in "${SET[@]}"; do
+  if [[ -n "${HASH[$rel]:-}" && "${HASH[$rel]}" == "${OLD_SHA[$rel]:-}" ]]; then
+    emit_row "$rel" "${OLD_SHA[$rel]}" "${OLD_ID[$rel]}"
     DONE["$rel"]=1
-    rm -f "$STAGE/$snap"
     skipped=$((skipped+1)); continue
   fi
-  pdir="$(dirname "$rel")"
-  parent="${FOLDER[$pdir]}"
-  name="$(basename "$rel")"
-  # A state miss is not proof of absence — a lost state file must not duplicate
-  # every file, so look the name up inside THIS parent id before creating,
-  # unless this run created that folder itself.
-  id="${OLD_ID[$rel]:-}"
-  if [[ -z "$id" && -z "${NEWDIR[$pdir]:-}" ]]; then id="$(find_child "$name" "$parent" files)"; fi
-  # stderr goes to its own file, never merged into the parsed stdout: under
-  # systemd (no keyring session) gws prints "Using keyring backend: keyring" to
-  # stderr on every call, and a 2>&1 capture makes every successful upload look
-  # like unparseable JSON. That failed 10 real uploads silently.
-  if [[ -n "$id" ]]; then
-    out="$(cd "$STAGE" && gws drive files update --params "$(jq -cn --arg f "$id" '{fileId:$f,fields:"id"}')" \
-           --upload "$snap" 2>"$ERRF")"
-    rm -f "$STAGE/$snap"
-    if [[ -z "$(printf '%s' "$out" | jq -r '.id // empty' 2>/dev/null)" ]]; then
-      log "ERROR update $rel: $(head -c 200 "$ERRF") | $(printf '%s' "$out" | head -c 200)"
-      failed=$((failed+1)); continue
-    fi
-    updated=$((updated+1)); log "UPDATE $rel -> $id"
-  else
-    out="$(cd "$STAGE" && gws drive files create --params '{"fields":"id"}' \
-           --json "$(jq -cn --arg n "$name" --arg p "$parent" '{name:$n,parents:[$p]}')" \
-           --upload "$snap" 2>"$ERRF")"
-    rm -f "$STAGE/$snap"
-    id="$(printf '%s' "$out" | jq -r '.id // empty' 2>/dev/null)"
-    if [[ -z "$id" ]]; then
-      log "ERROR create $rel: $(head -c 200 "$ERRF") | $(printf '%s' "$out" | head -c 200)"
-      failed=$((failed+1)); continue
-    fi
-    added=$((added+1)); log "ADD $rel -> $id"
-  fi
-  printf 'F\t%s\t%s\t%s\n' "$rel" "$sha" "$id" >> "$TMP"
+  WORK+=("$rel")
+done
+
+for p in "${!OLD_ID[@]}"; do
+  [[ -n "${DONE[$p]:-}" ]] && continue
+  [[ $LIVE_READY -eq 1 && -z "${LIVE[$p]:-}" ]] && continue
+  CARRY+=("$p")
+done
+CARRY_READY=1
+
+for rel in "${WORK[@]}"; do
+  pdir="${rel%/*}"
+  ask F "$rel" "${IS_ALLOW[$rel]:-}" "${FOLDER[$pdir]}" "${OLD_ID[$rel]:-}" "${NEWDIR[$pdir]:-}" "${OLD_SHA[$rel]:-}"
+  case "$R_KIND" in
+    MISSING) DONE["$rel"]=1; continue ;;
+    REFUSED) refuse "$rel" "$R_A"; continue ;;
+    SNAPERR|FAILED) failed=$((failed+1)); continue ;;
+    OVERSIZE) oversize=$((oversize+1)); DONE["$rel"]=1; continue ;;
+    SAME)
+      emit_row "$rel" "$R_A" "${OLD_ID[$rel]}"
+      DONE["$rel"]=1
+      skipped=$((skipped+1)); continue ;;
+    UPDATED) updated=$((updated+1)) ;;
+    ADDED) added=$((added+1)) ;;
+    *) log "FATAL publish worker replied '$R_KIND' for $rel"; exit 1 ;;
+  esac
+  emit_row "$rel" "$R_A" "$R_B"
   DONE["$rel"]=1
   since_checkpoint=$((since_checkpoint+1))
   if [[ $since_checkpoint -ge $CHECKPOINT_EVERY ]]; then persist; since_checkpoint=0; fi
 done
+
+worker_fd="${WORKER[1]}" worker_pid="$WORKER_PID"
+exec {worker_fd}>&-
+wait "$worker_pid"
 
 summary="done: added=$added updated=$updated skipped=$skipped failed=$failed refused=$refused folders_created=$folders_made tracked=${#TRACKED[@]}"
 if [[ -n "$CONFIG" ]]; then summary+=" allowlisted=${#ALLOW[@]} oversize=$oversize excluded=$excluded incomplete_roots=$enum_failed"; fi

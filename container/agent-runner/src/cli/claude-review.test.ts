@@ -28,6 +28,11 @@ const quota = {
   usage: { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
   modelUsage: {},
 };
+const revoked = {
+  ...quota,
+  api_error_status: 401,
+  result: 'Failed to authenticate: OAuth token revoked. Please log in again or contact your administrator.',
+};
 const success = { type: 'result', is_error: false, result: 'review complete' };
 const dirs: string[] = [];
 const services: ClaudeReviewService[] = [];
@@ -48,7 +53,7 @@ async function fixture(env: NodeJS.ProcessEnv = {}, mode = 'normal') {
   const cli = path.join(dir, 'claude-fake');
   fs.writeFileSync(
     cli,
-    `#!${process.execPath}\nimport fs from 'node:fs';\nconst input=await Bun.stdin.bytes();\nconst key=process.env.ANTHROPIC_API_KEY||process.env.CLAUDE_CODE_OAUTH_TOKEN||'none';\nfs.appendFileSync(${JSON.stringify(path.join(dir, 'calls'))},JSON.stringify({key,argv:process.argv.slice(2),stdin:Buffer.from(input).toString('base64'),cwd:process.cwd(),auth:Object.keys(process.env).filter(k=>/^(ANTHROPIC_API_KEY|CLAUDE_CODE_OAUTH_TOKEN)/.test(k))})+'\\n');\nif(process.env.MODE==='hang'){fs.writeFileSync(${JSON.stringify(path.join(dir, 'pid'))},String(process.pid));setInterval(()=>{},1000);await new Promise(()=>{});}\nif(process.env.MODE==='tree'){const child=Bun.spawn([process.execPath,'-e',\"process.on('SIGTERM',()=>{});require('fs').writeFileSync('grandchild-pid',String(process.pid));setInterval(()=>{},1000)\"],{stdio:['ignore','inherit','inherit']});setInterval(()=>{},1000);await child.exited;}\nif(process.env.MODE==='overflow'){await Bun.write(Bun.stdout,'x'.repeat(17*1024*1024));process.exit(1);}\nif(process.env.MODE==='nonquota'){console.log('bad configuration');process.exit(7);}\nif(process.env.MODE==='leak'){console.log(JSON.stringify({is_error:false,result:key}));console.error(key);process.exit(0);}\nconst fail=key!=='healthy'||process.env.MODE==='exhaust';console.log(JSON.stringify(fail?${JSON.stringify(quota)}:${JSON.stringify(success)}));process.exit(fail?1:0);\n`,
+    `#!${process.execPath}\nimport fs from 'node:fs';\nconst input=await Bun.stdin.bytes();\nconst key=process.env.ANTHROPIC_API_KEY||process.env.CLAUDE_CODE_OAUTH_TOKEN||'none';\nfs.appendFileSync(${JSON.stringify(path.join(dir, 'calls'))},JSON.stringify({key,argv:process.argv.slice(2),stdin:Buffer.from(input).toString('base64'),cwd:process.cwd(),auth:Object.keys(process.env).filter(k=>/^(ANTHROPIC_API_KEY|CLAUDE_CODE_OAUTH_TOKEN)/.test(k))})+'\\n');\nif(process.env.MODE==='hang'){fs.writeFileSync(${JSON.stringify(path.join(dir, 'pid'))},String(process.pid));setInterval(()=>{},1000);await new Promise(()=>{});}\nif(process.env.MODE==='tree'){const child=Bun.spawn([process.execPath,'-e',\"process.on('SIGTERM',()=>{});require('fs').writeFileSync('grandchild-pid',String(process.pid));setInterval(()=>{},1000)\"],{stdio:['ignore','inherit','inherit']});setInterval(()=>{},1000);await child.exited;}\nif(process.env.MODE==='overflow'){await Bun.write(Bun.stdout,'x'.repeat(17*1024*1024));process.exit(1);}\nif(process.env.MODE==='nonquota'){console.log('bad configuration');process.exit(7);}\nif(process.env.MODE==='leak'){console.log(JSON.stringify({is_error:false,result:key}));console.error(key);process.exit(0);}\nconst fail=key!=='healthy'||process.env.MODE==='exhaust';console.log(JSON.stringify(fail?(process.env.MODE==='revoked'?${JSON.stringify(revoked)}:${JSON.stringify(quota)}):${JSON.stringify(success)}));process.exit(fail?1:0);\n`,
     { mode: 0o700 },
   );
   const snapshot = { PATH: process.env.PATH, MODE: mode, ...env };
@@ -77,6 +82,19 @@ async function until(check: () => boolean) {
 }
 
 describe('Claude review credential rotation', () => {
+  it('moves past a revoked token to the next slot', async () => {
+    const { service, calls } = await fixture(
+      { CLAUDE_CODE_OAUTH_TOKEN: 'dead', CLAUDE_CODE_OAUTH_TOKEN_2: 'healthy' },
+      'revoked',
+    );
+
+    const response = await requestClaudeReview(service.socketPath, request('/tmp'));
+
+    expect(response.exitCode).toBe(0);
+    expect(JSON.parse(response.stdout).result).toBe('review complete');
+    expect(calls().map((c) => c.key)).toEqual(['dead', 'healthy']);
+  });
+
   it('preserves ordinary auth behavior with no configured ring', async () => {
     const f = await fixture();
     const result = await requestClaudeReview(f.service.socketPath, request(f.dir));

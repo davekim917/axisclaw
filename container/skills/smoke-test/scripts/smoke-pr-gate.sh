@@ -21,9 +21,18 @@ set -u
 # verb has to know about it and a stale positional can never mean "take the
 # slot". Only `claim` reads it (see below).
 TAKEOVER=false
+# `poll --recovery-only`: everything `poll` does (its alarms, its same-run
+# recovery) except opening a campaign. The live controller runs it while it may
+# not claim, because a lapsed lease is what makes its renewer fail, and only a
+# recovery clears a lapsed lease.
+RECOVERY_ONLY=false
 _ARGS=()
 for _a in "$@"; do
-  if [ "$_a" = "--takeover" ]; then TAKEOVER=true; else _ARGS+=("$_a"); fi
+  case "$_a" in
+    --takeover) TAKEOVER=true ;;
+    --recovery-only) RECOVERY_ONLY=true ;;
+    *) _ARGS+=("$_a") ;;
+  esac
 done
 set -- ${_ARGS[@]+"${_ARGS[@]}"}; GATE_VERB="${1:-poll}"; . "$(dirname -- "${BASH_SOURCE[0]}")/smoke-pr-gate-observe.sh"
 . "$(dirname -- "${BASH_SOURCE[0]}")/smoke-gate-layout.sh"
@@ -117,6 +126,10 @@ num_env WARMUP_TIMEOUT SMOKE_GATE_WARMUP_TIMEOUT 600
 # 6.5 hours while the CI fetch returned nothing on every 10-minute poll, and
 # nothing anywhere said so. A gate that cannot settle must be loud.
 num_env FACTS_STUCK_TIMEOUT SMOKE_GATE_FACTS_STUCK_SECONDS 3600
+# A walk PR (smoke-freeze-pr.sh --walk) is one task run's preview. Its run
+# closes it; past this age poll closes it, because a container that died
+# mid-walk leaves an open preview billing until someone does.
+num_env WALK_MAX_SECONDS SMOKE_GATE_WALK_MAX_SECONDS 21600
 # Freeze-PR handoff wiring, `finish` only, freeze PRs only (see the header
 # comment above `detect_freeze` and the `finish` command below). All three
 # are no-ops unless set — a deployment that never wires them keeps today's
@@ -1561,6 +1574,15 @@ active_run_is_live() {
   else
     printf 'false'
   fi
+}
+
+# Does a reclaim of this slot on <head-sha> CONTINUE the campaign that holds it?
+# Same frozen SHA, no disposition recorded, a run id already published. A
+# different SHA is a different campaign and mints a new id.
+slot_continues_on() {  # <state-json> <head-sha>
+  [ "$(jq -r --arg sha "$2" \
+        'if (.activeSha == $sha and .challengerDisposition == null and (.activeRunId // "") != "")
+         then "true" else "false" end' <<<"$1")" = true ]
 }
 
 # Seconds a live run has held its slot. Only `claim` reads this, to decide
@@ -3031,12 +3053,26 @@ config_verb() {
   exit 1
 }
 
+# `liveness`: the lease TTL and liveness window this script applies to the
+# environment it was handed, as numbers, so a caller judges by the values in
+# force rather than by its own reading of the env file. Read-only, like config.
+liveness_verb() {
+  jq -cn --argjson ttl "$LEASE_TTL_SECONDS" --argjson stale "$PROGRESS_STALE_SECONDS" \
+    '{ok:true,leaseTtlSeconds:$ttl,progressStaleSeconds:$stale}'
+  exit 0
+}
+
 COMMAND="${1:-poll}"
+if [ "$RECOVERY_ONLY" = true ] && [ "$COMMAND" != poll ]; then
+  jq -cn --arg command "$COMMAND" '{ok:false,error:("--recovery-only applies only to poll, not " + $command)}'
+  exit 2
+fi
 
 # The layout validator runs once, before any mode: `poll` names a bad prefix in
 # its throttled gate_misconfigured wake below, and every other mode refuses here.
 LAYOUT_MISSING="$(layout_prefix_problems)"
 [ "$COMMAND" != config ] || config_verb
+[ "$COMMAND" != liveness ] || liveness_verb
 if [ -n "$LAYOUT_MISSING" ] && [ "$COMMAND" != poll ]; then
   jq -cn --argjson missing "$(printf '%s\n' $LAYOUT_MISSING | jq -Rsc 'split("\n") | map(select(length > 0))')" \
     '{ok:false,error:"gate misconfigured",missing:$missing}'
@@ -3340,10 +3376,7 @@ if [ "$COMMAND" = "claim" ]; then
   # reclaim under the published id, or say --takeover and mean it. Note this
   # can only bite once the incumbent is no longer live — a live run is already
   # refused by the slot check above.
-  if [ "$TAKEOVER" != true ] &&
-     [ "$(jq -r --arg sha "$SHA" \
-          'if (.activeSha == $sha and .challengerDisposition == null and (.activeRunId // "") != "")
-           then "true" else "false" end' <<<"$STATE")" = true ] &&
+  if [ "$TAKEOVER" != true ] && slot_continues_on "$STATE" "$SHA" &&
      [ "$(jq -r '.activeRunId // empty' <<<"$STATE")" != "$RUN_ID" ]; then
     jq -cn --argjson pr "$PR" --arg run "$RUN_ID" \
       --arg active "$(jq -r '.activeRunId // empty' <<<"$STATE")" \
@@ -5198,7 +5231,7 @@ if [ "$COMMAND" != "poll" ]; then
     '{ok:false,error:("unknown command: " + $command),
       commands:["poll","check","wait-settled","claim","release","progress","finish",
                 "lease-claim","lease-renew","lease-release","lease-status",
-                "challenger-start","challenger-timeout"]}'
+                "challenger-start","challenger-timeout","config","liveness"]}'
   exit 2
 fi
 
@@ -5226,7 +5259,7 @@ if [ -n "$MISSING" ]; then
 fi
 
 PR_LIST_JSON="$(timeout 10 gh pr list -R "$REPO" --base "$BRANCH" --label "$LABEL" --state open \
-  --json number,headRefOid,headRefName --limit 100 2>/dev/null)"
+  --json number,headRefOid,headRefName,isDraft,createdAt --limit 100 2>/dev/null)"
 PR_LIST_RC=$?
 PR_LIST_LEN="$(jq -r 'length' <<<"$PR_LIST_JSON" 2>/dev/null || printf -- '-1')"
 # An EMPTY list is the one answer this command cannot be trusted on. `gh pr
@@ -5280,6 +5313,33 @@ flock -w 5 8 || true
 CONTROL="$(jq -c '.fetchFailures=0' <<<"$(read_control)")"
 write_control "$CONTROL"
 flock -u 8
+
+WALK_HELPER="$(dirname -- "${BASH_SOURCE[0]}")/smoke-freeze-pr.sh"
+while IFS= read -r WALK; do
+  WALK_PR="$(jq -r '.number' <<<"$WALK")"
+  WALK_OPENED="$(epoch_or_zero "$(jq -r '.createdAt // empty' <<<"$WALK")")"
+  [ "$WALK_OPENED" -gt 0 ] && [ "$(( $(date -u +%s) - WALK_OPENED ))" -ge "$WALK_MAX_SECONDS" ] || continue
+  WALK_OUT="$(bash "$WALK_HELPER" close-walk "$WALK_PR" 2>/dev/null)" || true
+  WALK_RESULT="$(jq -ce 'select(type == "object")' <<<"$WALK_OUT" 2>/dev/null)" || WALK_RESULT=null
+  WALK_RECORD="$(jq -cn --argjson pr "$WALK_PR" --arg opened "$(jq -r '.createdAt' <<<"$WALK")" --arg at "$(iso_now)" \
+    --argjson max "$WALK_MAX_SECONDS" --argjson result "$WALK_RESULT" \
+    '{pr:$pr,openedAt:$opened,attemptedAt:$at,maxSeconds:$max,result:$result}')"
+  printf '%s\n' "$WALK_RECORD" >> "$STATE_DIR/walk-closures.jsonl"
+  [ "$(jq -r '.ok == true' <<<"$WALK_RESULT")" != true ] || continue
+  WALK_SHA="$(jq -r '.headRefOid' <<<"$WALK")"
+  exec 9>"$(pr_lock_file "$WALK_PR")"
+  flock -w 5 9 || continue
+  STATE="$(read_pr_state "$WALK_PR")"
+  if [ "$(jq -r '.walkCloseAlertSha // empty' <<<"$STATE")" != "$WALK_SHA" ]; then
+    write_pr_state "$WALK_PR" "$(jq -c --arg sha "$WALK_SHA" '.walkCloseAlertSha=$sha' <<<"$STATE")"
+    jq -c --arg sha "$WALK_SHA" \
+      '{wakeAgent:true,data:{schemaVersion:1,trigger:"pr_walk_close_failed",pr:.pr,sourceSha:$sha,
+        openedAt:.openedAt,maxSeconds:.maxSeconds,result:.result}}' <<<"$WALK_RECORD"
+    exit 0
+  fi
+  flock -u 9
+done < <(jq -c '.[] | select(.isDraft == true and ((.headRefName // "") | startswith("smoke/walk-")))' <<<"$PR_LIST_JSON")
+PR_LIST_JSON="$(jq -c '[.[] | select((.headRefName // "") | startswith("smoke/walk-") | not)]' <<<"$PR_LIST_JSON")"
 
 PR_COUNT="$(jq -r 'length' <<<"$PR_LIST_JSON")"
 if [ "$PR_COUNT" -eq 0 ]; then
@@ -5457,6 +5517,10 @@ while IFS= read -r ROW; do
   if [ -n "$ACTIVE_SHA" ] && [ "$(active_run_is_live \
         "$(jq -r '.activeStartedAt // empty' <<<"$STATE")" \
         "$(jq -r '.activeProgressAt // empty' <<<"$STATE")")" = true ]; then
+    continue
+  fi
+
+  if [ "$RECOVERY_ONLY" = true ] && ! slot_continues_on "$STATE" "$HEAD_SHA"; then
     continue
   fi
 
@@ -5656,11 +5720,12 @@ if [ -s "$SETTLE_CANDIDATES" ]; then
   # (same predicate `claim` refuses id drift on, and the same one the deadline
   # is preserved by below). A different SHA is a different campaign and mints.
   RESUMED_RUN_ID=false
-  if [ "$(jq -r --arg sha "$HEAD_SHA" \
-        'if (.activeSha == $sha and .challengerDisposition == null and (.activeRunId // "") != "")
-         then "true" else "false" end' <<<"$STATE")" = true ]; then
+  if slot_continues_on "$STATE" "$HEAD_SHA"; then
     RUN_ID="$(jq -r '.activeRunId' <<<"$STATE")"
     RESUMED_RUN_ID=true
+  elif [ "$RECOVERY_ONLY" = true ]; then
+    declare_quiet "$(jq -cn '{wakeAgent:false,data:{schemaVersion:1,trigger:"waiting_for_candidates"}}')"
+    exit $?
   else
     RUN_STAMP_EPOCH="$(date -u +%s)"
     RUN_ID="$(campaign_run_id "$W_PR" "$HEAD_SHA" "$RUN_STAMP_EPOCH")"

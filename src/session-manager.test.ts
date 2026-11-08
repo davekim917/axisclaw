@@ -73,6 +73,8 @@ import type { AgentGroup, Session } from './types.js';
 
 const AG = 'ag-test';
 const SESS = 'sess-test';
+const OPERATOR_ID = 'discord:operator';
+const OPERATOR_PREFERENCE = `---\nids: [${OPERATOR_ID}]\n---\n# Operator\nJordan owns deployment.`;
 
 // The three admission entry points take a mailbox SESSION now (mailbox seam
 // PR 7), not a raw handle. These wrappers open one for the named session so
@@ -488,12 +490,12 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
     const memoryRoot = path.join(TEST_DATA_DIR, 'workgroups', 'reset', 'memory');
     fs.mkdirSync(path.join(memoryRoot, 'preferences'), { recursive: true });
     fs.writeFileSync(path.join(memoryRoot, 'index.md'), '# Canon\nJordan owns deployment.');
-    fs.writeFileSync(path.join(memoryRoot, 'preferences', 'operator.md'), '# Operator\nJordan owns deployment.');
+    fs.writeFileSync(path.join(memoryRoot, 'preferences', 'operator.md'), OPERATOR_PREFERENCE);
     const message = (id: string) => ({
       id,
       kind: 'chat-sdk',
       timestamp: '2026-07-25T00:00:00.000Z',
-      content: JSON.stringify({ text: 'Who owns deployment?', sender: 'Operator' }),
+      content: JSON.stringify({ text: 'Who owns deployment?', sender: 'Operator', senderId: OPERATOR_ID }),
     });
 
     await writeSessionMessage(AG, SESS, message('epoch-first'));
@@ -674,12 +676,12 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
     const memoryRoot = path.join(TEST_DATA_DIR, 'workgroups', 'reset', 'memory');
     fs.mkdirSync(path.join(memoryRoot, 'preferences'), { recursive: true });
     fs.writeFileSync(path.join(memoryRoot, 'index.md'), '# Canon\nJordan owns deployment.');
-    fs.writeFileSync(path.join(memoryRoot, 'preferences', 'operator.md'), '# Operator\nJordan owns deployment.');
+    fs.writeFileSync(path.join(memoryRoot, 'preferences', 'operator.md'), OPERATOR_PREFERENCE);
     const message = (id: string, text: string) => ({
       id,
       kind: 'chat-sdk',
       timestamp: '2026-07-25T00:00:00.000Z',
-      content: JSON.stringify({ text, sender: 'Operator' }),
+      content: JSON.stringify({ text, sender: 'Operator', senderId: OPERATOR_ID }),
     });
 
     await writeSessionMessage(AG, SESS, message('clear-epoch-first', 'Who owns deployment?'));
@@ -741,12 +743,12 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
     const memoryRoot = path.join(TEST_DATA_DIR, 'workgroups', 'reset', 'memory');
     fs.mkdirSync(path.join(memoryRoot, 'preferences'), { recursive: true });
     fs.writeFileSync(path.join(memoryRoot, 'index.md'), '# Canon\nJordan owns deployment.');
-    fs.writeFileSync(path.join(memoryRoot, 'preferences', 'operator.md'), '# Operator\nJordan owns deployment.');
+    fs.writeFileSync(path.join(memoryRoot, 'preferences', 'operator.md'), OPERATOR_PREFERENCE);
     await writeSessionMessage(AG, SESS, {
       id: 'fresh-task-first',
       kind: 'chat-sdk',
       timestamp: '2026-07-25T00:00:00.000Z',
-      content: JSON.stringify({ text: 'Who owns deployment?', sender: 'Operator' }),
+      content: JSON.stringify({ text: 'Who owns deployment?', sender: 'Operator', senderId: OPERATOR_ID }),
     });
     const inbound = new Database(inboundDbPath(AG, SESS));
     const outbound = new Database(outboundDbPath(AG, SESS));

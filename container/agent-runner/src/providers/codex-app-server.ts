@@ -9,6 +9,7 @@ import {
   type CodexRateLimitsReadResponse,
   parseCodexRateLimitsReadResponse,
 } from './codex-rate-limits.js';
+import { usableToolTimeoutMs } from './mcp-tool-timeout.js';
 
 function log(msg: string): void {
   console.error(`[codex-app-server] ${msg}`);
@@ -606,6 +607,8 @@ export interface CodexStdioMcpServer {
   env?: Record<string, string>;
   /** Absolute by the time it reaches here. */
   cwd?: string;
+  /** Tool-call timeout in milliseconds; Codex takes seconds. */
+  timeout?: number;
 }
 
 export interface CodexHttpMcpServer {
@@ -677,6 +680,10 @@ export function renderCodexMcpServer(name: string, config: CodexMcpServer): stri
     const argsStr = config.args.map(tomlBasicString).join(', ');
     lines.push(`args = [${argsStr}]`);
   }
+  const timeoutMs = usableToolTimeoutMs(config.timeout);
+  if (timeoutMs !== undefined) {
+    lines.push(`tool_timeout_sec = ${timeoutMs / 1000}`);
+  }
   if (config.env && Object.keys(config.env).length > 0) {
     lines.push(`[mcp_servers.${tomlName}.env]`);
     for (const [key, value] of Object.entries(config.env)) {
@@ -698,56 +705,25 @@ export function writeCodexMcpConfigToml(servers: Record<string, CodexMcpServer>)
   log(`Wrote MCP config.toml (${Object.keys(servers).length} server(s))`);
 }
 
-export function buildCodexHooksJson(opts?: { emailGateTimeoutSec?: number }): {
-  hooks: {
-    PreToolUse: { hooks: { type: 'command'; command: string; timeout: number }[] }[];
-    PostToolUse: { hooks: { type: 'command'; command: string; timeout: number }[] }[];
-  };
-} {
-  const cliPath = '/app/src/codex-hooks/cli.ts';
-  const preTimeoutSec = opts?.emailGateTimeoutSec ?? 3600;
-  return {
-    hooks: {
-      PreToolUse: [
-        {
-          hooks: [
-            {
-              type: 'command' as const,
-              command: `bun ${cliPath} PreToolUse`,
-              timeout: preTimeoutSec,
-            },
-          ],
-        },
-      ],
-      PostToolUse: [
-        {
-          hooks: [
-            {
-              type: 'command' as const,
-              command: `bun ${cliPath} PostToolUse`,
-              timeout: 30,
-            },
-          ],
-        },
-      ],
-    },
-  };
-}
-
 /**
- * The PreToolUse email gate waits up to 60 minutes for approval, hence its long timeout. The caller keys the
- * `[hooks.state.*]` trust entries on the returned directory, since Codex will not run an untrusted hook.
+ * The destructive-action guard chain, installed root-owned by the image from `container/codex-system/`. Codex reads
+ * it as the system config layer under every CODEX_HOME and dispatches it as managed (no trust row), and the image's
+ * requirements.toml pins hooks on, so no home, flag or config the agent writes can remove or disable it.
  */
-export function writeCodexHooksJson(opts?: { emailGateTimeoutSec?: number; codexHome?: string }): string {
-  // Same resolver as the config writer: a rotated home must get the hooks too, or the guard silently stops firing.
-  // An explicit codexHome lets peer-mode `codex exec` get the hook before CODEX_HOME is switched.
-  const codexConfigDir = opts?.codexHome ?? resolveCodexConfigDir();
-  fs.mkdirSync(codexConfigDir, { recursive: true });
-  const hooksJsonPath = path.join(codexConfigDir, 'hooks.json');
-  const hooks = buildCodexHooksJson(opts);
-  fs.writeFileSync(hooksJsonPath, JSON.stringify(hooks, null, 2));
-  log(`Wrote hooks.json (PreToolUse timeout=${hooks.hooks.PreToolUse[0].hooks[0].timeout}s)`);
-  return codexConfigDir;
+export const SYSTEM_CODEX_HOOKS_PATH = '/etc/codex/hooks.json';
+
+/** The installed chain's `hooks` block, or null when the image ships none (an image older than the system layer). */
+export function readSystemCodexHooks(
+  systemHooksPath: string = SYSTEM_CODEX_HOOKS_PATH,
+): Record<string, unknown> | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(fs.readFileSync(systemHooksPath, 'utf-8'));
+  } catch {
+    return null;
+  }
+  const hooks = (parsed as { hooks?: unknown } | null)?.hooks;
+  return hooks && typeof hooks === 'object' && !Array.isArray(hooks) ? (hooks as Record<string, unknown>) : null;
 }
 
 /** `model` is not emitted here: thread/start carries it as a first-class parameter. */
@@ -770,8 +746,8 @@ export function createCodexConfigOverrides(
     // threshold in sync with this value.
     'project_doc_max_bytes=262144',
     // Also set here in case a rotated OAuth fallback home lost its generated config.toml.
-    'model_context_window=400000',
-    'model_auto_compact_token_limit=360000',
+    'model_context_window=800000',
+    'model_auto_compact_token_limit=720000',
     'features.fast_mode=false',
     // Each subagent owns a full MCP subprocess tree: an unbounded worker count exhausts the PID cgroup and
     // surfaces as a misleading protocol-desync error.

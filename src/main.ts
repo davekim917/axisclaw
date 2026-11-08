@@ -50,6 +50,7 @@ import {
   getContainerIdentity,
   honorPendingStopIntents,
   planContainerShutdown,
+  prewarmAgentGroupImages,
 } from './container-runner.js';
 import { quiesceWorkgroupsForBootMountChange, type BootQuiescenceScope } from './container-restart.js';
 import { writeUpstreamPolicySnapshot } from './container-updates.js';
@@ -57,6 +58,7 @@ import { setDeliveryAdapter, startActiveDeliveryPoll, startSweepDeliveryPoll, st
 import { getHostInstanceId, startHostInstanceLease, stopHostInstanceLease } from './host-instance.js';
 import { startHostSweep, stopHostSweep } from './host-sweep.js';
 import { ensureArchiveSchema } from './message-archive.js';
+import { migrateArchiveSearchAtBoot } from './archive-search-sync.js';
 import { startHostModules, stopHostModules } from './host-lifecycle.js';
 import { runOnecliBootPreflight } from './onecli-preflight.js';
 import { resetStorageActivityState } from './storage-activity.js';
@@ -215,6 +217,40 @@ async function checkDependencyLinks(): Promise<void> {
   }
 }
 
+/**
+ * Fire-and-forget: boot does not wait on Slack. A failed send leaves the migrator's ERROR line. An incomplete
+ * merge keeps its source, so it is retried, and alerted, at every boot until it completes.
+ */
+function alertSharedDirMerge(merge: SharedDirMerge): void {
+  const what =
+    `${merge.copied} file(s) were copied in at their own paths, ${merge.duplicates} were already identical, and ` +
+    `${merge.skipped} special file(s) were skipped.` +
+    (merge.orphanPath
+      ? ` ${merge.collisions} were copied to \`${merge.orphanPath}\` instead: they collided with different content ` +
+        'at the same path, or sit in a git repo, which is copied whole rather than merged.'
+      : '');
+  const kept =
+    merge.unaccounted.length === 0
+      ? `Every file is accounted for, so \`${merge.source}\` now links to the shared dir.`
+      : `${merge.unaccounted.length} entr(ies) could not be placed (e.g. ${merge.unaccounted.slice(0, 3).join(', ')}), ` +
+        `so \`${merge.source}\` was left in place with its links, and every boot retries until it completes.`;
+  void notifyOwner({
+    title: `Workgroup ${merge.workgroupId}: "${merge.name}" collided with an existing shared dir`,
+    body:
+      `The seed folder's real \`${merge.name}/\` collided with a different \`${merge.name}/\` already in the ` +
+      `workgroup's shared tree (\`${merge.sharedPath}\`). Nothing was deleted or overwritten. ${what}\n\n${kept}` +
+      (merge.orphanPath ? '\n\nReconcile the set-aside copy with the shared dir, then remove it.' : ''),
+  })
+    .then((result) => {
+      if (result.code !== 0)
+        log.warn('shared-dirs: could not DM the owner about a collision', {
+          code: result.code,
+          message: result.message,
+        });
+    })
+    .catch((err: unknown) => log.warn('shared-dirs: could not DM the owner about a collision', { err }));
+}
+
 async function dispatchResponse(payload: ResponsePayload): Promise<void> {
   for (const handler of getResponseHandlers()) {
     try {
@@ -269,6 +305,8 @@ import {
   reconcileWorkgroupSharedDirs,
   sharedDirsPendingChange,
   workgroupMemoryPendingChange,
+  type SharedDirMerge,
+  type SharedDirsReconcileReport,
   type SharedDirsPendingChange,
   type WorkgroupMemoryPendingChange,
   type WorkgroupMemoryReport,
@@ -329,7 +367,7 @@ export interface BootMountQuiescenceDeps {
     },
   ) => Promise<BootQuiescenceScope>;
   warnStartup?: (reason: string, skipSessionIds: ReadonlySet<string>) => Promise<void>;
-  reconcileShared?: (db: Database.Database, dirs: { workgroupIds?: string[] }) => unknown;
+  reconcileShared?: (db: Database.Database, dirs: { workgroupIds?: string[] }) => SharedDirsReconcileReport[] | void;
   memoryGate?: (db: Database.Database, opts: { mutateWorkgroupIds?: string[] }) => WorkgroupMemoryReport[];
   prune?: () => void;
   fatal?: (message: string, err: unknown) => never;
@@ -473,7 +511,8 @@ export async function runBootMountQuiescence(
   // Flag-gated (NANOCLAW_WORKGROUP_SHARED_FS, default off). Idempotent and fail-closed.
   if (sharedFsEnabled) {
     try {
-      (deps.reconcileShared ?? reconcileWorkgroupSharedDirs)(db, { workgroupIds: reconcileWorkgroupIds });
+      const out = (deps.reconcileShared ?? reconcileWorkgroupSharedDirs)(db, { workgroupIds: reconcileWorkgroupIds });
+      for (const merge of (out ?? []).flatMap((report) => report.merges)) alertSharedDirMerge(merge);
     } catch (sharedErr) {
       fatal('Workgroup shared-FS consolidation failed at startup', sharedErr);
     }
@@ -564,6 +603,8 @@ export async function main(): Promise<void> {
   // Before ANY service that can spawn (the dashboard's run-now included): until the archive's row-mark schema
   // exists every projection freshness stamp fails closed, and every spawn does the full rebuild.
   ensureArchiveSchema();
+  // Before session adoption, the channel adapters and the sweep: nothing writes or searches the archive until then.
+  await migrateArchiveSearchAtBoot();
 
   // Before anything can spawn, so every spawn this process makes mounts the same tree, not a checkout mid-pull.
   activateAgentRunnerSource();
@@ -699,6 +740,15 @@ export async function main(): Promise<void> {
       }
     } catch (err) {
       log.warn('agent-runner deps drift check failed at boot', { err });
+    }
+  })();
+
+  // Detached: the builds take minutes, and a spawn that arrives first is refused and joins the same rebuild.
+  void (async () => {
+    try {
+      await prewarmAgentGroupImages();
+    } catch (err) {
+      log.warn('Per-agent-group image pre-warm failed at boot', { err });
     }
   })();
 

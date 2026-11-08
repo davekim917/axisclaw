@@ -7,14 +7,20 @@ import { taskThreadId } from '../../../db/sessions.js';
 
 const KEY_RE = /^[A-Za-z0-9][A-Za-z0-9._:/#-]{0,199}$/;
 const TASK_DISPATCH_MAX_RECOVERIES = 2;
+const DISPATCH_SERIES_PREFIX = 'dispatch-';
+/** The next string after every `dispatch-…` id, so the receipt lookup is an index range and never reads `content`. */
+const DISPATCH_SERIES_PREFIX_END = 'dispatch.';
+const SHA256_HEX_LENGTH = 64;
 
 /** Terminal event rows remain replay receipts even after their container stops. */
 export function hasTaskDispatchEvents(db: Database.Database): boolean {
   return !!db
     .prepare(
-      `SELECT 1 FROM messages_in WHERE kind = 'task'
-    AND CASE WHEN json_valid(content) THEN json_type(content, '$.dispatch') IS NOT NULL ELSE 0 END
-    LIMIT 1`,
+      `SELECT 1 FROM messages_in
+        WHERE series_id >= '${DISPATCH_SERIES_PREFIX}' AND series_id < '${DISPATCH_SERIES_PREFIX_END}'
+          AND length(series_id) = ${DISPATCH_SERIES_PREFIX.length + SHA256_HEX_LENGTH}
+          AND kind = 'task'
+        LIMIT 1`,
     )
     .get();
 }
@@ -27,7 +33,11 @@ export function validateDispatchKey(value: unknown, name: string): asserts value
 
 export function dispatchSeriesId(contextKey: string): string {
   validateDispatchKey(contextKey, 'context key');
-  return `dispatch-${createHash('sha256').update(contextKey).digest('hex')}`;
+  return `${DISPATCH_SERIES_PREFIX}${createHash('sha256').update(contextKey).digest('hex')}`;
+}
+
+export function isDispatchSeries(seriesId: string | null | undefined): boolean {
+  return seriesId?.startsWith(DISPATCH_SERIES_PREFIX) ?? false;
 }
 
 function dispatchEventId(contextKey: string, eventKey: string): string {
@@ -88,7 +98,8 @@ function metadata(row: StoredEvent): DispatchMetadata {
 export function dispatchTaskEvent(
   db: Database.Database,
   input: TaskDispatchInput,
-  outbound: Database.Database | null = null,
+  outbound: Database.Database | null,
+  containerLive: boolean,
 ): TaskDispatchResult {
   const seriesId = dispatchSeriesId(input.contextKey);
   const rowId = dispatchEventId(input.contextKey, input.eventKey);
@@ -121,7 +132,7 @@ export function dispatchTaskEvent(
       } else if (input.retryOf !== undefined) {
         const previous = find(dispatchEventId(input.contextKey, input.retryOf));
         if (!previous || previous.series_id !== seriesId) throw new Error('retry predecessor not found in context');
-        const settlement = readTaskSettlement(db, outbound, previous.id, taskThreadId(seriesId));
+        const settlement = readTaskSettlement(db, outbound, previous.id, taskThreadId(seriesId), containerLive);
         const providerFailed =
           previous.status === 'completed' && settlement.executionSettled && settlement.outcome === 'error';
         if (previous.status !== 'failed' && previous.status !== 'expired' && !providerFailed) {

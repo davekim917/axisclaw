@@ -1,16 +1,9 @@
 /**
- * F-4.3a (docs/specs/upstream-host-sweep-seam/plan.md §8, S2-PR4) — half of
- * "session-title and thread-title sweeps keep their caps, cooldowns and
- * backoffs". Ported from src/dashboard/session-title-sweep.test.ts (that
- * file's own full suite is untouched — this family PR only moved the
- * tick:housekeeping registration wrapper (T15), not the dashboard module's
- * own code, so its behavior is re-proven here as the acceptance evidence for
- * the moved wrapper's dependency).
+ * The session-title sweep keeps its caps, cooldowns and backoffs when it runs
+ * through its tick:housekeeping registration, not only when called directly.
  *
  * Kept in its own file, not central.test.ts: this fixture needs the REAL
- * src/llm.js, which conflicts
- * with thread-title-retry.test.ts's full `vi.mock('../../llm.js', ...)` —
- * `vi.mock` is hoisted per FILE, not per `describe` block.
+ * src/llm.js, and `vi.mock` is hoisted per FILE, not per `describe` block.
  *
  * Codex review finding (efb8350a..838d84f6, accepted): the cases above call
  * `runSessionTitleSweep` DIRECTLY, proving the dashboard module's own
@@ -129,7 +122,7 @@ function seedSession(
     .prepare(
       "INSERT OR IGNORE INTO sessions (id, agent_group_id, messaging_group_id, thread_id, status, created_at) VALUES (?, ?, NULL, ?, 'active', ?)",
     )
-    .run(id, agentGroupId, `system:tasks:${id}`, now());
+    .run(id, agentGroupId, `slack:C0:${id}`, now());
   if (opts.title !== undefined || opts.title_generated_at !== undefined || opts.title_basis_seq !== undefined) {
     getRawDb()
       .prepare(`UPDATE sessions SET title = ?, title_generated_at = ?, title_basis_seq = ? WHERE id = ?`)
@@ -201,6 +194,7 @@ describe('F-4.3a — session-title sweep keeps its cap, cooldown and new-message
       title_basis_seq: 50,
     });
     writeInboundMessages('ag-1', 'sess-quiet', [[54, '{"text":"hi"}']]); // 4 past basis_seq
+    getRawDb().prepare('UPDATE sessions SET last_active = ?').run(new Date().toISOString());
     const quietBackend = vi.fn(async () => 'newer title');
     setTitleBackendForTest(quietBackend);
     const quietResult = await runSessionTitleSweep();
@@ -217,6 +211,7 @@ describe('F-4.3a — session-title sweep keeps its cap, cooldown and new-message
       'sess-busy',
       Array.from({ length: 12 }, (_, i) => [10 + i + 1, JSON.stringify({ text: `msg ${i}` })]) as [number, string][],
     );
+    getRawDb().prepare('UPDATE sessions SET last_active = ?').run(new Date().toISOString());
     setTitleBackendForTest(async () => 'refreshed title');
     const busyResult = await runSessionTitleSweep();
     expect(busyResult.generated).toBe(1);

@@ -31,6 +31,7 @@ import { log } from '../../log.js';
 import { assertHttpsEndpoint, discoverAuthorization, type FetchLike } from './discovery.js';
 import {
   buildAuthorizeUrl,
+  clientCredentialsToken,
   exchangeAuthorizationCode,
   isUnrecoverableGrantError,
   OAuthTokenError,
@@ -41,6 +42,7 @@ import {
 } from './oauth-client.js';
 import {
   deleteOnecliSecret,
+  existingSecretOnHost,
   findOnecliSecretByName,
   putOnecliBearerSecret,
   type OnecliSecretRef,
@@ -168,6 +170,12 @@ async function startLoginLocked(input: LoginInput, fetchImpl: FetchLike): Promis
   const group = await getAgentGroup(input.agentGroupId);
   if (!group) throw new Error(`Agent group not found: ${input.agentGroupId}`);
 
+  if ((await getMcpOAuthIntegration(input.name))?.grant_type === 'client_credentials') {
+    throw new Error(
+      `"${input.name}" holds client credentials; replace them with \`ncl integrations add-client --replace\`.`,
+    );
+  }
+
   const mcp = new URL(input.mcpUrl);
   // `--issuer` is gated inside `discoverAuthorization`, where override and discovered issuers meet.
   const discovered = await discoverAuthorization(fetchImpl, input.mcpUrl, input.issuer);
@@ -269,6 +277,7 @@ async function startLoginLocked(input: LoginInput, fetchImpl: FetchLike): Promis
     agent_group_id: input.agentGroupId,
     mcp_url: input.mcpUrl,
     resource: input.noResourceIndicator ? null : (discovered.resource ?? null),
+    grant_type: 'authorization_code',
     authorization_endpoint: discovered.authorizationEndpoint,
     token_endpoint: discovered.tokenEndpoint,
     registration_endpoint: discovered.registrationEndpoint ?? null,
@@ -403,7 +412,7 @@ async function startLoginLocked(input: LoginInput, fetchImpl: FetchLike): Promis
             clientSecret: bundle.clientSecret,
             code,
             codeVerifier: bundle.pending.codeVerifier,
-            redirectUri: row.redirect_uri,
+            redirectUri: loginRedirectUri(row),
             resource: row.resource ?? undefined,
           });
           await finalizeToken(row, bundle, token, { newGrant: true });
@@ -576,6 +585,14 @@ export function completeLogin(
   return withIntegrationLock(input.name, () => completeLoginLocked(input, fetchImpl));
 }
 
+/** A client-credentials integration has no browser login, so nothing may complete one. */
+function loginRedirectUri(row: McpOAuthIntegration): string {
+  if (row.grant_type !== 'authorization_code' || !row.redirect_uri) {
+    throw new Error(`"${row.name}" holds client credentials and has no login to complete.`);
+  }
+  return row.redirect_uri;
+}
+
 async function completeLoginLocked(
   input: { name: string; redirectResponse: string },
   fetchImpl: FetchLike,
@@ -595,7 +612,7 @@ async function completeLoginLocked(
     clientSecret: bundle.clientSecret,
     code,
     codeVerifier: bundle.pending.codeVerifier,
-    redirectUri: row.redirect_uri,
+    redirectUri: loginRedirectUri(row),
     resource: row.resource ?? undefined,
   });
 
@@ -889,6 +906,10 @@ async function refreshOne(name: string, outcome: RefreshOutcome, fetchImpl: Fetc
     await recordRefreshFailure(row.name, outcome, err);
     return;
   }
+  if (row.grant_type === 'client_credentials') {
+    await mintClientCredentials(row, bundle, outcome, fetchImpl, decision.reason);
+    return;
+  }
   if (!bundle?.refreshToken) {
     if (!warnedNeedsLogin.has(row.name)) {
       warnedNeedsLogin.add(row.name);
@@ -926,54 +947,8 @@ async function refreshOne(name: string, outcome: RefreshOutcome, fetchImpl: Fetc
       updatedAt: new Date().toISOString(),
     });
 
-    let secret;
-    try {
-      secret = await putIntegrationBearer(row, token.tokenType || 'Bearer', token.accessToken);
-    } catch (err) {
-      // Park the minted token and let the backoff own the retry; the generic
-      // handler would re-hit the token endpoint every tick while the gateway is down.
-      rememberPendingSecretWrite(row.name, token, expiryFrom(token, Date.now()));
-      await markMcpOAuthIntegration(row.name, {
-        status: 'error',
-        status_detail: pendingWriteStatusDetail(row.name, err),
-      });
-      outcome.failed.push(row.name);
-      log.warn('MCP OAuth bearer write failed — token is minted, retrying the write only', {
-        integration: row.name,
-        attempts: pendingSecretWrites.get(row.name)?.attempts,
-        err,
-      });
-      return;
-    }
-
-    pendingSecretWrites.delete(row.name);
-
-    await markMcpOAuthIntegration(row.name, {
-      status: 'active',
-      status_detail: null,
-      expires_at: expiryFrom(token, Date.now()),
-      // Track any narrowing the server applied (see `finalizeToken`).
-      scopes: token.scope ?? row.scopes,
-      bearer_secret_id: secret.id,
-      last_refresh_at: new Date().toISOString(),
-    });
-    // Re-declare on every refresh: a declaration that failed in `finalizeToken`
-    // would otherwise never be retried. Logged, not rethrown: the bearer is in
-    // the vault, and `error` would force a fresh grant per tick for a config problem.
-    try {
-      await ensureGroupSecretDeclared(row.agent_group_id, row.bearer_secret_name);
-    } catch (err) {
-      log.warn('MCP OAuth bearer refreshed but declaring it failed', {
-        integration: row.name,
-        secretName: row.bearer_secret_name,
-        err,
-      });
-    }
-    outcome.refreshed.push(row.name);
-    log.info('MCP OAuth access token refreshed', {
-      integration: row.name,
+    await storeMintedBearer(row, token, outcome, {
       reason: decision.reason,
-      expiresAt: expiryFrom(token, Date.now()),
       rotatedRefreshToken: Boolean(token.refreshToken && token.refreshToken !== bundle.refreshToken),
     });
   } catch (err) {
@@ -1001,6 +976,306 @@ async function refreshOne(name: string, outcome: RefreshOutcome, fetchImpl: Fetc
     }
     await recordRefreshFailure(row.name, outcome, err);
   }
+}
+
+async function storeMintedBearer(
+  row: McpOAuthIntegration,
+  token: TokenResponse,
+  outcome: RefreshOutcome,
+  logDetail: Record<string, unknown>,
+): Promise<void> {
+  let secret;
+  try {
+    secret = await putIntegrationBearer(row, token.tokenType || 'Bearer', token.accessToken);
+  } catch (err) {
+    // Park the minted token and let the backoff own the retry; the generic
+    // handler would re-hit the token endpoint every tick while the gateway is down.
+    rememberPendingSecretWrite(row.name, token, expiryFrom(token, Date.now()));
+    await markMcpOAuthIntegration(row.name, {
+      status: 'error',
+      status_detail: pendingWriteStatusDetail(row.name, err),
+    });
+    outcome.failed.push(row.name);
+    log.warn('MCP OAuth bearer write failed — token is minted, retrying the write only', {
+      integration: row.name,
+      attempts: pendingSecretWrites.get(row.name)?.attempts,
+      err,
+    });
+    return;
+  }
+
+  pendingSecretWrites.delete(row.name);
+
+  await markMcpOAuthIntegration(row.name, {
+    status: 'active',
+    status_detail: null,
+    expires_at: expiryFrom(token, Date.now()),
+    // Track any narrowing the server applied (see `finalizeToken`).
+    scopes: token.scope ?? row.scopes,
+    bearer_secret_id: secret.id,
+    last_refresh_at: new Date().toISOString(),
+  });
+  // Re-declare on every refresh: a declaration that failed in `finalizeToken`
+  // would otherwise never be retried. Logged, not rethrown: the bearer is in
+  // the vault, and `error` would force a fresh grant per tick for a config problem.
+  try {
+    await ensureGroupSecretDeclared(row.agent_group_id, row.bearer_secret_name);
+  } catch (err) {
+    log.warn('MCP OAuth bearer refreshed but declaring it failed', {
+      integration: row.name,
+      secretName: row.bearer_secret_name,
+      err,
+    });
+  }
+  outcome.refreshed.push(row.name);
+  log.info('MCP OAuth access token refreshed', {
+    integration: row.name,
+    expiresAt: expiryFrom(token, Date.now()),
+    ...logDetail,
+  });
+}
+
+const replaceClientHint = (name: string): string =>
+  `enter a new pair with \`ncl secrets intake --client-credentials ${name}\``;
+
+/** Mints from the held client id and secret; a credential the token endpoint refuses needs a human, not a retry. */
+async function mintClientCredentials(
+  row: McpOAuthIntegration,
+  bundle: McpOAuthBundle | undefined,
+  outcome: RefreshOutcome,
+  fetchImpl: FetchLike,
+  reason: string,
+): Promise<void> {
+  if (!bundle?.clientSecret) {
+    await markMcpOAuthIntegration(row.name, {
+      status: 'needs_login',
+      status_detail: `no client credentials on file — ${replaceClientHint(row.name)}`,
+    });
+    outcome.needsLogin.push(row.name);
+    return;
+  }
+  let token: TokenResponse;
+  try {
+    token = await clientCredentialsToken(fetchImpl, {
+      tokenEndpoint: row.token_endpoint,
+      clientId: bundle.clientId,
+      clientSecret: bundle.clientSecret,
+      scopes: row.scopes ?? undefined,
+    });
+  } catch (err) {
+    if (
+      err instanceof OAuthTokenError &&
+      err.status >= 400 &&
+      err.status < 500 &&
+      err.status !== 408 &&
+      err.status !== 429
+    ) {
+      await markMcpOAuthIntegration(row.name, {
+        status: 'needs_login',
+        status_detail: `token endpoint rejected the client credentials (${err.message}) — ${replaceClientHint(row.name)}`,
+      });
+      outcome.needsLogin.push(row.name);
+      if (!warnedNeedsLogin.has(row.name)) {
+        warnedNeedsLogin.add(row.name);
+        log.warn('Client credentials rejected — new credentials required', { integration: row.name, err });
+      }
+      return;
+    }
+    await recordRefreshFailure(row.name, outcome, err);
+    return;
+  }
+  try {
+    await storeMintedBearer(row, token, outcome, { reason, grant: 'client_credentials' });
+  } catch (err) {
+    await recordRefreshFailure(row.name, outcome, err);
+  }
+}
+
+export interface AddClientInput {
+  name: string;
+  agentGroupId: string;
+  /** The API origin the token is for; the vault secret injects on its host. */
+  apiUrl: string;
+  tokenUrl: string;
+  clientId: string;
+  clientSecret: string;
+  secretName?: string;
+  scopes?: string;
+  /** Replace the credentials of an existing client-credentials integration of this name. */
+  replace: boolean;
+}
+
+export interface AddClientResult {
+  name: string;
+  status: string;
+  statusDetail: string | null;
+  bearerSecretName: string;
+  hostPattern: string;
+  expiresAt: string | null;
+}
+
+/**
+ * Registers (or with `replace`, re-keys) an integration whose host holds a client id and secret. The credentials are
+ * proved by minting a token before anything is stored, so a wrong pair leaves no row, bundle or vault secret behind.
+ */
+export function addClientCredentialsIntegration(
+  input: AddClientInput,
+  fetchImpl: FetchLike = fetch,
+): Promise<AddClientResult> {
+  assertIntegrationName(input.name);
+  return withIntegrationLock(input.name, () => addClientLocked(input, fetchImpl));
+}
+
+async function clientCredentialsRow(name: string): Promise<McpOAuthIntegration> {
+  const row = await getMcpOAuthIntegration(name);
+  if (!row) throw new Error(`No integration named "${name}".`);
+  if (row.grant_type !== 'client_credentials') {
+    throw new Error(`"${name}" is an OAuth login integration; it holds no client credentials to replace.`);
+  }
+  return row;
+}
+
+/** The API host and owning group of an existing client-credentials integration; anything else is refused. */
+export async function clientCredentialsIntegration(name: string): Promise<{ host: string; agentGroupId: string }> {
+  const row = await clientCredentialsRow(name);
+  return { host: row.host_pattern, agentGroupId: row.agent_group_id };
+}
+
+/** Refused before anything was written: the integration is no longer the one the caller was shown. */
+export class IntegrationChangedError extends Error {
+  override name = 'IntegrationChangedError';
+}
+
+/**
+ * Gives an existing client-credentials integration a new pair, with every other setting as it stands. `expected` is
+ * what the caller showed the person entering the pair; a row that no longer matches it is refused.
+ */
+export function rekeyClientCredentials(
+  name: string,
+  pair: { clientId: string; clientSecret: string },
+  fetchImpl: FetchLike = fetch,
+  expected?: { host: string; agentGroupId: string },
+): Promise<AddClientResult> {
+  return withIntegrationLock(name, async () => {
+    const row = await clientCredentialsRow(name);
+    if (expected && (row.host_pattern !== expected.host || row.agent_group_id !== expected.agentGroupId)) {
+      throw new IntegrationChangedError(
+        `"${name}" now serves ${row.host_pattern} for group ${row.agent_group_id}, not what the card showed`,
+      );
+    }
+    return addClientLocked(
+      {
+        name,
+        agentGroupId: row.agent_group_id,
+        apiUrl: row.mcp_url,
+        tokenUrl: row.token_endpoint,
+        ...pair,
+        scopes: row.scopes ?? undefined,
+        replace: true,
+      },
+      fetchImpl,
+    );
+  });
+}
+
+async function addClientLocked(input: AddClientInput, fetchImpl: FetchLike): Promise<AddClientResult> {
+  const group = await getAgentGroup(input.agentGroupId);
+  if (!group) throw new Error(`Agent group not found: ${input.agentGroupId}`);
+  const api = new URL(assertHttpsEndpoint('--api-url', input.apiUrl));
+  if (api.pathname !== '/' || api.search || api.username || api.password) {
+    throw new Error('--api-url must be a bare https origin, e.g. https://example.cloud.looker.com');
+  }
+  assertHttpsEndpoint('--token-url', input.tokenUrl);
+  if (!input.clientId.trim() || !input.clientSecret.trim())
+    throw new Error('The client id and secret must be non-empty.');
+
+  const existing = await getMcpOAuthIntegration(input.name);
+  if (existing && !input.replace) {
+    throw new Error(`"${input.name}" already exists; pass --replace to give it new credentials.`);
+  }
+  if (!existing && input.replace) throw new Error(`No integration named "${input.name}" to replace.`);
+  if (existing && existing.grant_type !== 'client_credentials') {
+    throw new Error(
+      `"${input.name}" is an OAuth login integration; its credentials come from \`ncl integrations login\`.`,
+    );
+  }
+  if (existing && existing.agent_group_id !== input.agentGroupId) {
+    throw new Error(
+      `"${input.name}" belongs to agent group ${existing.agent_group_id}; an integration cannot change groups.`,
+    );
+  }
+  // The vault secret keeps the host it was created with (a value-only PATCH), so a new origin would inject on the old one.
+  if (existing && existing.mcp_url !== api.origin) {
+    throw new Error(
+      `"${input.name}" serves ${existing.mcp_url}; run \`ncl integrations remove --name ${input.name} --delete-secret\`, or add the new origin under a new --secret, before adding ${api.origin}.`,
+    );
+  }
+  if (existing && input.secretName !== undefined && input.secretName !== existing.bearer_secret_name) {
+    throw new Error(`"${input.name}" keeps its secret "${existing.bearer_secret_name}"; drop --secret.`);
+  }
+  if (!existing) {
+    const conflict = await getMcpOAuthIntegrationByTarget(input.agentGroupId, api.origin);
+    if (conflict) throw new Error(`Integration "${conflict.name}" already serves ${api.origin} for this group.`);
+  }
+
+  const bearerSecretName =
+    existing?.bearer_secret_name ?? input.secretName ?? defaultBearerSecretName(input.name, group.folder);
+  await existingSecretOnHost(bearerSecretName, api.hostname);
+
+  const token = await clientCredentialsToken(fetchImpl, {
+    tokenEndpoint: input.tokenUrl,
+    clientId: input.clientId,
+    clientSecret: input.clientSecret,
+    scopes: input.scopes,
+  });
+
+  writeMcpOAuthBundle({
+    name: input.name,
+    clientId: input.clientId,
+    clientSecret: input.clientSecret,
+    scopes: input.scopes,
+    updatedAt: new Date().toISOString(),
+  });
+  await upsertMcpOAuthIntegration({
+    name: input.name,
+    agent_group_id: input.agentGroupId,
+    mcp_url: api.origin,
+    resource: null,
+    grant_type: 'client_credentials',
+    authorization_endpoint: null,
+    token_endpoint: input.tokenUrl,
+    registration_endpoint: null,
+    issuer: null,
+    scopes: input.scopes ?? null,
+    redirect_uri: null,
+    bearer_secret_name: bearerSecretName,
+    bearer_secret_id: existing?.bearer_secret_id ?? null,
+    host_pattern: api.hostname,
+    path_pattern: null,
+    status: 'pending',
+    status_detail: null,
+    expires_at: null,
+    last_refresh_at: null,
+  });
+  warnedNeedsLogin.delete(input.name);
+  pendingSecretWrites.delete(input.name);
+
+  const row = await getMcpOAuthIntegration(input.name);
+  if (!row) throw new Error(`Integration "${input.name}" vanished while being written.`);
+  const outcome: RefreshOutcome = { checked: 1, refreshed: [], failed: [], needsLogin: [] };
+  await storeMintedBearer(row, token, outcome, {
+    reason: input.replace ? 'replaced' : 'added',
+    grant: 'client_credentials',
+  });
+  const after = await getMcpOAuthIntegration(input.name);
+  return {
+    name: input.name,
+    status: after?.status ?? 'unknown',
+    statusDetail: after?.status_detail ?? null,
+    bearerSecretName,
+    hostPattern: api.hostname,
+    expiresAt: after?.expires_at ?? null,
+  };
 }
 
 async function recordRefreshFailure(name: string, outcome: RefreshOutcome, err: unknown): Promise<void> {

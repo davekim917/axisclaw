@@ -13,6 +13,8 @@ vi.mock('../../config.js', async (orig) => ({
 }));
 
 const BINDING = 'binding-0123456789abcdef';
+const WIDENED_LINK = 'link-widened-0123456789';
+const DOLLAR_HOST_LINK = 'link-dollar-host-012345';
 const CONTAINER = 'nanoclaw-v2-example-1';
 const DASHBOARD = `${DASHBOARD_TOKEN_COOKIE}=dash-token`;
 
@@ -110,6 +112,11 @@ beforeEach(async () => {
       opened.push(name);
       return net.connect(upstreamPort, '127.0.0.1');
     },
+    describeLink: (token) => {
+      if (token === WIDENED_LINK) return { host: 'app.example.com', extraHosts: ['login.idp.example'] };
+      if (token === DOLLAR_HOST_LINK) return { host: "$'.example.com", extraHosts: ['login.idp.example'] };
+      return null;
+    },
     consumeLink: (token) =>
       spends.push(token) && token === 'link-0123456789abcdef' ? { bindingId: BINDING, maxAgeSeconds: 7200 } : null,
     resolveBinding: (id) => (id === BINDING ? { containerName: CONTAINER, dashboardToken: 'dash-token' } : null),
@@ -131,6 +138,41 @@ describe('browser takeover proxy', () => {
     expect(res.body).toContain('<form method="post"');
     expect(res.headers['set-cookie']).toBeUndefined();
     expect(spends).toEqual([]);
+  });
+
+  it('shows an ordinary link the same page it always did', async () => {
+    const res = await request('/t/link-0123456789abcdef');
+    expect(res.body).toBe(
+      '<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">' +
+        '<title>Agent browser takeover</title>' +
+        '<form method="post" style="font:16px system-ui;margin:20vh auto;max-width:28em;text-align:center">' +
+        '<p>An agent is waiting for you to sign in in its browser. This link works once.</p>' +
+        '<button style="font:inherit;padding:.6em 1.2em">Open the agent\'s browser</button></form>',
+    );
+  });
+
+  it('names what a widened link hands over before the owner presses anything, and spends nothing', async () => {
+    const res = await request(`/t/${WIDENED_LINK}`);
+    expect(res.body).toContain(
+      '<p>This agent alone gets its session for <b>app.example.com</b> and your sign-in at ' +
+        '<b>login.idp.example</b>. That sign-in can open other apps that use it, not only app.example.com.</p>',
+    );
+    expect(spends).toEqual([]);
+  });
+
+  it('prints a host the agent supplied literally, whatever a replacement pattern would make of it', async () => {
+    const res = await request(`/t/${DOLLAR_HOST_LINK}`);
+    expect(res.body).toContain('<b>$&#39;.example.com</b>');
+    expect(res.body.match(/<button/g)).toHaveLength(1);
+  });
+
+  it('answers the viewer that the host is alive from the host alone, and only to a bound viewer', async () => {
+    expect((await request('/alive')).status).toBe(403);
+
+    const res = await request('/alive', { cookie: `${TAKEOVER_COOKIE}=${BINDING}` });
+
+    expect(res.status).toBe(204);
+    expect(opened).toEqual([]);
   });
 
   it('a POST spends the link into an HttpOnly host cookie and sends the viewer to the page', async () => {

@@ -9,7 +9,8 @@ import { taskThreadId } from '../../db/sessions.js';
 describe('keyed task admission and settlement', () => {
   let inbound: Database.Database;
   let outbound: Database.Database;
-  const dispatchTaskEvent = (db: Database.Database, request: TaskDispatchInput) => dispatchEvent(db, request, outbound);
+  const dispatchTaskEvent = (db: Database.Database, request: TaskDispatchInput, containerLive = true) =>
+    dispatchEvent(db, request, outbound, containerLive);
   const input: TaskDispatchInput = {
     contextKey: 'campaign/42/intake',
     eventKey: 'initial',
@@ -98,7 +99,7 @@ describe('keyed task admission and settlement', () => {
   });
   it('settles only an exact successful automatic outcome plus quiet execution', () => {
     const { rowId, seriesId } = dispatchTaskEvent(inbound, input);
-    const read = () => readTaskSettlement(inbound, outbound, rowId, taskThreadId(seriesId));
+    const read = () => readTaskSettlement(inbound, outbound, rowId, taskThreadId(seriesId), true);
     complete(rowId);
     expect(read().state).toBe('settled');
     outbound.prepare('UPDATE container_state SET provider_executing=1').run();
@@ -116,6 +117,26 @@ describe('keyed task admission and settlement', () => {
     outbound.prepare('UPDATE container_state SET provider_executing=0').run();
     expect(dispatchTaskEvent(inbound, retry)).toMatchObject({ admission: 'inserted', attempt: 1 });
   });
+  it('a raised execution flag counts only while the container is live', () => {
+    const { rowId, seriesId } = dispatchTaskEvent(inbound, input);
+    complete(rowId);
+    outbound.prepare('UPDATE container_state SET provider_executing=1').run();
+    const read = (containerLive: boolean) =>
+      readTaskSettlement(inbound, outbound, rowId, taskThreadId(seriesId), containerLive);
+    expect(read(true)).toMatchObject({ state: 'busy', reason: 'execution-or-input-outstanding' });
+    expect(read(false)).toMatchObject({ state: 'settled', executionSettled: true });
+    // Liveness discounts only the flag: real outstanding work still blocks a stopped container.
+    outbound.prepare("INSERT INTO session_state VALUES('work_continuation','invalid',?)").run(new Date().toISOString());
+    expect(read(false).state).toBe('busy');
+  });
+  it('recovers a provider-error event whose stopped container left the execution flag raised', () => {
+    const { rowId } = dispatchTaskEvent(inbound, input);
+    complete(rowId, { isError: true });
+    outbound.prepare('UPDATE container_state SET provider_executing=1').run();
+    const retry = { ...input, eventKey: 'recovery', retryOf: 'initial' };
+    expect(() => dispatchTaskEvent(inbound, retry, true)).toThrow();
+    expect(dispatchTaskEvent(inbound, retry, false)).toMatchObject({ admission: 'inserted', attempt: 1 });
+  });
   it.each([{ auto: false, isError: true }, { taskMessageIds: ['unrelated'], isError: true }, { isError: false }])(
     'does not authorize recovery from unrelated/manual/success log %j',
     (extra) => {
@@ -129,13 +150,13 @@ describe('keyed task admission and settlement', () => {
     (extra) => {
       const { rowId, seriesId } = dispatchTaskEvent(inbound, input);
       complete(rowId, extra);
-      expect(readTaskSettlement(inbound, outbound, rowId, taskThreadId(seriesId)).state).toBe('unknown');
+      expect(readTaskSettlement(inbound, outbound, rowId, taskThreadId(seriesId), true).state).toBe('unknown');
     },
   );
   it('future waits, paused inputs and undelivered actions block phase advancement', () => {
     const { rowId, seriesId } = dispatchTaskEvent(inbound, input);
     complete(rowId);
-    const read = () => readTaskSettlement(inbound, outbound, rowId, taskThreadId(seriesId));
+    const read = () => readTaskSettlement(inbound, outbound, rowId, taskThreadId(seriesId), true);
     inbound
       .prepare(
         "INSERT INTO messages_in(id,seq,kind,timestamp,content,status,process_after) VALUES('future',4,'chat',?,'{}','pending','2099-01-01T00:00:00.000Z')",
@@ -167,9 +188,9 @@ describe('keyed task admission and settlement', () => {
   it('fails closed on missing execution metadata, outcomes or outbound store', () => {
     const { rowId, seriesId } = dispatchTaskEvent(inbound, input);
     complete(rowId);
-    expect(readTaskSettlement(inbound, null, rowId, taskThreadId(seriesId)).state).toBe('unknown');
+    expect(readTaskSettlement(inbound, null, rowId, taskThreadId(seriesId), true).state).toBe('unknown');
     outbound.prepare('DELETE FROM container_state').run();
-    expect(readTaskSettlement(inbound, outbound, rowId, taskThreadId(seriesId)).state).toBe('unknown');
+    expect(readTaskSettlement(inbound, outbound, rowId, taskThreadId(seriesId), true).state).toBe('unknown');
   });
   it('legacy observer cutover excludes only its own future inert recurrence, never owned follow-ups', () => {
     const { rowId, seriesId } = dispatchTaskEvent(inbound, input);
@@ -180,8 +201,8 @@ describe('keyed task admission and settlement', () => {
         "INSERT INTO messages_in(id,seq,kind,timestamp,content,status,process_after,recurrence,series_id,trigger) VALUES('poll',4,'task',?,'{}','pending','2099-01-01T00:00:00.000Z','15,45 * * * *',?,0)",
       )
       .run(new Date().toISOString(), seriesId);
-    const read = () => readTaskSettlement(inbound, outbound, rowId, taskThreadId(seriesId), true);
-    expect(readTaskSettlement(inbound, outbound, rowId, taskThreadId(seriesId)).state).toBe('busy');
+    const read = () => readTaskSettlement(inbound, outbound, rowId, taskThreadId(seriesId), true, true);
+    expect(readTaskSettlement(inbound, outbound, rowId, taskThreadId(seriesId), true).state).toBe('busy');
     expect(read().state).toBe('settled');
     inbound.prepare("UPDATE messages_in SET series_id='another-series' WHERE id='poll'").run();
     expect(read().state).toBe('busy'); // another series' recurrence is not this observer's own poll
@@ -206,8 +227,8 @@ describe('keyed task admission and settlement', () => {
     // A keyed deadline wake the observation turn armed for a different work item, plus its recall row.
     insert.run('wake', 4, 'chat', new Date().toISOString(), '2099-01-01T00:00:00.000Z');
     insert.run('recall-wake', 6, 'system', new Date().toISOString(), '2099-01-01T00:00:00.000Z');
-    const strict = () => readTaskSettlement(inbound, outbound, rowId, taskThreadId(seriesId));
-    const read = () => readTaskSettlement(inbound, outbound, rowId, taskThreadId(seriesId), false, true);
+    const strict = () => readTaskSettlement(inbound, outbound, rowId, taskThreadId(seriesId), true);
+    const read = () => readTaskSettlement(inbound, outbound, rowId, taskThreadId(seriesId), true, false, true);
     expect(strict()).toMatchObject({ state: 'busy', reason: 'execution-or-input-outstanding' });
     expect(strict()).not.toHaveProperty('futureInputs');
     expect(read()).toMatchObject({ state: 'settled', executionSettled: true, futureInputs: 2 });
@@ -250,7 +271,7 @@ describe('keyed task admission and settlement', () => {
       )
       .run(new Date().toISOString());
     const at = (observer: boolean, future: boolean) =>
-      readTaskSettlement(inbound, outbound, rowId, taskThreadId(seriesId), observer, future);
+      readTaskSettlement(inbound, outbound, rowId, taskThreadId(seriesId), true, observer, future);
     expect(at(true, false)).toMatchObject({ state: 'busy', executionSettled: false });
     expect(at(true, true)).toMatchObject({ state: 'settled', executionSettled: true, futureInputs: 2 });
   });

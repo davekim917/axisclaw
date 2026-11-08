@@ -7,6 +7,7 @@ import { GROUPS_DIR } from '../../config.js';
 import {
   assertMcpServerNotPluginOwned,
   validateExcludePlugins,
+  effectiveSourcesFooter,
   effectiveStatusSubtext,
   parseMcpServerConfig,
   readContainerConfig,
@@ -66,6 +67,10 @@ import {
   getWorkgroupAccessForGroup,
   validateToolEntry,
 } from '../../workgroup-access.js';
+import {
+  getWorkgroupApprovalsChannel,
+  setWorkgroupApprovalsChannel,
+} from '../../modules/approvals/approvals-channel.js';
 import type { AgentGroup, ContainerConfigRow } from '../../types.js';
 import { registerResource } from '../crud.js';
 
@@ -247,6 +252,8 @@ function presentConfig(row: ContainerConfigRow, folder?: string): Record<string,
     // Stored and effective: stored `false` is a deliberate opt-out, null rides the default.
     status_subtext: fileConfig?.statusSubtext ?? null,
     effective_status_subtext: fileConfig ? effectiveStatusSubtext(fileConfig) : null,
+    sources_footer: fileConfig?.sourcesFooter ?? null,
+    effective_sources_footer: fileConfig ? effectiveSourcesFooter(fileConfig) : null,
     updated_at: row.updated_at,
   };
 }
@@ -592,6 +599,7 @@ registerResource({
             mcp_servers: access.mcpServers,
             exclude_mcp_servers: access.excludeMcpServers,
             exclude_plugins: access.excludePlugins,
+            approvals_channel: await getWorkgroupApprovalsChannel(workgroup),
           };
         }
         if (args.fleet) {
@@ -617,7 +625,8 @@ registerResource({
         '--timezone takes an IANA id like "Europe/Lisbon" ("" clears back to the install default). Tasks created or edited afterwards use the new zone; an already-armed occurrence keeps its absolute fire time and the series moves onto the new grid at its next re-arm. The container clock follows after a restart. ' +
         '--provider REFUSES the switch when any armed scheduled-task pin would be invalid under the new provider (model/effort vocabularies do not nest: claude has ultracode, codex has ultra, opencode has neither and no xhigh). ' +
         'Task pins are never rewritten for you and there is no --force: clear the refusal with `ncl tasks repin --target-provider <new>`, which validates against the provider you are moving TO and therefore works before the switch. ' +
-        "--status-subtext on|off controls the small model/effort/context line under this group's own replies (on everywhere by default; turn it off for a group whose conversations include people outside the fleet). It is written to container.json only and takes effect at the next restart.",
+        "--status-subtext on|off controls the small model/effort/context line under this group's own replies (on everywhere by default; turn it off for a group whose conversations include people outside the fleet). It is written to container.json only and takes effect at the next restart. " +
+        '--sources-footer on|off adds a "Data read (recorded)" line under replies that used Looker, Snowflake or Google Sheets, built from the calls the container recorded (on by default; off writes `sourcesFooter: false`). Written to container.json only; takes effect at the next restart.',
       handler: async (args) => {
         const id = args.id as string;
         if (!id) throw new Error('--id is required');
@@ -679,6 +688,14 @@ registerResource({
           else if (raw === 'off' || raw === 'false') statusSubtext = false;
           else throw new Error('--status-subtext must be one of: on, off');
         }
+        const sourcesFooterArg = args['sources-footer'] ?? args.sources_footer;
+        let sourcesFooter: boolean | undefined;
+        if (sourcesFooterArg !== undefined) {
+          const raw = String(sourcesFooterArg).toLowerCase();
+          if (raw === 'on' || raw === 'true') sourcesFooter = true;
+          else if (raw === 'off' || raw === 'false') sourcesFooter = false;
+          else throw new Error('--sources-footer must be one of: on, off');
+        }
 
         const memoryRequestMb = optionalIntegerArg(args, 'memory-request-mb', 'memory_request_mb');
         const memoryLimitMb = optionalIntegerArg(args, 'memory-limit-mb', 'memory_limit_mb');
@@ -694,9 +711,14 @@ registerResource({
           cpuShares !== undefined ||
           pidsLimit !== undefined;
 
-        if (Object.keys(updates).length === 0 && !hasResourceUpdate && statusSubtext === undefined) {
+        if (
+          Object.keys(updates).length === 0 &&
+          !hasResourceUpdate &&
+          statusSubtext === undefined &&
+          sourcesFooter === undefined
+        ) {
           throw new Error(
-            'Nothing to update — provide a scalar config flag (--speed included), --status-subtext, or one of: --memory-request-mb, --memory-limit-mb, --memory-swap-limit-mb, --cpus, --cpu-shares, --pids-limit',
+            'Nothing to update — provide a scalar config flag (--speed included), --status-subtext, --sources-footer, or one of: --memory-request-mb, --memory-limit-mb, --memory-swap-limit-mb, --cpus, --cpu-shares, --pids-limit',
           );
         }
 
@@ -751,6 +773,13 @@ registerResource({
           // `true` erases the key: only the opt-out is recorded, so the file shows what the group changed.
           await updateContainerConfig(group.folder, (config) => {
             config.statusSubtext = statusSubtext ? undefined : false;
+            return config;
+          });
+        }
+
+        if (sourcesFooter !== undefined) {
+          await updateContainerConfig(group.folder, (config) => {
+            config.sourcesFooter = sourcesFooter ? undefined : false;
             return config;
           });
         }
@@ -996,6 +1025,33 @@ registerResource({
           throw new Error(`"${target.entry}" is not excluded on workgroup ${target.workgroup}`);
         }
         return { removed: target.entry, ...(await exclusionResult(target)) };
+      },
+    },
+    'config set-approvals-channel': {
+      access: 'approval',
+      hostOnly: true,
+      description:
+        "Slack only. Name a workgroup's shared approvals channel (--workgroup <workgroup-id> --bot <channel-type> --channel " +
+        '<platform-id>), or --clear it. OPERATOR-ONLY. A card whose requester cannot answer it, or that no person ' +
+        'asked for, is posted there once as a live card instead of a DM copy, and deleted when it resolves. --bot is ' +
+        'the bot that posts there (e.g. slack-example); it must be a member of the channel, and a card is only posted ' +
+        'there from the same workspace. Takes effect for the next card; no restart.',
+      handler: async (args) => {
+        const workgroup = await workgroupTarget(args);
+        if (!workgroup) throw new Error('--workgroup <workgroup-id> is required');
+        if (args.clear) {
+          if (args.bot !== undefined || args.channel !== undefined) {
+            throw new Error('--clear takes no --bot or --channel');
+          }
+          await setWorkgroupApprovalsChannel(workgroup, null);
+          return { workgroup, approvals_channel: null };
+        }
+        const bot = typeof args.bot === 'string' ? args.bot.trim() : '';
+        const channel = typeof args.channel === 'string' ? args.channel.trim() : '';
+        if (!bot || !channel)
+          throw new Error('--bot <channel-type> and --channel <platform-id> are required, or --clear');
+        await setWorkgroupApprovalsChannel(workgroup, { channelType: bot, platformId: channel });
+        return { workgroup, approvals_channel: await getWorkgroupApprovalsChannel(workgroup) };
       },
     },
     'config add-package': {

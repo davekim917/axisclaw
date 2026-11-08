@@ -32,6 +32,11 @@ const hostActionMocks = vi.hoisted(() => ({
 // The real fence reader by default, so a fixture with no mailbox on disk reads
 // as holding no fence. A test that models durable barriers only through the
 // mocked quiescence overrides it to report those barriers.
+vi.mock('child_process', async (importOriginal) => {
+  const real = await importOriginal<typeof import('child_process')>();
+  return { ...real, execFileSync: vi.fn(real.execFileSync) };
+});
+
 vi.mock('../../repo-fence-recovery.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../repo-fence-recovery.js')>();
   hostActionMocks.sessionsHoldRepoIngressFence.mockImplementation(
@@ -3141,6 +3146,79 @@ describe('repository_checkout host action (plan §5.2, Phase 2)', { timeout: 60_
     const codeResult = await checkout(unit, 'feat-proj', root, 'proj');
     expect(codeResult.shape).toBe('clone');
     expect(codeResult.created).toBe(true);
+  });
+
+  it('a request replayed after the host died mid-clone clears what the killed attempt left', async () => {
+    networkCanonical(root);
+    const unit = threadUnit('killed-mid-clone');
+    const requestId = nextRequestId();
+    const stagingRoot = checkoutStagingRoot(topicWorktreesDir(unit, root));
+    const killed = path.join(stagingRoot, requestId, 'proj', '.git');
+    fs.mkdirSync(killed, { recursive: true });
+    fs.writeFileSync(path.join(killed, 'index.lock'), '');
+
+    const result = await checkoutRepository({
+      workgroupId: WG,
+      workUnit: unit,
+      repo: 'proj',
+      branch: null,
+      requestId,
+      dataDir: root,
+      farms: OFF,
+    });
+
+    expect(result.created).toBe(true);
+    expect(fs.readdirSync(stagingRoot)).toEqual([]);
+  });
+
+  it('the next checkout in a topic removes the hour-old staging a dead request left and keeps a fresh one', async () => {
+    networkCanonical(root);
+    const unit = threadUnit('dead-request');
+    const stagingRoot = checkoutStagingRoot(topicWorktreesDir(unit, root));
+    const dead = path.join(stagingRoot, 'repo-dead');
+    const fresh = path.join(stagingRoot, 'repo-fresh');
+    fs.mkdirSync(dead, { recursive: true });
+    fs.mkdirSync(fresh, { recursive: true });
+    const twoHoursAgo = Date.now() / 1000 - 7200;
+    fs.utimesSync(dead, twoHoursAgo, twoHoursAgo);
+
+    await checkout(unit, null, root);
+
+    expect(fs.readdirSync(stagingRoot)).toEqual(['repo-fresh']);
+  });
+
+  it('a new checkout runs its long git work and every farm link off the main thread', async () => {
+    const canonical = networkCanonical(root);
+    const donor = path.join(root, 'donor', 'app');
+    writeNpmProject(donor, { tree: true });
+    pushToRemote(canonical, 'main', {
+      'app/package.json': fs.readFileSync(path.join(donor, 'package.json')),
+      'app/package-lock.json': fs.readFileSync(path.join(donor, 'package-lock.json')),
+    });
+    const pass = startDependencyCachePass({
+      mode: 'apply',
+      cacheRoot: path.join(root, DEPENDENCY_CACHE_DIRNAME),
+      now: Date.now(),
+      reclaimableBytes: () => 0,
+      fingerprint: () => FP,
+    });
+    expect(processPackageDir(pass, WG, donor)).toBe('adopted');
+    const mainThreadLinks = vi.spyOn(fs, 'linkSync');
+    vi.mocked(execFileSync).mockClear();
+
+    const result = await checkout(threadUnit('off-thread'), null, root, 'proj', {
+      mode: 'apply',
+      fingerprint: () => FP,
+    });
+
+    expect(result).toMatchObject({ created: true, farmsLinked: 1 });
+    expect(mainThreadLinks).not.toHaveBeenCalled();
+    const blockingGit = vi
+      .mocked(execFileSync)
+      .mock.calls.map(([, args]) => (args ?? []).join(' '))
+      .filter((args) => /\b(clone|fetch|ls-files)\b|\bcheckout --quiet --force\b/.test(args));
+    expect(blockingGit).toEqual([]);
+    mainThreadLinks.mockRestore();
   });
 
   it('repository_checkout links node_modules farms for package dirs with a verified entry', async () => {

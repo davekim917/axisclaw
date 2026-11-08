@@ -1,10 +1,18 @@
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import type { MessageInRow } from '../db/messages-in.js';
+import { markScriptSkipped, type MessageInRow } from '../db/messages-in.js';
 import { touchHeartbeat } from '../heartbeat.js';
-import { beginProviderBusyScope, endProviderBusyScope } from '../modules/mailbox/index.js';
+import {
+  beginProviderBusyScope,
+  carryScriptWake,
+  endProviderBusyScope,
+  getCarriedScriptWake,
+} from '../modules/mailbox/index.js';
 import { evaluateManagedGitCommand } from '../managed-git-guard.js';
+import { retainCompleteRecallPairs } from '../pending-batch.js';
+import { withCodexShimPath } from '../codex-shim-path.js';
+import { guardCorePaths } from '../guard-core-paths.js';
 import { MCP_HEADER_ONLY_SECRET_VARS } from '../providers/secret-env.js';
 import { writeGateRow } from './gate-row.js';
 
@@ -32,8 +40,6 @@ function log(msg: string): void {
 
 // Pre-task scripts run unattended with no approval round-trip, so they go through the SAME evaluator as the
 // interactive Bash hook, and anything it would block OR gate is refused.
-const DEFAULT_GUARD_CORE_PATH =
-  '/workspace/plugins/bootstrap/plugins/workflow-agents/hooks/guards/block-destructive-core.ts';
 type BashEvaluator = (
   command: string,
   opts?: { skipGate?: boolean },
@@ -41,7 +47,7 @@ type BashEvaluator = (
 let _evalBash: BashEvaluator | null | undefined;
 async function loadBashEvaluator(): Promise<BashEvaluator | null> {
   if (_evalBash !== undefined) return _evalBash;
-  const corePath = process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE || DEFAULT_GUARD_CORE_PATH;
+  const corePath = guardCorePaths().destructive;
   try {
     const core = (await import(corePath)) as Record<string, unknown>;
     const fn = core.evaluateBashCommand;
@@ -84,11 +90,15 @@ async function classifyScript(script: string): Promise<{ safe: boolean; reason?:
   return hit ? { safe: false, reason: 'destructive command (fallback classifier)' } : { safe: true };
 }
 
-/** Parity with the interactive Bash env (secret-env.ts): strip only the MCP header-only secrets. */
+/**
+ * Parity with the interactive Bash env (secret-env.ts): strip only the header-only secrets. Where plugin registration
+ * is deferred, the agent's shells reach codex through the shim, and so does a script, or it meets the pending home.
+ */
 function scriptEnv(): NodeJS.ProcessEnv {
   const strip = new Set<string>(MCP_HEADER_ONLY_SECRET_VARS);
   const env: NodeJS.ProcessEnv = {};
   for (const [k, v] of Object.entries(process.env)) if (!strip.has(k)) env[k] = v;
+  if (env.NANOCLAW_CODEX_REGISTER) env.PATH = withCodexShimPath(env.PATH);
   return env;
 }
 
@@ -247,6 +257,19 @@ export interface TaskScriptOutcome {
   skipped: Array<{ id: string; reason: ScriptSkipReason }>;
 }
 
+/** Hand woken occurrences from the early gate to the poll loop, so their scripts do not run a second time. */
+export function carryWokenTasks(rows: MessageInRow[]): void {
+  for (const row of rows) {
+    if (row.kind !== 'task') continue;
+    try {
+      const content = JSON.parse(row.content) as Record<string, unknown>;
+      if (content.scriptOutput !== undefined) carryScriptWake(row.id, content.scriptOutput);
+    } catch {
+      /* not a script-enriched row */
+    }
+  }
+}
+
 /**
  * Run pre-task scripts for any task messages that carry one, serially.
  * - Errors / missing output / wakeAgent=false → task id added to `skipped`,
@@ -283,6 +306,12 @@ export async function applyPreTaskScripts(messages: MessageInRow[]): Promise<Tas
     // A host-gated fire already ran the script on the host; running it again would double its side effects.
     if (content.scriptOutput !== undefined) {
       keep.push(msg);
+      continue;
+    }
+    const carried = getCarriedScriptWake(msg.id);
+    if (carried) {
+      content.scriptOutput = carried.output;
+      keep.push({ ...msg, content: JSON.stringify(content) });
       continue;
     }
 
@@ -324,4 +353,17 @@ export async function applyPreTaskScripts(messages: MessageInRow[]): Promise<Tas
   }
 
   return { keep, skipped };
+}
+
+/**
+ * The poll loop's pre-task step, also run by the early gate: scripts run, every task they gated is acked as a
+ * script skip, and what is returned may still reach the agent (recall pairs survive together or not at all).
+ */
+export async function gateBatchScripts(messages: MessageInRow[]): Promise<TaskScriptOutcome> {
+  const { keep, skipped } = await applyPreTaskScripts(messages);
+  if (skipped.length > 0) {
+    markScriptSkipped(skipped);
+    log(`Pre-task script skipped ${skipped.length} task(s): ${skipped.map((s) => s.id).join(', ')}`);
+  }
+  return { keep: retainCompleteRecallPairs(messages, keep), skipped };
 }

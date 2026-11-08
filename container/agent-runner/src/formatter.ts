@@ -354,6 +354,8 @@ function formatSingleChat(msg: MessageInRow): string {
   // The platform-side sender id lets the agent build canonical `<@USER_ID>` mentions instead of guessing from prose names.
   const senderId = content.senderId || content.author?.userId;
   const senderIdAttr = typeof senderId === 'string' && senderId.length > 0 ? ` sender_id="${escapeXml(senderId)}"` : '';
+  // The orchestrate spawn hook reads this: a bot's message is never a person's turn, so it can't name a model.
+  const senderIsBotAttr = content.origin !== 'host' && content.author?.isBot === true ? ' sender_is_bot="true"' : '';
 
   // origin="host" comes only from a reserved field the host strips from every write but its own notes;
   // sender/sender_id are author-controlled and prove nothing.
@@ -374,7 +376,7 @@ function formatSingleChat(msg: MessageInRow): string {
       : null;
   const platformMsgIdAttr = platformMsgId ? ` platform_msg_id="${escapeXml(platformMsgId)}"` : '';
 
-  return `<message${idAttr}${fromAttr}${hostAttr}${eventAttr}${platformMsgIdAttr} sender="${escapeXml(sender)}"${senderIdAttr} time="${escapeXml(time)}"${replyAttr}>${replyPrefix}${escapeXml(text)}${attachmentsSuffix}</message>`;
+  return `<message${idAttr}${fromAttr}${hostAttr}${eventAttr}${platformMsgIdAttr} sender="${escapeXml(sender)}"${senderIdAttr}${senderIsBotAttr} time="${escapeXml(time)}"${replyAttr}>${replyPrefix}${escapeXml(text)}${attachmentsSuffix}</message>`;
 }
 
 /**

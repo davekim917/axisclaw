@@ -25,6 +25,7 @@
  */
 import { describe, it, expect, mock, spyOn, beforeEach, afterEach } from 'bun:test';
 import fs from 'node:fs';
+import { resetGuardCorePathsForTest, setGuardCorePathsForTest } from '../guard-core-paths.js';
 import os from 'node:os';
 import path from 'node:path';
 import type { HookCallback } from '@anthropic-ai/claude-agent-sdk';
@@ -93,11 +94,12 @@ describe('(iii) Claude registration: one emitter, and no guard ever sees the std
   const saved: Record<string, string | undefined> = {};
   let writeSpy: ReturnType<typeof spyOn> | undefined;
   beforeEach(() => {
-    for (const k of ['NANOCLAW_DESTRUCTIVE_GUARD_CORE', 'NANOCLAW_EMAIL_GATE_CORE', 'NANOCLAW_IS_SCHEDULED_TASK'])
-      saved[k] = process.env[k];
+    for (const k of ['NANOCLAW_IS_SCHEDULED_TASK']) saved[k] = process.env[k];
     // Inline fallbacks: the same fail-closed email bypass check the finding cites.
-    process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = '/nonexistent/guard-core.ts';
-    process.env.NANOCLAW_EMAIL_GATE_CORE = '/nonexistent/email-gate-core.ts';
+    setGuardCorePathsForTest({
+      destructive: '/nonexistent/guard-core.ts',
+      emailGate: '/nonexistent/email-gate-core.ts',
+    });
     delete process.env.NANOCLAW_IS_SCHEDULED_TASK;
     // Staging an approval card writes an outbound row. None may be written.
     writeSpy = spyOn(messagesOut, 'writeMessageOut').mockImplementation(() => {
@@ -106,6 +108,7 @@ describe('(iii) Claude registration: one emitter, and no guard ever sees the std
   });
   afterEach(() => {
     writeSpy?.mockRestore();
+    resetGuardCorePathsForTest();
     for (const [k, v] of Object.entries(saved)) {
       if (v === undefined) delete process.env[k];
       else process.env[k] = v;
@@ -171,19 +174,15 @@ describe('runPreToolUseChain — no stdin prefix here, and no guard ever sees on
   let writeSpy: ReturnType<typeof spyOn> | undefined;
 
   beforeEach(() => {
-    for (const k of [
-      'NANOCLAW_DESTRUCTIVE_GUARD_CORE',
-      'NANOCLAW_EMAIL_GATE_CORE',
-      'NANOCLAW_IS_SCHEDULED_TASK',
-      'NANOCLAW_TEST_GUARD_COMMAND_SINK',
-    ])
-      saved[k] = process.env[k];
-    process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = new URL(
-      '../codex-hooks/__test-fixtures__/guard-command-recorder/block-destructive-core.ts',
-      import.meta.url,
-    ).pathname;
-    // Inline email policy — the same fail-closed bypass check the finding cites.
-    process.env.NANOCLAW_EMAIL_GATE_CORE = '/nonexistent/email-gate-core.ts';
+    for (const k of ['NANOCLAW_IS_SCHEDULED_TASK', 'NANOCLAW_TEST_GUARD_COMMAND_SINK']) saved[k] = process.env[k];
+    setGuardCorePathsForTest({
+      destructive: new URL(
+        '../codex-hooks/__test-fixtures__/guard-command-recorder/block-destructive-core.ts',
+        import.meta.url,
+      ).pathname,
+      // Inline email policy — the same fail-closed bypass check the finding cites.
+      emailGate: '/nonexistent/email-gate-core.ts',
+    });
     delete process.env.NANOCLAW_IS_SCHEDULED_TASK;
     sink = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'nc-guard-sink-')), 'commands.jsonl');
     process.env.NANOCLAW_TEST_GUARD_COMMAND_SINK = sink;
@@ -194,6 +193,7 @@ describe('runPreToolUseChain — no stdin prefix here, and no guard ever sees on
   });
   afterEach(() => {
     writeSpy?.mockRestore();
+    resetGuardCorePathsForTest();
     for (const [k, v] of Object.entries(saved)) {
       if (v === undefined) delete process.env[k];
       else process.env[k] = v;

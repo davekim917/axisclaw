@@ -55,8 +55,13 @@ const KNOWN_NON_CODE_GLOBS: ReadonlySet<string> = new Set([
   '.claude.json',
   '.ripgreprc',
   '.gitmodules',
+  // The phone app: its own npm tree and bun:test suite, which neither lane's coverage tool instruments.
+  'mobile/**',
   // The coverage baseline: risk:high so a PR can't delete tests and the evidence together.
   'coverage-risk-baseline.json',
+  // Vitest's own config: it decides what the coverage run reports, but it lives outside the src/ and scripts/ trees
+  // coverage.include draws from, so the report never carries it.
+  'vitest.config.ts',
 ]);
 
 /**

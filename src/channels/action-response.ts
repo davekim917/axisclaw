@@ -16,14 +16,14 @@ function actionResponsePayload(
   userId: string,
   messageId: string | null,
   replyToClicker: ((text: string) => Promise<void>) | undefined,
+  channelId: string | null | undefined,
 ): ResponsePayload {
   return {
     questionId,
     value: selectedOption,
     userId,
     channelType,
-    // Not surfaced by the onAction signature; handlers look them up from the pending_question / pending_approval row.
-    platformId: '',
+    platformId: channelId ?? '',
     threadId: null,
     // Approvals bind the click to this message.
     messageId,
@@ -36,11 +36,11 @@ export function makeOnAction(
   channelType: string,
   dispatch: (payload: ResponsePayload) => Promise<void>,
 ): ChannelSetup['onAction'] {
-  return (questionId, selectedOption, userId, messageId, replyToClicker) => {
-    dispatch(actionResponsePayload(channelType, questionId, selectedOption, userId, messageId, replyToClicker)).catch(
-      (err) => {
-        log.error('Failed to handle question response', { questionId, err });
-      },
-    );
+  return (questionId, selectedOption, userId, messageId, replyToClicker, channelId) => {
+    dispatch(
+      actionResponsePayload(channelType, questionId, selectedOption, userId, messageId, replyToClicker, channelId),
+    ).catch((err) => {
+      log.error('Failed to handle question response', { questionId, err });
+    });
   };
 }

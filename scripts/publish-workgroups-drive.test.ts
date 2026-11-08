@@ -61,6 +61,8 @@ function git(repo: string, ...args: string[]) {
 
 // Swaps a file for a symlink the moment the publisher looks that file up on
 // Drive: after every check on it has passed, before gws opens it.
+// FIFO_PATH instead replaces that path with a FIFO on the first file lookup,
+// while an earlier file is being published.
 // GROW_PATH instead grows a file to GROW_BYTES on the first Drive-shaped jq
 // call, which comes after enumeration and before any file is opened.
 const JQ_SWAP_STUB = `#!/bin/bash
@@ -71,11 +73,22 @@ for a in "$@"; do
   if [[ -n "\${GROW_PATH:-}" && "$a" == *mimeType* ]]; then
     head -c "$GROW_BYTES" /dev/zero > "$GROW_PATH"
   fi
+  if [[ -n "\${FIFO_PATH:-}" && "$a" == *"mimeType !="* && ! -p "$FIFO_PATH" ]]; then
+    rm -f "$FIFO_PATH" && mkfifo "$FIFO_PATH"
+  fi
 done
 exec "$REAL_JQ" "$@"
 `;
 
 const REAL_JQ = spawnSync('bash', ['-c', 'command -v jq'], { encoding: 'utf8' }).stdout.trim();
+const REAL_SHA = spawnSync('bash', ['-c', 'command -v sha256sum'], { encoding: 'utf8' }).stdout.trim();
+
+// Logs every file argument sha256sum is given, so a test can assert which
+// files the publisher read and hashed.
+const SHA_STUB = `#!/bin/bash
+for a in "$@"; do [[ "$a" == -* ]] || printf '%s\\n' "$a" >> "$SHA_CALLS"; done
+exec "$REAL_SHA" "$@"
+`;
 
 type Fixture = ReturnType<typeof fixture>;
 
@@ -92,6 +105,7 @@ function fixture(files: Record<string, string>, untracked: Record<string, string
   fs.mkdirSync(outside);
   fs.writeFileSync(path.join(bin, 'gws'), GWS_STUB, { mode: 0o755 });
   fs.writeFileSync(path.join(bin, 'jq'), JQ_SWAP_STUB, { mode: 0o755 });
+  fs.writeFileSync(path.join(bin, 'sha256sum'), SHA_STUB, { mode: 0o755 });
   fs.writeFileSync(path.join(outside, 'secret.txt'), SECRET);
   fs.writeFileSync(path.join(outside, 'secret.pdf'), SECRET);
   git(repo, 'init', '-q');
@@ -112,6 +126,7 @@ function fixture(files: Record<string, string>, untracked: Record<string, string
     state: path.join(root, 'state.tsv'),
     gwsLog: path.join(root, 'gws.log'),
     gwsCalls: path.join(root, 'gws.calls'),
+    shaCalls: path.join(root, 'sha.calls'),
   };
 }
 
@@ -132,6 +147,11 @@ function config(f: Fixture, overrides: Record<string, unknown> = {}) {
 function run(f: Fixture, env: Record<string, string> = {}, args: string[] = [], cmd: string[] = ['bash']) {
   const result = spawnSync(cmd[0], [...cmd.slice(1), SCRIPT, ...args], {
     encoding: 'utf8',
+    // A publisher blocked on a FIFO or an endless read fails the test instead
+    // of hanging it: spawnSync blocks the event loop, so vitest's own timeout
+    // cannot fire.
+    timeout: 30_000,
+    killSignal: 'SIGKILL',
     env: {
       ...process.env,
       PATH: `${f.bin}:${process.env.PATH}`,
@@ -141,14 +161,17 @@ function run(f: Fixture, env: Record<string, string> = {}, args: string[] = [], 
       GWS_LOG: f.gwsLog,
       GWS_CALLS: f.gwsCalls,
       REAL_JQ,
+      REAL_SHA,
+      SHA_CALLS: f.shaCalls,
       ...env,
     },
   });
   const read = (p: string) => (fs.existsSync(p) ? fs.readFileSync(p, 'utf8') : '');
   const uploads = read(f.gwsLog);
   const calls = read(f.gwsCalls);
-  for (const p of [f.gwsLog, f.gwsCalls]) fs.rmSync(p, { force: true });
-  return { ...result, uploads, calls };
+  const hashed = read(f.shaCalls).split('\n').filter(Boolean);
+  for (const p of [f.gwsLog, f.gwsCalls, f.shaCalls]) fs.rmSync(p, { force: true });
+  return { ...result, uploads, calls, hashed };
 }
 
 // Marks folders as already on Drive. A folder the run creates itself is known
@@ -581,6 +604,90 @@ describe('publish-workgroups-drive.sh', () => {
       const killed = run(f, { GWS_KILL_AFTER: '3', GWS_KILL_SIG: 'KILL', DRIVE_CHECKPOINT_EVERY: '1' });
       expect(killed.status).not.toBe(0);
       expect(statePaths(f)).toEqual(['wg1/artifacts/a.md', 'wg1/records/board.md']);
+    });
+  });
+
+  describe('unchanged-file skip', () => {
+    it('skips unchanged files without a per-file snapshot or hash process', () => {
+      const f = fixture({ 'wg1/records/board.md': 'board' }, { 'wg1/artifacts/deck.pdf': 'deck' });
+      config(f);
+      expect(run(f).status).toBe(0);
+
+      const again = run(f);
+
+      expect(again.status, again.stderr).toBe(0);
+      expect(again.hashed).toEqual([]);
+      expect(again.calls).toBe('');
+      expect(again.stderr).toMatch(/skipped=2 /);
+      expect(statePaths(f)).toEqual(['wg1/artifacts/deck.pdf', 'wg1/records/board.md']);
+    });
+
+    it('uploads a same-size rewrite even when its mtime is put back', () => {
+      const f = fixture({ 'wg1/records/board.md': 'board' }, { 'wg1/artifacts/a.md': 'a1' });
+      config(f);
+      expect(run(f).status).toBe(0);
+      const file = path.join(f.repo, 'wg1/artifacts/a.md');
+      // touch -r copies nanoseconds; fs.utimesSync would round to ms and
+      // change the mtime it means to restore.
+      const ref = path.join(f.root, 'mtime-ref');
+      expect(spawnSync('touch', ['-r', file, ref]).status).toBe(0);
+      fs.writeFileSync(file, 'a2');
+      expect(spawnSync('touch', ['-r', ref, file]).status).toBe(0);
+      expect(fs.statSync(file, { bigint: true }).mtimeNs).toBe(fs.statSync(ref, { bigint: true }).mtimeNs);
+
+      const r = run(f);
+
+      expect(r.status, r.stderr).toBe(0);
+      expect(r.uploads.trim().split('\n')).toEqual(['UPLOAD f/a.md a2']);
+    });
+
+    it('refuses, without hanging, a published file swapped for a device link, a FIFO, or a moved-out directory', () => {
+      const f = fixture({ 'a/x.txt': 'x', 'b/y.txt': 'y', 'c/z.txt': 'z', 'd/ok.txt': 'ok' });
+      expect(run(f).status).toBe(0);
+      fs.rmSync(path.join(f.repo, 'a/x.txt'));
+      fs.symlinkSync('/dev/zero', path.join(f.repo, 'a/x.txt'));
+      fs.rmSync(path.join(f.repo, 'b/y.txt'));
+      expect(spawnSync('mkfifo', [path.join(f.repo, 'b/y.txt')]).status).toBe(0);
+      // The file keeps its inode and bytes; only its directory now resolves
+      // outside the tree.
+      fs.renameSync(path.join(f.repo, 'c'), path.join(f.outside, 'c'));
+      fs.symlinkSync(path.join(f.outside, 'c'), path.join(f.repo, 'c'));
+
+      const r = run(f);
+
+      expect(r.status).toBe(1);
+      expect(r.uploads).toBe('');
+      expect(r.stderr).toMatch(/ERROR REFUSED a\/x\.txt/);
+      expect(r.stderr).toMatch(/ERROR REFUSED b\/y\.txt/);
+      expect(r.stderr).toMatch(/ERROR REFUSED c\/z\.txt/);
+      expect(r.stderr).toMatch(/skipped=1 failed=0 refused=3 /);
+    });
+
+    it('skips a published allowlisted file that grew past the cap', () => {
+      const f = fixture({ 'wg1/records/board.md': 'board' }, { 'wg1/artifacts/a.pdf': 'small' });
+      config(f, { max_file_mb: 1 });
+      expect(run(f).status).toBe(0);
+      // Without cached folders the run looks them up on Drive, and the first
+      // lookup grows the file: after enumeration, before it is read.
+      fs.writeFileSync(f.state, fs.readFileSync(f.state, 'utf8').replace(/^D\t.*\n/gm, ''));
+      const r = run(f, { GROW_PATH: path.join(f.repo, 'wg1/artifacts/a.pdf'), GROW_BYTES: '1048577' });
+
+      expect(r.status, r.stderr).toBe(0);
+      expect(r.uploads).toBe('');
+      expect(r.stderr).toMatch(/SKIP oversize wg1\/artifacts\/a\.pdf/);
+    });
+
+    it('refuses a queued file replaced by a FIFO while an earlier file uploads', () => {
+      const f = fixture({ 'wg1/records/board.md': 'board' }, { 'wg1/artifacts/a.md': 'a', 'wg1/artifacts/b.md': 'b' });
+      config(f);
+      seedFolders(f, ['wg1', 'wg1/records', 'wg1/artifacts']);
+
+      const r = run(f, { FIFO_PATH: path.join(f.repo, 'wg1/artifacts/b.md') });
+
+      expect(fs.lstatSync(path.join(f.repo, 'wg1/artifacts/b.md')).isFIFO()).toBe(true);
+      expect(r.status).toBe(1);
+      expect(r.stderr).toMatch(/ERROR REFUSED wg1\/artifacts\/b\.md/);
+      expect(r.uploads).toContain('UPLOAD f/a.md a');
     });
   });
 });

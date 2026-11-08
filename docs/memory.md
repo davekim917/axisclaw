@@ -82,7 +82,13 @@ an ordinary memory file that `write_memory_file` will overwrite like any
 other.
 
 The topic files are not read automatically by anything either. Recall touches
-only `index.md` and the sender-matched `preferences/<slug>.md` files — an agent
+only `index.md` and the sender's `preferences/<name>.md` file. A preference file
+reaches a sender only through its `ids:` frontmatter (`---\nids: [U0EXAMPLE1, 1234567890]\n---`,
+bare platform ids or full `<channel>:<id>`); names are never matched, since they
+change at will. It holds how a person wants to be talked to and nothing else:
+a line about approvals, sign-off, production, merges or deploys is withheld
+from the injected text with a `preference-lines-withheld` notice, because who
+may do what comes from roles and guards. An agent
 reaches a topic file by navigating from `index.md` or by grepping
 `/workspace/workgroup/memory` itself. They are ordinary OKF concept files;
 nothing about reading or hand-editing them is special:
@@ -210,6 +216,13 @@ ceiling. Evidence fingerprints combine trusted provenance with a hash of the
 full authoritative source content; unchanged evidence already delivered in the
 same provider context epoch is suppressed. Exact-link evidence and material
 corrections bypass suppression.
+
+Sibling bots each archive their own copy of a channel's messages. Both archive
+lanes treat copies sharing `platform_id`, `thread_id`, `sent_at`, `text` and the
+sender id without its platform prefix as one message: one excerpt, the current
+agent's copy or else the lowest id. An unchanged lexical excerpt delivered under
+one copy is suppressed under all of them. Copies whose text differs, as when bots
+render a mention differently, stay separate.
 
 The epoch reuses the existing provider continuation lifecycle and
 `outbound.db` session-state key/value store. Compaction, rotation, `/clear`,

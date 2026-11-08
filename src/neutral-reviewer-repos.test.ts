@@ -3,7 +3,7 @@ import fs from 'fs';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const logMock = vi.hoisted(() => ({ warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn() }));
-vi.mock('./log.js', () => ({ log: logMock }));
+vi.mock('./log.js', () => ({ log: logMock, setLogScrubber: vi.fn() }));
 
 import {
   checkNeutralReviewerRepos,

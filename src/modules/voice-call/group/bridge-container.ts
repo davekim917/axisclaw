@@ -26,6 +26,8 @@ export interface BridgeSnapshot {
   delegations: Array<{ id: string; at: number }>;
   slots: Record<string, number>;
   live: string | null;
+  /** The voice's track in the room: published, or heard once someone in the room has it connected. */
+  voice: 'published' | 'heard' | null;
   room: string | null;
   people: string[];
 }

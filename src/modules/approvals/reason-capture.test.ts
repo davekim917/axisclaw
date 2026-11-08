@@ -33,6 +33,7 @@ import { upsertUser } from '../permissions/db/users.js';
 import { upsertUserDm } from '../permissions/db/user-dms.js';
 import { grantRole } from '../permissions/db/user-roles.js';
 import type { PendingApproval } from '../../types.js';
+import { recordCardCopy } from './card-copies.js';
 import { REJECT_WITH_REASON_VALUE } from './primitive.js';
 
 vi.mock('../../container-runner.js', async (importOriginal) => ({
@@ -537,6 +538,19 @@ describe("reject with reason, asked in the card's thread", () => {
     expect(await captureReasonReply(reply(THREAD, 'admin-1', 'wrong schema'))).toBe(true);
     expect(lastRelayedText()).toBe('Your install_packages request was rejected by admin: "wrong schema"');
     expect(await getPendingApproval('appr-t1')).toBeUndefined();
+  });
+
+  it('pressed on the DM copy of a thread card, it prompts in that DM and takes the reply there', async () => {
+    const { captureReasonReply } = await import('./reason-capture.js');
+    const copy = { channel_type: DM_CHANNEL, platform_id: DM_PLATFORM, instance: null, platform_message_id: 'copy-1' };
+    await seedApproval('appr-tc', 'install_packages', inThread);
+    await recordCardCopy('appr-tc', copy);
+    await clickRejectWithReason('appr-tc', { platformId: DM_PLATFORM, threadId: null, messageId: 'copy-1' });
+
+    expect(prompts().map((d) => [d.platformId, d.threadId])).toEqual([[DM_PLATFORM, null]]);
+    expect(await captureReasonReply(reply(THREAD, 'admin-1', 'in the thread'))).toBe(false);
+    expect(await captureReasonReply(dmReply('wrong schema'))).toBe(true);
+    expect(lastRelayedText()).toBe('Your install_packages request was rejected by admin: "wrong schema"');
   });
 
   it("leaves someone else's message in the thread alone and keeps waiting for the clicker", async () => {

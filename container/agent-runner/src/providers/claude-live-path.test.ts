@@ -13,7 +13,22 @@ import { MEMORY_SESSION_HOOK } from '../memory/session-hook.js';
 import { closeSessionDb, initTestSessionDb } from '../modules/mailbox/testing.js';
 import { allowNetwork, allowSubprocess, allowWritesTo } from '../test-hermeticity.js';
 import { ClaudeProvider, IMAGE_CLAUDE_CODE_EXECUTABLE, _setClaudeCodeExecutableForTesting } from './claude.js';
+import { claudeCyclePlan } from '../cli/claude-cycle.js';
+import { getCredentialSlot } from '../modules/mailbox/session-state.js';
 import type { ProviderEvent } from './types.js';
+
+const SDK = '@anthropic-ai/claude-agent-sdk';
+// bun's mock.module lasts for the rest of the process, so in a run that also loads a test mocking the SDK
+// (`bun test src/providers`) this file would drive the mock, not the CLI. Compared by source, since the unmocked
+// copy is a second instance of the same module.
+const sdkMocked =
+  String((await import(SDK)).query) !==
+  String((await import(`${Bun.resolveSync(SDK, import.meta.dir)}?unmocked`)).query);
+const SDK_MOCKED_REASON = `${SDK} is mocked in this process by another test file; run \`bun run test:live-path\``;
+// `test:live-path` runs only live-path files, so a mock there is a defect, never a reason to skip.
+if (sdkMocked && process.env.LIVE_PATH_STRICT === '1')
+  throw new Error(`provider-claude live path: ${SDK_MOCKED_REASON}`);
+if (sdkMocked) console.warn(`provider-claude live path skipped: ${SDK_MOCKED_REASON}`);
 
 type MessagesRequest = {
   model?: string;
@@ -63,9 +78,10 @@ function sse(model: string, reply: Reply): string {
 
 /** The streamed main-loop requests, in order; side requests (titles, classifiers) are answered but not recorded. */
 const turns: MessagesRequest[] = [];
+const REVOKED_TOKEN = 'revoked-live-path-token';
 let script: Reply[] = [];
 let server: ReturnType<typeof Bun.serve>;
-let home: string;
+let home = '';
 
 beforeAll(() => {
   allowNetwork();
@@ -77,6 +93,16 @@ beforeAll(() => {
     async fetch(req) {
       const url = new URL(req.url);
       if (req.method !== 'POST' || url.pathname !== '/v1/messages') return Response.json({}, { status: 404 });
+      if (req.headers.get('authorization') === `Bearer ${REVOKED_TOKEN}`) {
+        return Response.json(
+          {
+            type: 'error',
+            error: { type: 'authentication_error', message: 'OAuth access token has been revoked.' },
+            request_id: 'req_live_path',
+          },
+          { status: 401 },
+        );
+      }
       const body = (await req.json()) as MessagesRequest;
       const model = body.model ?? 'unknown';
       if (!body.stream) {
@@ -109,27 +135,32 @@ afterEach(() => {
   turns.length = 0;
   script = [];
   if (home) fs.rmSync(home, { recursive: true, force: true });
+  home = '';
 });
 
-async function runTurn(
-  input: Omit<Parameters<ClaudeProvider['query']>[0], 'cwd'>,
-): Promise<Extract<ProviderEvent, { type: 'result' }>> {
-  home = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-live-path-'));
+function liveProvider(auth: Record<string, string>): ClaudeProvider {
+  home ||= fs.mkdtempSync(path.join(os.tmpdir(), 'claude-live-path-'));
   allowWritesTo(home);
-  const cwd = path.join(home, 'work');
-  fs.mkdirSync(cwd);
+  fs.mkdirSync(path.join(home, 'work'), { recursive: true });
   const p = new ClaudeProvider({
     env: {
       PATH: process.env.PATH,
       HOME: home,
       CLAUDE_CONFIG_DIR: path.join(home, '.claude'),
       ANTHROPIC_BASE_URL: `http://127.0.0.1:${server.port}`,
-      ANTHROPIC_API_KEY: 'sk-ant-live-path-fake',
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
+      ...auth,
     },
   });
   p.registerMemorySessionHook(MEMORY_SESSION_HOOK);
-  const q = p.query({ ...input, cwd });
+  return p;
+}
+
+async function runTurn(
+  input: Omit<Parameters<ClaudeProvider['query']>[0], 'cwd'>,
+  provider = liveProvider({ ANTHROPIC_API_KEY: 'sk-ant-live-path-fake' }),
+): Promise<Extract<ProviderEvent, { type: 'result' }>> {
+  const q = provider.query({ ...input, cwd: path.join(home, 'work') });
   try {
     for await (const event of q.events) {
       if (event.type === 'result') return event;
@@ -145,7 +176,7 @@ function systemText(req: MessagesRequest): string {
   return typeof req.system === 'string' ? req.system : (req.system ?? []).map((b) => b.text).join('\n');
 }
 
-describe('provider-claude live path', () => {
+describe.skipIf(sdkMocked)('provider-claude live path', () => {
   it('runs the Claude Code release the image pins', () => {
     // The image runs its own install of that pin (/pnpm/claude); this test can only run the SDK's bundled build.
     const pin = /^ARG CLAUDE_CODE_VERSION=(\S+)$/m.exec(
@@ -197,5 +228,41 @@ describe('provider-claude live path', () => {
     const followUp = JSON.stringify(turns[1].messages);
     expect(followUp).toContain('toolu_live_1');
     expect(followUp).toContain('live-path-tool-output');
+  }, 60_000);
+
+  it('turns the real CLI rendering of a revoked OAuth token into a rotation', async () => {
+    script = [{ text: 'served by the next slot' }];
+    const provider = liveProvider({
+      CLAUDE_CODE_OAUTH_TOKEN: REVOKED_TOKEN,
+      CLAUDE_CODE_OAUTH_TOKEN_2: 'healthy-live-path-token',
+    });
+    provider.resetRotationCycle();
+
+    const failure = await runTurn({ prompt: 'ping', model: 'claude-sonnet-5-5' }, provider).catch((err) => err);
+    expect(provider.isRetryable(failure)).toBe(true);
+    expect((failure as Error).message).toContain('OAuth token revoked');
+
+    expect(provider.rotateApiKey()).toMatchObject({ rotated: true, slot: 'CLAUDE_CODE_OAUTH_TOKEN_2' });
+    const result = await runTurn({ prompt: 'ping', model: 'claude-sonnet-5-5' }, provider);
+    expect(result.text).toContain('served by the next slot');
+    expect(getCredentialSlot('claude')).toBe('CLAUDE_CODE_OAUTH_TOKEN_2');
+  }, 60_000);
+
+  it('spawns the CLI in a form the claude launcher leaves to the provider', async () => {
+    const dir = (home = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-live-path-')));
+    const recorded = path.join(dir, 'argv');
+    const probe = path.join(dir, 'argv-probe');
+    fs.writeFileSync(probe, `#!/bin/sh\nprintf '%s\\n' "$@" > '${recorded}'\nexit 1\n`, { mode: 0o700 });
+    allowSubprocess(['argv-probe']);
+    _setClaudeCodeExecutableForTesting(probe);
+    try {
+      await runTurn({ prompt: 'ping' }, liveProvider({ ANTHROPIC_API_KEY: 'sk-ant-live-path-fake' })).catch(() => {});
+    } finally {
+      _setClaudeCodeExecutableForTesting(undefined);
+    }
+
+    const argv = fs.readFileSync(recorded, 'utf8').trim().split('\n');
+    expect(argv).toContain('--input-format');
+    expect(claudeCyclePlan(argv, { CLAUDE_CODE_OAUTH_TOKEN: 'one', CLAUDE_CODE_OAUTH_TOKEN_2: 'two' })).toBeNull();
   }, 60_000);
 });

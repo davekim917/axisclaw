@@ -68,7 +68,7 @@ function commandDecide(cmd: CommandDef, input: GuardInput) {
 
   if (cliScope === 'group') {
     // Only allow whitelisted resources and general commands (no resource, like help)
-    if (cmd.resource && !GROUP_SCOPE_RESOURCES.has(cmd.resource)) {
+    if (cmd.resource && !cmd.groupScopeVerb && !GROUP_SCOPE_RESOURCES.has(cmd.resource)) {
       return DENY(`CLI access is scoped to this agent group. Cannot access "${cmd.resource}".`);
     }
 

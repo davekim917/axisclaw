@@ -83,6 +83,35 @@ tracked_changes() {
   [ -n "$(git status --porcelain --untracked-files=no 2>/dev/null)" ]
 }
 
+# Warn-only: a hotfix must still go out while the nightly is red, so nothing here
+# can stop a deploy. The two budgets add up to the five seconds this may cost. An
+# unclear answer is "unknown", never green, and a run that was cancelled or skipped
+# says nothing about main, so it is passed over. `--repo` because gh otherwise
+# answers for its own default remote, and `upstream` has no such workflow.
+nightly_state_warning() {
+  local repo verdict issue notice
+  repo="$(git remote get-url origin 2>/dev/null)"
+  verdict="$(GH_PROMPT_DISABLED=1 timeout -s KILL 3.5 gh run list --repo "$repo" --workflow ci-full.yml \
+    --branch main --event schedule --limit 100 --json status,conclusion,createdAt --jq '
+      map(select(.status == "completed" and .conclusion != "cancelled" and .conclusion != "skipped"))
+      | (map(.conclusion) | index("success")) as $green
+      | if length == 0 then "unknown"
+        elif $green == 0 then "green"
+        else "red " + .[($green // length) - 1].createdAt[:10]
+        end' 2>/dev/null)" || verdict=""
+  case "$verdict" in
+    green) return 0 ;;
+    red\ *)
+      issue="$(GH_PROMPT_DISABLED=1 timeout -s KILL 1.5 gh issue list --repo "$repo" --state open \
+        --search '"Nightly CI is red on main" in:title' --json number --jq '.[0].number // empty' 2>/dev/null)" || issue=""
+      notice="NIGHTLY RED on main since ${verdict#red }${issue:+: #$issue}"
+      ;;
+    *) notice="nightly state unknown" ;;
+  esac
+  echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') $notice" >> "$LOG"
+  echo "$notice"
+}
+
 # Every ACTIVE systemd service that holds this checkout's code resident, one
 # unit id per line, nanoclaw-v2 included. Non-zero exit means "could not look",
 # which is never the same answer as "nothing there" (#818).
@@ -225,6 +254,7 @@ trap 'exit 143' TERM
 if [ "$POST_PULL" != "1" ]; then
   echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') Deploy started" >> "$LOG"
   write_status "running" "preflight" ""
+  nightly_state_warning
 
   # Automatic rollback uses git reset. Refuse before mutating anything when
   # tracked customizations exist; silently deleting them is never an option.

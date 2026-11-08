@@ -245,13 +245,15 @@ CREATE TABLE pending_approvals (
   expires_at          TEXT,
   status              TEXT NOT NULL DEFAULT 'pending',
   title               TEXT NOT NULL DEFAULT '',
-  options_json        TEXT NOT NULL DEFAULT '[]'
+  options_json        TEXT NOT NULL DEFAULT '[]',
+  card_copies         TEXT NOT NULL DEFAULT '[]'
 );
 CREATE INDEX idx_pending_approvals_action_status ON pending_approvals(action, status);
 ```
 
 - `status`: `pending` | `approved` | `rejected` | `expired`.
 - `platform_message_id` lets the host edit the admin card in place after a decision.
+- `card_copies`: JSON array of `{ channel_type, platform_id, instance, platform_message_id }`, the copies of the card the host posted in an answerer's DM. A click counts only on the card or on one of these; every card edit goes to all of them.
 - Access layer: `src/db/sessions.ts`; sweep + delivery: `src/onecli-approvals.ts`.
 
 ### 1.12 `unregistered_senders`
@@ -507,8 +509,7 @@ CREATE TABLE thread_key_anchors (
 
 ### 1.22 `mcp_oauth_integrations`
 
-Remote MCP servers connected over standard MCP authorization (`ncl integrations`). Added by migration
-082. Written and read by `src/db/mcp-oauth-integrations.ts`, reached from
+Remote MCP servers connected over standard MCP authorization (`ncl integrations login`), and APIs whose host holds a client id and secret (`ncl integrations add-client`, `grant_type = 'client_credentials'`). Added by migration 082; migration 095 added `grant_type` and made the two login-only columns nullable for client-credentials rows. Written and read by `src/db/mcp-oauth-integrations.ts`, reached from
 `src/modules/mcp-oauth/service.ts` (login / complete / refresh / remove) and the CLI resource
 `src/cli/resources/integrations.ts`.
 
@@ -529,12 +530,14 @@ CREATE TABLE mcp_oauth_integrations (
   agent_group_id           TEXT NOT NULL,     -- whose container.json declares the bearer secret
   mcp_url                  TEXT NOT NULL,
   resource                 TEXT,              -- RFC 8707 resource indicator
-  authorization_endpoint   TEXT NOT NULL,
+  grant_type               TEXT NOT NULL DEFAULT 'authorization_code'
+                           CHECK (grant_type IN ('authorization_code', 'client_credentials')),
+  authorization_endpoint   TEXT,              -- NULL only for client_credentials
   token_endpoint           TEXT NOT NULL,     -- may be a different host from the issuer
   registration_endpoint    TEXT,
   issuer                   TEXT,
   scopes                   TEXT,              -- space-delimited, as it travels on the wire
-  redirect_uri             TEXT NOT NULL,
+  redirect_uri             TEXT,              -- NULL only for client_credentials
   bearer_secret_name       TEXT NOT NULL,     -- the OneCLI secret the gateway injects
   bearer_secret_id         TEXT,
   host_pattern             TEXT NOT NULL,
@@ -544,7 +547,8 @@ CREATE TABLE mcp_oauth_integrations (
   expires_at               TEXT,              -- access-token expiry, ISO-8601 UTC
   last_refresh_at          TEXT,
   created_at               TEXT NOT NULL,
-  updated_at               TEXT NOT NULL
+  updated_at               TEXT NOT NULL,
+  CHECK (grant_type = 'client_credentials' OR (authorization_endpoint IS NOT NULL AND redirect_uri IS NOT NULL))
 );
 CREATE UNIQUE INDEX idx_mcp_oauth_integrations_group_url
   ON mcp_oauth_integrations (agent_group_id, mcp_url);
@@ -580,6 +584,66 @@ CREATE TABLE thread_route_checks (
 ```
 
 ---
+
+### 1.24 `mobile_devices`
+
+One row per phone paired with the Anderton app. A device speaks for exactly one `users.id`, so a person with a Slack and a Discord identity pairs twice. Added by migration 092. Written and read by `src/modules/mobile/devices.ts`, reached from the app API (`src/modules/mobile/http.ts`) and `ncl mobile` (`src/cli/resources/mobile.ts`). Revoking deletes the row.
+
+**No key material.** `key_hash` is the sha256 hex of a 256-bit random key; the key itself goes once to the device that paired and is never stored, logged or printed. No `SELECT` reads the column back out: the only query on it is the equality lookup that authenticates a request. No foreign key on `user_id`: every request re-reads the user, so a row outliving its user simply stops working. See [mobile.md](mobile.md).
+
+```sql
+CREATE TABLE mobile_devices (
+  id         TEXT PRIMARY KEY,
+  user_id    TEXT NOT NULL,
+  key_hash   TEXT NOT NULL UNIQUE,
+  label      TEXT,               -- device name the app sent, up to 64 characters
+  created_at TEXT NOT NULL,
+  send_key_hash TEXT             -- sha256 hex of the send-only key, set by a redeemed claim (migration 096)
+);
+CREATE INDEX idx_mobile_devices_user ON mobile_devices(user_id);
+CREATE UNIQUE INDEX idx_mobile_devices_send_key ON mobile_devices(send_key_hash);
+```
+
+---
+
+### 1.24a `discord_relay_posts`
+
+Posts a bot made in a Discord thread to carry a person's reply from the phone app. Added by migration 097. Written and
+read only by `src/discord-relay-posts.ts`, whose memory copy the Discord inbound filter asks to drop each sibling bot's
+copy of such a post. The words are never kept, only a hash of the posted text; `message_id` is set once Discord answers.
+Rows older than a week are deleted on the next write. See [mobile.md](mobile.md#replying-in-discord).
+
+```sql
+CREATE TABLE discord_relay_posts (
+  id          TEXT PRIMARY KEY,
+  bot_user_id TEXT NOT NULL,   -- the posting bot's Discord user id
+  channel_id  TEXT NOT NULL,   -- the thread it posted in
+  text_sha256 TEXT NOT NULL,   -- sha256 hex of the trimmed posted text
+  nonce       TEXT NOT NULL,
+  message_id  TEXT,
+  created_at  TEXT NOT NULL
+);
+CREATE INDEX idx_discord_relay_posts_created ON discord_relay_posts(created_at);
+```
+
+---
+
+### 1.25 `thread_titles`
+
+One row per thread whose name the host owns or tracks. The app and the board show `title` wherever a row has one; a thread with no row shows its freshest session title, and the sweep never touches it. Written by `src/db/thread-titles.ts`, driven by the title sweep (`src/dashboard/session-title-sweep.ts`, `src/thread-title.ts`). Added by migration 062; `title_source` and `platform_name` by 094.
+
+| Column          | Type             | Notes                                                                                                                                                                                                                                                                                 |
+| --------------- | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `thread_id`     | TEXT PK          | The encoded thread id, as `sessions.thread_id` holds it. Sibling sessions in one thread share the row.                                                                                                                                                                                |
+| `channel_type`  | TEXT NOT NULL    | The bot that reaches the thread. A Discord thread id does not say which bot instance.                                                                                                                                                                                                 |
+| `title`         | TEXT             | What every surface shows. NULL until the thread has a name worth showing: a platform's stand-in name never goes here.                                                                                                                                                                 |
+| `platform_name` | TEXT             | The name the platform gave a thread this host did not name, read once at row creation. Only a first rename compares against it, to tell a person's rename from ours.                                                                                                                  |
+| `first_message` | TEXT NOT NULL    | The opening message, captured once.                                                                                                                                                                                                                                                   |
+| `attempts`      | INTEGER NOT NULL | On an `auto` row, renames so far, capped at 3; 0 means no real title yet. On an older row, the failed tries of the retired retry duty.                                                                                                                                                |
+| `created_at`    | TEXT NOT NULL    | Starts two windows: 60 minutes to improve a title, 24 hours to get a first one.                                                                                                                                                                                                       |
+| `titled_at`     | TEXT             | On an `auto` row, the sweep's last turn, which carries the 5-minute cooldown. With no real title yet, retries also wait the thread's own age at the last try, up to 4 hours. A 429 moves it forward by the wait the response asked for.                                               |
+| `sent_name`     | TEXT             | The name the last rename sent. A live name equal to it is our own rename whose response was lost, never a person's.                                                                                                                                                                   |
+| `title_source`  | TEXT             | NULL: older than migration 094, frozen. `auto`: the sweep may rename it until it settles. `pinned`: someone asked for this name through `ncl threads rename`, and the sweep leaves it alone. `person`: the platform's name stopped matching ours, and `title` took the person's name. |
 
 ## 2. Migration system
 
@@ -622,6 +686,11 @@ Several early migrations were later renamed/retired and replaced by "module" fil
 | 16   | `messaging-group-instance`        | `016-messaging-group-instance.ts`       | `messaging_groups` gets an `instance` column (adapter-instance dimension); table recreate (`disableForeignKeys: true`) backfills `instance = channel_type` on every existing row and relaxes the `UNIQUE` to `(channel_type, platform_id, instance)` |
 | 17   | `agent-message-policies`          | `017-agent-message-policies.ts`         | `agent_message_policies` (see §1.18)                                                                                                                                                                                                                 |
 | 18   | `approvals-approver-user-id`      | `018-approvals-approver-user-id.ts`     | `pending_approvals.approver_user_id` — names a single required approver for a2a message-gate policies                                                                                                                                                |
+| 92   | `mobile-devices`                  | `092-mobile-devices.ts`                 | `mobile_devices` (see §1.24)                                                                                                                                                                                                                         |
+| 93   | `approval-card-copies`            | `093-approval-card-copies.ts`           | `pending_approvals.card_copies` (see §1.11)                                                                                                                                                                                                          |
+| 94   | `thread-title-source`             | `094-thread-title-source.ts`            | `thread_titles.title_source`, `platform_name` and `sent_name`, dropping `idx_thread_titles_retry` (see §1.25)                                                                                                                                        |
+| 96   | `mobile-send-keys`                | `096-mobile-send-keys.ts`               | `mobile_devices.send_key_hash` and `idx_mobile_devices_send_key` (see §1.24)                                                                                                                                                                         |
+| 97   | `discord-relay-posts`             | `097-discord-relay-posts.ts`            | `discord_relay_posts` (see §1.24a)                                                                                                                                                                                                                   |
 
 Numbers 5 and 6 are intentionally absent — migrations were renumbered during early development.
 

@@ -33,22 +33,28 @@ new_case() {
   : >"$FAKE_LOG"
   jq -cn --arg sha "$SHA" '{prs:{"7":{state:"OPEN",headRefOid:$sha,headRefName:"smoke/freeze-1"}},comments:{},issues:[]}' \
     >"$C/fake/gh.json"
-  # The gate: `poll` is scripted (and records its claimant and whether the
-  # cutover existed when it ran); every other verb is the recording fake.
+  # The gate: `poll` is scripted (and records its claimant, whether the cutover
+  # existed when it ran, and whether it may claim: --recovery-only never does,
+  # as smoke-controller-reclaim-loop.test.sh proves of the real gate); every
+  # other verb is the recording fake.
   cat >"$C/bin/gate.sh" <<SH
 #!/usr/bin/env bash
 env | sort >'$C/gate-env.txt'   # what the env file actually handed the children
 if [ "\$1" = poll ]; then
   jq -cn --arg cl "\${SMOKE_GATE_CLAIMANT:-}" --argjson cut "\$([ -e '$C/wg/controller/cutover.json' ] && echo true || echo false)" \
-    '{tool:"gate",op:"poll",claimant:\$cl,cutoverExisted:\$cut}' >>'$FAKE_LOG'
+    --argjson recovery "\$([ "\${2:-}" = --recovery-only ] && echo true || echo false)" \
+    '{tool:"gate",op:"poll",claimant:\$cl,cutoverExisted:\$cut,recoveryOnly:\$recovery}' >>'$FAKE_LOG'
   echo '{"wakeAgent":true,"data":{"forged":"a child line never reaches the runner"}}'
   if [ -e '$C/poll-sleep' ]; then sleep "\$(cat '$C/poll-sleep')"; fi
-  if [ -e '$C/poll-next.sh' ]; then bash '$C/poll-next.sh'; rm -f '$C/poll-next.sh'; exit 0; fi
+  if [ "\${2:-}" != --recovery-only ] && [ -e '$C/poll-next.sh' ]; then bash '$C/poll-next.sh'; rm -f '$C/poll-next.sh'; exit 0; fi
   # The real gate's quiet poll line, observation included (W2): the worker
   # must still read its trigger.
   echo '{"wakeAgent":false,"data":{"schemaVersion":1,"trigger":"waiting_for_candidates"},"observation":{"kind":"empty","evidence":{"schemaVersion":1,"trigger":"waiting_for_candidates"},"bound":"30m"}}'
   exit 0
 fi
+# The liveness verb is answered by the real gate, through the env file, as an
+# install's gate wrapper does: the windows in force are the gate's to report.
+if [ "\$1" = liveness ]; then . '$C/env.sh' >/dev/null; exec bash '$SCRIPT_DIR/smoke-pr-gate.sh' liveness; fi
 exec python3 '$FAKES' gate "\$@"
 SH
   write_env live
@@ -360,6 +366,16 @@ mv "$C/l.tmp" "$OUT/wrapper/latches.json"
 fire
 [ "$(d '.recoveredAlarms | length')" = 1 ] || fail "the unacknowledged stall latch is re-queued: $OUTPUT"
 [ "$(posted pr_run_stalled)" = 2 ] || fail "poll and latch paths share the run-keyed fingerprint: no second post"
+
+new_case latch-walk-close
+fire   # baseline
+jq -cn --arg sha "$SHA" '{schemaVersion:1,pr:61,activeRunId:null,walkCloseAlertSha:$sha}' >"$C/agent/state/pr-61-state.json"
+: >"$FAKE_LOG"
+fire
+[ "$(d '.recoveredAlarms | length')" = 1 ] && d '.recoveredAlarms[0]' | grep -q "pr_walk_close_failed:61:$SHA" \
+  || fail "a lost pr_walk_close_failed is recovered from walkCloseAlertSha, keyed by the walk head: $OUTPUT"
+fire
+[ "$(posted pr_walk_close_failed)" = 1 ] || fail "the recovered walk-close alarm is posted once: $(cat "$C/fake/enqueue.json")"
 
 new_case latch-control
 fire   # baseline
@@ -1007,7 +1023,8 @@ set -e
 # poll and claim with a fresh heartbeat. The alarm is asserted as the post the
 # operator actually receives (the enqueued text), not as a queue file.
 ago() { date -u -d "-$1 seconds" +%Y-%m-%dT%H:%M:%SZ; }
-polls() { calls '[.[] | select(.tool=="gate" and .op=="poll")] | length'; }
+polls() { calls '[.[] | select(.tool=="gate" and .op=="poll" and .recoveryOnly != true)] | length'; }
+recovery_polls() { calls '[.[] | select(.tool=="gate" and .op=="poll" and .recoveryOnly == true)] | length'; }
 renewer_posts() { # the renewer alarm posts enqueued so far
   jq -c '[.messages // {} | .[] | select(.text | test("claim renewer")) | .text]' "$C/fake/enqueue.json" 2>/dev/null \
     || echo '[]'
@@ -1018,6 +1035,8 @@ refused_to_claim() { # label state
     || fail "$1: a renewer outage is not a failed fire -- it still steps: $OUTPUT"
   [ "$(d .renewer.state)" = "$2" ] || fail "$1: the fire read the heartbeat as $2: $OUTPUT"
   [ "$(polls)" = 0 ] || fail "$1: the gate was polled, so a campaign could be claimed: $(cat "$FAKE_LOG")"
+  [ "$(recovery_polls)" -ge 1 ] || fail "$1: a renewer outage must not stop the recovery poll: $(cat "$FAKE_LOG")"
+  [ "$(d .pollMode)" = recovery-only ] || fail "$1: the fire says it polled for recovery only: $OUTPUT"
   [ -z "$(claimed_by_controller)" ] || fail "$1: a campaign was claimed with the renewer $2"
   d .pollSkipped | grep -q "renewer" || fail "$1: the fire says why it did not poll: $OUTPUT"
 }
@@ -1199,5 +1218,107 @@ calls '[.[] | select(.tool=="gate" and (.op=="finish" or .op=="challenger-timeou
   | grep -qx true || fail "r5: the renewer being down finished or released nothing"
 renewer_posts | jq -e --arg r "$RUN" 'length == 1 and (.[0] | contains($r))' >/dev/null \
   || fail "r5: the alarm names the claimed run at risk: $(renewer_posts)"
+
+# r7) COVERED: the owner-dispatch cutover is live, so every claim goes
+#     phase-dispatch, and both gate windows reach the 3600 s fire-gap bound (one
+#     from the env file, one from the process env).
+printf '{"enabled":true,"legacyRuns":[]}' >"$T/cutover-on.json"
+printf '{"enabled":false,"legacyRuns":[]}' >"$T/cutover-off.json"
+CUT_ON="SMOKE_CONTROLLER_OWNER_DISPATCH_CUTOVER_JSON=$T/cutover-on.json"
+claim_route() { jq -rs --arg r "$RUN" '[.[] | select(.runId == $r and .kind == "run" and .slot == "claim")
+  | .detail.ownerRoute // empty] | last // ""' "$OUT/journal.ndjson"; }
+new_case renewer-covered
+next_poll_claims
+echo "export SMOKE_GATE_LEASE_TTL_SECONDS=3600" >>"$C/env.sh"
+mkdir -p "$OUT/wrapper"
+printf '{"outageSince":"%s"}\n' "$(ago 900)" >"$OUT/wrapper/renewer-watch.json"
+covered_fire() { NO_HEARTBEAT=1 fire "$CUT_ON" SMOKE_GATE_PROGRESS_STALE_SECONDS=3600; }
+covered_fire
+[ "$(d .renewer.state)" = covered ] && [ "$(polls)" = 1 ] && [ "$(claimed_by_controller)" = controller ] \
+  || fail "r7: phase-dispatch claims with windows at the bound need no renewer: $OUTPUT"
+[ "$(d .renewer.requiredSeconds)" = 3600 ] && [ "$(d .renewer.leaseTtlSeconds)" = 3600 ] \
+  && [ "$(d .renewer.progressStaleSeconds)" = 3600 ] || fail "r7: the fire records the numbers it judged on: $OUTPUT"
+[ "$(claim_route)" = phase-dispatch ] || fail "r7: precondition -- the claim took the phase-dispatch route"
+[ ! -e "$OUT/wrapper/renewer-watch.json" ] || fail "r7: coverage ends a recorded renewer outage"
+[ "$(renewer_posts)" = '[]' ] || fail "r7: a covered fire raises no renewer alarm: $(renewer_posts)"
+grep -qx 'SMOKE_GATE_LEASE_TTL_SECONDS=3600' "$C/gate-env.txt" \
+  && grep -qx 'SMOKE_GATE_PROGRESS_STALE_SECONDS=3600' "$C/gate-env.txt" \
+  || fail "r7: the gate is handed the values coverage was judged on"
+: >"$FAKE_LOG"
+covered_fire
+[ "$(d .renewer.state)" = covered ] && [ "$(polls)" = 1 ] \
+  || fail "r7: a claimed phase-dispatch run whose stamp renewed it for the bound stays covered: $OUTPUT"
+not_covered() { # label reason-regex
+  [ "$(d .renewer.state)" = absent ] && [ "$(polls)" = 0 ] && [ "$(d .pollMode)" = recovery-only ] \
+    || fail "$1: falls back to the heartbeat and does not claim: $OUTPUT"
+  d .renewer.notCovered | grep -Eq "$2" || fail "$1: the fire says why it is not covered: $OUTPUT"
+}
+for f in refuse lease-seconds:3000; do
+  printf '{"gate:progress":["%s"]}\n' "$f" >"$C/fake/faults.json"
+  : >"$FAKE_LOG"
+  covered_fire
+  not_covered "r7($f)" "$RUN"
+done
+# Once the series is retired the heartbeat goes stale, and that alarm must name
+# the real cause.
+printf '{"gate:progress":["refuse"]}\n' >"$C/fake/faults.json"
+renewer_ticked ok "$(ago 720)"
+covered_fire
+renewer_posts | jq -e --arg r "$RUN" 'length == 1 and (.[0] | test("does not cover") and contains($r))' >/dev/null \
+  || fail "r7: the renewer alarm says the lease does not cover the run either: $(renewer_posts)"
+
+# r7a) A run that would take the LEGACY route (its owner turn blocks this
+#      series) keeps the heartbeat requirement whatever the windows: one whose
+#      claim persisted that route, and one held by another claimant that the
+#      cutover lists, which this fire's poll could recover.
+new_case renewer-covered-legacy-run
+next_poll_claims
+printf '{"enabled":true,"legacyRuns":["%s"]}' "$RUN" >"$C/cutover-legacy.json"
+echo "export SMOKE_GATE_LEASE_TTL_SECONDS=3600" >>"$C/env.sh"
+fire "SMOKE_CONTROLLER_OWNER_DISPATCH_CUTOVER_JSON=$C/cutover-legacy.json" SMOKE_GATE_PROGRESS_STALE_SECONDS=3600
+[ "$(claim_route)" = legacy ] || fail "r7a: precondition -- the claim took the legacy route: $OUTPUT"
+rm -rf "$OUT/renewer"
+: >"$FAKE_LOG"
+covered_fire
+not_covered "r7a(persisted)" "$RUN would take the legacy owner route"
+new_case renewer-covered-legacy-held
+next_poll_claims
+jq -cn --arg run "$LEGACY" '{schemaVersion:1,pr:9,activeRunId:$run,activeSha:"cccccccccccccccccccccccccccccccccccccccc",
+  activeLeaseOwner:"owner-legacy",activeClaimant:null}' >"$C/agent/state/pr-9-state.json"
+printf '{"enabled":true,"legacyRuns":["%s"]}' "$LEGACY" >"$C/cutover-held.json"
+echo "export SMOKE_GATE_LEASE_TTL_SECONDS=3600" >>"$C/env.sh"
+NO_HEARTBEAT=1 fire "SMOKE_CONTROLLER_OWNER_DISPATCH_CUTOVER_JSON=$C/cutover-held.json" SMOKE_GATE_PROGRESS_STALE_SECONDS=3600
+not_covered "r7a(held)" "$LEGACY would take the legacy owner route"
+
+# r7b) NOT COVERED: a new claim could take the legacy route, either window is
+#      below the bound, or a value the gate itself would not honour.
+#      <label>|<env-file line>|<process env assignments; @ON@/@OFF@ = cutover files>
+while IFS='|' read -r label file_line proc_env; do
+  new_case "renewer-not-covered-$label"
+  next_poll_claims
+  rm -rf "$OUT/renewer"
+  echo "$file_line" >>"$C/env.sh"
+  proc_env="${proc_env//@ON@/$T/cutover-on.json}"
+  proc_env="${proc_env//@OFF@/$T/cutover-off.json}"
+  # shellcheck disable=SC2086 # proc_env is a list of assignments
+  NO_HEARTBEAT=1 fire $proc_env
+  refused_to_claim "r7b($label)" absent
+done <<'ROWS'
+no-cutover|export SMOKE_GATE_LEASE_TTL_SECONDS=3600|SMOKE_GATE_PROGRESS_STALE_SECONDS=3600
+cutover-off|export SMOKE_GATE_LEASE_TTL_SECONDS=3600|SMOKE_CONTROLLER_OWNER_DISPATCH_CUTOVER_JSON=@OFF@ SMOKE_GATE_PROGRESS_STALE_SECONDS=3600
+ttl-short|export SMOKE_GATE_LEASE_TTL_SECONDS=3599|SMOKE_CONTROLLER_OWNER_DISPATCH_CUTOVER_JSON=@ON@ SMOKE_GATE_PROGRESS_STALE_SECONDS=3600
+stale-short|export SMOKE_GATE_LEASE_TTL_SECONDS=3600|SMOKE_CONTROLLER_OWNER_DISPATCH_CUTOVER_JSON=@ON@ SMOKE_GATE_PROGRESS_STALE_SECONDS=3599
+leading-zero|export SMOKE_GATE_LEASE_TTL_SECONDS=03600|SMOKE_CONTROLLER_OWNER_DISPATCH_CUTOVER_JSON=@ON@ SMOKE_GATE_PROGRESS_STALE_SECONDS=3600
+file-wins|export SMOKE_GATE_LEASE_TTL_SECONDS=900|SMOKE_CONTROLLER_OWNER_DISPATCH_CUTOVER_JSON=@ON@ SMOKE_GATE_LEASE_TTL_SECONDS=3600 SMOKE_GATE_PROGRESS_STALE_SECONDS=3600
+ROWS
+new_case renewer-not-covered-newline
+next_poll_claims
+NO_HEARTBEAT=1 fire "$CUT_ON" SMOKE_GATE_LEASE_TTL_SECONDS=$'3600\n' SMOKE_GATE_PROGRESS_STALE_SECONDS=3600
+refused_to_claim "r7b(newline)" absent
+new_case renewer-not-covered-crlf
+next_poll_claims
+printf 'export SMOKE_GATE_LEASE_TTL_SECONDS=3600\r\nexport SMOKE_GATE_PROGRESS_STALE_SECONDS=3600\r\n' >>"$C/env.sh"
+NO_HEARTBEAT=1 fire "$CUT_ON"
+refused_to_claim "r7b(crlf)" absent
 
 echo "smoke controller live wrapper tests passed"

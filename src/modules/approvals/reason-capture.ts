@@ -33,9 +33,13 @@ import {
 } from '../../db/sessions.js';
 import { log } from '../../log.js';
 import { registerMessageInterceptor } from '../../router.js';
+import { replyThreads } from '../../thread-context.js';
 import type { PendingApproval, Session } from '../../types.js';
 import { inboundSender } from '../permissions/inbound-sender.js';
+import { displayNameAcrossBots } from '../../slack-user-identity.js';
+import { upsertUser } from '../permissions/db/users.js';
 import { ensureUserDm } from '../permissions/user-dm.js';
+import type { ApprovalCardCopy } from './card-copies.js';
 import { finalizeReject, resolveClaimed } from './finalize.js';
 import { editApprovalCardResolution, REJECT_WITH_REASON_VALUE } from './primitive.js';
 
@@ -93,9 +97,14 @@ export async function claimReasonHold(approval: PendingApproval): Promise<boolea
  * (nowhere to ask, no adapter, delivery throws) we finalize a plain reject
  * immediately rather than strand the requesting agent.
  */
-export async function armReasonCapture(approval: PendingApproval, session: Session, userId: string): Promise<void> {
+export async function armReasonCapture(
+  approval: PendingApproval,
+  session: Session,
+  userId: string,
+  onCopy?: ApprovalCardCopy,
+): Promise<void> {
   const adapter = getDeliveryAdapter();
-  const target = await reasonTarget(approval, userId);
+  const target = await reasonTarget(approval, userId, onCopy);
   if (!target || !adapter) {
     log.warn('reject-with-reason: cannot reach approver, finalizing plain reject', {
       approvalId: approval.approval_id,
@@ -158,8 +167,39 @@ interface ReasonTarget {
   inThread: boolean;
 }
 
-/** Where the reason is asked for and read: the card's thread, else beside the card, else the approver's DM. */
-async function reasonTarget(approval: PendingApproval, userId: string): Promise<ReasonTarget | null> {
+/**
+ * Where the reason is asked for and read: the clicker's DM for an approvals-channel copy, else the DM copy that was
+ * clicked, else the card's thread, else beside the card, else the approver's DM.
+ */
+async function reasonTarget(
+  approval: PendingApproval,
+  userId: string,
+  onCopy: ApprovalCardCopy | undefined,
+): Promise<ReasonTarget | null> {
+  // The approvals channel is a queue of open cards, so a reason asked from it goes to the clicker's DM. The clicker may
+  // have passed authorization as their identity on another bot and never messaged this one, which leaves no user row
+  // for ensureUserDm to open the DM from.
+  if (onCopy?.queue) {
+    if (userId) {
+      await upsertUser({
+        id: userId,
+        kind: onCopy.channel_type,
+        display_name: await displayNameAcrossBots(userId),
+        created_at: new Date().toISOString(),
+      });
+    }
+    return dmTarget(userId);
+  }
+  if (onCopy) {
+    return {
+      channelType: onCopy.channel_type,
+      platformId: onCopy.platform_id,
+      threadId: null,
+      replyThreads: [null],
+      instance: onCopy.instance ?? onCopy.channel_type,
+      inThread: false,
+    };
+  }
   if (approval.channel_type && approval.platform_id && (approval.thread_id || approval.platform_message_id)) {
     const located = {
       channelType: approval.channel_type,
@@ -167,15 +207,16 @@ async function reasonTarget(approval: PendingApproval, userId: string): Promise<
       instance: approval.instance ?? approval.channel_type,
       inThread: true,
     };
-    if (approval.thread_id) return { ...located, threadId: approval.thread_id, replyThreads: [approval.thread_id] };
-    // A card with no thread (a channel's top level, or a DM, which can't hold threads) is asked beside it; the reply
-    // counts there or in a thread under the card.
     return {
       ...located,
-      threadId: null,
-      replyThreads: [null, `${approval.platform_id}:${approval.platform_message_id}`],
+      threadId: approval.thread_id,
+      replyThreads: replyThreads(approval.platform_id, approval.thread_id, approval.platform_message_id),
     };
   }
+  return dmTarget(userId);
+}
+
+async function dmTarget(userId: string): Promise<ReasonTarget | null> {
   const dm = userId ? await ensureUserDm(userId) : null;
   if (!dm) return null;
   return {

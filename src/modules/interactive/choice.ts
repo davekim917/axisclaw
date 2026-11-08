@@ -23,6 +23,7 @@ import { onHostStart } from '../../host-lifecycle.js';
 import { log } from '../../log.js';
 import { resolveSession, sessionMessageExists } from '../../session-manager.js';
 import { isChannelVariant, type MessagingGroup, type PendingApproval, type Session } from '../../types.js';
+import { cardOverrun } from '../approvals/card-budget.js';
 import { registerChoiceHandler, retireChoice, type ChoiceHandlerContext } from '../approvals/choices.js';
 import { notifyAgent, requestApprovalOutcome, type RequestApprovalOptions } from '../approvals/primitive.js';
 import {
@@ -47,7 +48,6 @@ const CHOICE_RESPONSE_EVENT = 'choice_response';
 const ID_RE = /^[A-Za-z0-9._:-]{1,128}$/;
 const USER_ID_RE = /^[^:\s]+:\S+$/;
 const OPTION_STYLES = new Set<unknown>(['primary', 'danger', 'default']);
-const MAX_RELEASE_CARD_TEXT = 1800;
 const HEX_RUN_RE = /[0-9a-f]{40}/i;
 const DISPLAY_SAFE_RE =
   /^[\x20-\x7E\u00A3\u00B0\u00C0-\u00FF\u2013\u2014\u2018\u2019\u201C\u201D\u2022\u2026\u2192\u20AC]*$/;
@@ -149,10 +149,6 @@ function parseChoiceRequest(content: Record<string, unknown>): ChoiceRequest | {
     return { error: 'a warning card needs approvalScope.holds: the exact hold codes its Go accepts' };
   }
   const canonical = scope && brief ? canonicalReleaseChoice(scope, brief) : undefined;
-  const cardText = canonical ? `**${canonical.title}**\n\n${canonical.question}`.length : 0;
-  if (cardText > MAX_RELEASE_CARD_TEXT) {
-    return { error: `decision is too long for one card: shorten it by ${cardText - MAX_RELEASE_CARD_TEXT} characters` };
-  }
   const genericTitle = typeof title === 'string' && title.trim() ? title : undefined;
   const genericQuestion = typeof question === 'string' && question.trim() ? question : undefined;
   if (!canonical && !genericTitle) return { error: 'title is required' };
@@ -372,6 +368,20 @@ async function handleRequestChoice(content: Record<string, unknown>, session: Se
     }
     // Top-level in the destination: the card is the ask, and replies thread under it.
     conversation = { channelType: mg.channel_type, platformId: mg.platform_id, threadId: null, instance: mg.instance };
+  }
+
+  if (request.approvalScope) {
+    const channelType =
+      conversation?.channelType ??
+      (session.messaging_group_id ? (await getMessagingGroup(session.messaging_group_id))?.channel_type : undefined);
+    const over = cardOverrun(channelType, request.title, request.question);
+    if (over > 0) {
+      await notifyAgent(
+        session,
+        `request_choice failed: decision is too long for one card: shorten it by ${over} characters`,
+      );
+      return;
+    }
   }
 
   const options: RawOption[] = request.options.map((o) => ({

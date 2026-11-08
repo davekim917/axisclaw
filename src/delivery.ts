@@ -46,12 +46,14 @@ import { isUnguarded, unguarded, type Unguarded } from './guard/index.js';
 import { log } from './log.js';
 import { scrubSecrets } from './secret-scrubber.js';
 import { humanizeOutboundContent } from './verdict-tokens.js';
+import { archiveTenancyOf } from './archive-tenancy.js';
 import { archiveMessage } from './message-archive.js';
 import { notifyOutboundDelivered } from './delivery-events.js';
 import { resolveContinueThread } from './continue-thread.js';
 import { normalizeOptions } from './channels/ask-question.js';
 import { clearOutbox, readOutboxFiles, withExistingMailboxSession } from './session-manager.js';
-import { sessionOutboundStorageStat, type NanoclawMailboxSession } from './modules/mailbox/index.js';
+import { isDispatchSeries, sessionOutboundStorageStat, type NanoclawMailboxSession } from './modules/mailbox/index.js';
+import type { RoutedTaskRow } from './modules/mailbox/ops/lookups.js';
 import type { OutboundMessage } from './modules/mailbox/ops/delivery.js';
 import { pauseTypingRefreshAfterDelivery, setTypingAdapter } from './modules/typing/index.js';
 import { TASK_LIST_ENABLED } from './config.js';
@@ -70,6 +72,7 @@ import { isGateRow, orderGateRowsBySeq, recordGateRow } from './modules/scheduli
 import { emitDashboardEvent, emitSessionEvent } from './dashboard/api/events.js';
 import type { OutboundFile } from './channels/adapter.js';
 import { isChannelVariant, type PendingApproval, type Session } from './types.js';
+import { attachSourcesFooter, sourcesFooterContext } from './sources-footer.js';
 
 /** Cached per process and never invalidated: a session's spawn-child status never changes. */
 const spawnChildSessionCache = new Map<string, boolean>();
@@ -585,6 +588,8 @@ export interface ChannelDeliveryAdapter {
     /** Delivering adapter instance (defaults to channelType downstream).
      *  Host-internal only — containers never see instance. */
     instance?: string,
+    /** See `OutboundMessage.workstreamThread`. */
+    workstreamThread?: boolean,
   ): Promise<string | undefined>;
   setTyping?(
     channelType: string,
@@ -1000,12 +1005,10 @@ async function ackDelivery(
 
 /** The stat is taken BEFORE the drain and that value is stored, so a commit mid-drain is re-polled next cycle. */
 export async function sweepDeliverSession(session: Session, nowMs: number): Promise<DrainOutcome | 'skipped'> {
-  // Never gate a live container (pollActive drains it). `isContainerRunning` is authoritative: the sweep's session
-  // snapshot can still read 'stopped' for a container already writing. Lazy import keeps container-runner out of
-  // every delivery importer's module graph.
-  const { isContainerRunning } = await import('./container-runner.js');
-  const containerLive =
-    isContainerRunning(session.id) || session.container_status === 'running' || session.container_status === 'idle';
+  // Never gate a live container (pollActive drains it). Lazy import keeps container-runner out of every delivery
+  // importer's module graph.
+  const { isSessionContainerLive } = await import('./container-runner.js');
+  const containerLive = isSessionContainerLive(session);
 
   // `null` — no storage yet, unreadable, or a rollback still owed on the file
   // — falls through and lets the drain decide instead of arming.
@@ -1058,31 +1061,57 @@ export async function runSweepDeliveryCycle(nowMs: number = Date.now()): Promise
   return { polled, skipped };
 }
 
-/**
- * Per-series opt-out (`--thread-anchor false`), cached per TTL to avoid a DB open per message. Any failure means
- * NOT exempt (the anchored default is the safe one).
- */
-const threadAnchorExemptCache = new Map<string, { exempt: boolean; at: number }>();
-const THREAD_ANCHOR_CACHE_TTL_MS = 5 * 60 * 1000;
+interface TaskSeriesRoute {
+  /** `--thread-anchor false`: one new thread per item, so no rolling anchor. */
+  anchorExempt: boolean;
+  /** The series' routing stamp; a thread here is where the series was started, e.g. by `ncl threads open`. */
+  stamp: RoutedTaskRow | null;
+}
 
-async function isThreadAnchorExempt(session: Session): Promise<boolean> {
+const taskSeriesRouteCache = new Map<string, { route: TaskSeriesRoute; at: number }>();
+const TASK_SERIES_ROUTE_CACHE_TTL_MS = 5 * 60 * 1000;
+const NO_TASK_SERIES_ROUTE: TaskSeriesRoute = { anchorExempt: false, stamp: null };
+
+async function readTaskSeriesRoute(session: Session): Promise<TaskSeriesRoute> {
   const prefix = `${TASKS_SYSTEM_THREAD_ID}:`;
-  if (!session.thread_id?.startsWith(prefix)) return false;
-  const cached = threadAnchorExemptCache.get(session.id);
-  if (cached && Date.now() - cached.at < THREAD_ANCHOR_CACHE_TTL_MS) return cached.exempt;
+  if (!session.thread_id?.startsWith(prefix)) return NO_TASK_SERIES_ROUTE;
+  const cached = taskSeriesRouteCache.get(session.id);
+  if (cached && Date.now() - cached.at < TASK_SERIES_ROUTE_CACHE_TTL_MS) return cached.route;
 
-  let exempt = false;
+  let route = NO_TASK_SERIES_ROUTE;
   try {
     const seriesId = session.thread_id.slice(prefix.length);
-    const content = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
-      mailbox.getLatestTaskContent(seriesId),
-    );
-    if (content) exempt = (JSON.parse(content) as { threadAnchor?: unknown }).threadAnchor === false;
+    const read = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) => ({
+      content: mailbox.getLatestTaskContent(seriesId),
+      routed: mailbox.getLatestRoutedTaskRow(seriesId),
+    }));
+    if (read) {
+      route = {
+        anchorExempt:
+          read.content !== null && (JSON.parse(read.content) as { threadAnchor?: unknown }).threadAnchor === false,
+        stamp: read.routed,
+      };
+    }
   } catch {
-    exempt = false;
+    route = NO_TASK_SERIES_ROUTE;
   }
-  threadAnchorExemptCache.set(session.id, { exempt, at: Date.now() });
-  return exempt;
+  taskSeriesRouteCache.set(session.id, { route, at: Date.now() });
+  return route;
+}
+
+/** Read uncached, since `tasks update` can add or clear a recurrence mid-series. Unreadable counts as recurring. */
+async function isRecurringSeries(session: Session): Promise<boolean> {
+  const seriesId = taskSeriesId(session.thread_id);
+  if (seriesId === null) return true;
+  try {
+    return (
+      (await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
+        mailbox.isRecurringTaskSeries(seriesId),
+      )) ?? true
+    );
+  } catch {
+    return true;
+  }
 }
 
 async function deliverMessage(
@@ -1554,7 +1583,9 @@ async function deliverMessage(
 
   // Defense in depth: scrub registered secret values from every agent-authored post; verdict tokens are humanized
   // here too (the one door all chat posts pass through).
-  const scrubbedContent = humanizeOutboundContent(scrubSecrets(msg.content));
+  const scrubbedContent = await attachSourcesFooter(humanizeOutboundContent(scrubSecrets(msg.content)), () =>
+    sourcesFooterContext(session.agent_group_id),
+  );
 
   // Final replies always post fresh, never as an edit of the status bubble, so the answer lands below any
   // follow-up that arrived mid-turn.
@@ -1579,23 +1610,43 @@ async function deliverMessage(
   // reactions follow the anchor to reach in-thread messages but never drop or record one.
   const isInPlaceOp = content.operation === 'edit' || content.operation === 'reaction';
   const isTaskSessionPost = session.messaging_group_id === null && isTaskThread(session.thread_id);
+  const taskSeriesRoute = isTaskSessionPost ? await readTaskSeriesRoute(session) : NO_TASK_SERIES_ROUTE;
 
   // Keyed anchor (`content.threadKey`): the first post under a key lands at root and is recorded; later posts
   // thread beneath it with no rotation. Beats both other anchors, never an explicit thread_id. Keyed per agent
   // group and per messaging group, so two adapter instances never share a parent.
   const threadKey = isRoutineOutcome ? null : readThreadKey(content, msg.id, session.id);
+
+  // A task-session post to the room its series was stamped with continues the stamped thread. The runner names a
+  // thread only from the row it is answering, so a post answering a row with no thread (a steer, a system notice) or
+  // sent after its reply route aged out carries the room alone. A one-shot series' outcome belongs to the thread it
+  // was started in; a recurring series' outcome does not (above).
+  const stamp = taskSeriesRoute.stamp;
+  let threadFromStamp = false;
+  if (
+    baseThreadId === null &&
+    threadKey === null &&
+    stamp?.thread_id &&
+    stamp.channel_type === msg.channel_type &&
+    stamp.platform_id === msg.platform_id &&
+    (!isRoutineOutcome || !(await isRecurringSeries(session)))
+  ) {
+    baseThreadId = stamp.thread_id;
+    threadFromStamp = true;
+  }
   const keyAddr: ThreadKeyAddress | null =
     threadKey !== null && baseThreadId === null && deliverMessagingGroupId !== undefined
       ? { agentGroupId: session.agent_group_id, messagingGroupId: deliverMessagingGroupId, threadKey }
       : null;
   const keyedEligible = keyAddr !== null;
+  // A dispatched work session posting under a key is doing work someone returns to, and so is a keyed handoff: that is
+  // the opening post of the work, sent before the dispatch exists. A report series posts its own keys (dbt alerts do),
+  // so the key alone does not say which it is.
+  const isHandoff = content.reporting?.version === 1 && content.reporting.purpose === 'handoff';
+  const workstreamThread = keyedEligible && (isHandoff || isDispatchSeries(taskSeriesId(session.thread_id)));
 
   const taskAnchorEligible =
-    !isRoutineOutcome &&
-    !keyedEligible &&
-    isTaskSessionPost &&
-    baseThreadId === null &&
-    !(await isThreadAnchorExempt(session));
+    !isRoutineOutcome && !keyedEligible && isTaskSessionPost && baseThreadId === null && !taskSeriesRoute.anchorExempt;
 
   // Per-turn channel-root threading (see ChatThreadAnchor) for every post the task anchor does not take. A task list is
   // progress: it never becomes the root the answer threads under, nor threads under an earlier message.
@@ -1607,7 +1658,8 @@ async function deliverMessage(
     msg.kind !== 'task_list';
 
   let effectiveThreadId = baseThreadId;
-  let usedAnchor = false;
+  // An edit or reaction names no thread, so its target may be a root post: retry there, as for an anchor.
+  let usedAnchor = threadFromStamp && isInPlaceOp;
   let adoptedThreadPlatformId: string | undefined;
   if (keyAddr) {
     const anchor = await getThreadKeyAnchor(keyAddr, new Date().toISOString());
@@ -1750,6 +1802,7 @@ async function deliverMessage(
       scrubbedContent,
       files,
       deliverInstance,
+      workstreamThread,
     );
   } catch (err) {
     if (outcomeClaim) {
@@ -1793,6 +1846,7 @@ async function deliverMessage(
       scrubbedContent,
       files,
       deliverInstance,
+      workstreamThread,
     );
   }
 
@@ -1855,21 +1909,25 @@ async function deliverMessage(
           post: { text, channelType: msg.channel_type, platformId: msg.platform_id, threadId: effectiveThreadId },
         });
         const mg = await getMessagingGroupByPlatform(msg.channel_type, msg.platform_id);
-        archiveMessage({
-          id: msg.id,
-          agentGroupId: session.agent_group_id,
-          messagingGroupId: session.messaging_group_id,
-          channelType: msg.channel_type,
-          channelName: mg?.name ?? null,
-          platformId: msg.platform_id,
-          // Where the post actually landed (an anchored post has a null row thread_id).
-          threadId: effectiveThreadId,
-          role: 'assistant',
-          senderId: session.agent_group_id,
-          senderName: 'assistant',
-          text,
-          sentAt: new Date().toISOString(),
-        });
+        const tenancy = await archiveTenancyOf(session.agent_group_id);
+        archiveMessage(
+          {
+            id: msg.id,
+            agentGroupId: session.agent_group_id,
+            messagingGroupId: session.messaging_group_id,
+            channelType: msg.channel_type,
+            channelName: mg?.name ?? null,
+            platformId: msg.platform_id,
+            // Where the post actually landed (an anchored post has a null row thread_id).
+            threadId: effectiveThreadId,
+            role: 'assistant',
+            senderId: session.agent_group_id,
+            senderName: 'assistant',
+            text,
+            sentAt: new Date().toISOString(),
+          },
+          tenancy,
+        );
       }
     } catch {
       // best-effort

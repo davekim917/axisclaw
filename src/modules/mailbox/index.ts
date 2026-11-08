@@ -11,7 +11,7 @@ import {
   type TaskDispatchResult,
 } from './ops/task-dispatch.js';
 import { readTaskSettlement, type TaskSettlement } from './ops/task-settlement.js';
-export { dispatchSeriesId, validateDispatchKey } from './ops/task-dispatch.js';
+export { dispatchSeriesId, isDispatchSeries, validateDispatchKey } from './ops/task-dispatch.js';
 
 import { sessionMailboxDir, sessionMailboxPath } from '../../mailbox/sqlite/paths.js';
 import { SqliteAgentMailbox, wrapSqliteInbound, wrapSqliteOutbound } from '../../mailbox/sqlite/index.js';
@@ -87,7 +87,9 @@ import {
   type TaskListSettlement,
   getLatestRoutedTaskRow,
   getLatestTaskContent,
+  isRecurringTaskSeries,
   getTaskOccurrenceSeriesId,
+  getEarliestInboundChats,
   getRecentInboundChatSenders,
   hasRestartNoteSince,
   type ChannelDestination,
@@ -348,10 +350,12 @@ export interface NanoclawMailboxSession extends MailboxSession {
   listOutboundMessageIds(): string[];
 
   getRecentInboundChatSenders(limit: number): InboundChatSenderRow[];
+  getEarliestInboundChats(limit: number): InboundChatSenderRow[];
   getChannelDestination(name: string): ChannelDestination | null;
   getLatestTaskContent(seriesId: string): string | null;
   getTaskOccurrenceSeriesId(occurrenceId: string): string | null;
   getLatestRoutedTaskRow(seriesId: string): RoutedTaskRow | null;
+  isRecurringTaskSeries(seriesId: string): boolean;
   getInboundRoutingAnchor(messageId: string): InboundRoutingAnchor | null;
   getInboundRequestIdentity(sequence: number): InboundRequestIdentity | null;
   getRecoverableLifecycleStatus(outboundId?: string): RecoverableLifecycleStatus | null;
@@ -393,11 +397,12 @@ export interface NanoclawMailboxSession extends MailboxSession {
   // Upstream's task ops are reused wherever the statement matches; only these differ.
   /** Fork insert: routing columns, and `trigger = 0` so the row lands inert. */
   insertTaskRow(row: TaskRowInsert): void;
-  dispatchTaskEvent(input: TaskDispatchInput): TaskDispatchResult;
+  dispatchTaskEvent(input: TaskDispatchInput, containerLive: boolean): TaskDispatchResult;
   hasTaskDispatchEvents(): boolean;
   readTaskSettlement(
     eventId: string,
     threadId: string | null,
+    containerLive: boolean,
     observer?: boolean,
     futureInputs?: boolean,
   ): TaskSettlement;
@@ -878,10 +883,12 @@ function forkOps(
     listOutboundMessageIds: () => readOutbound([], listOutboundMessageIds),
 
     getRecentInboundChatSenders: (limit) => getRecentInboundChatSenders(inbound, limit),
+    getEarliestInboundChats: (limit) => getEarliestInboundChats(inbound, limit),
     getChannelDestination: (name) => getChannelDestination(inbound, name),
     getLatestTaskContent: (seriesId) => getLatestTaskContent(inbound, seriesId),
     getTaskOccurrenceSeriesId: (occurrenceId) => getTaskOccurrenceSeriesId(inbound, occurrenceId),
     getLatestRoutedTaskRow: (seriesId) => getLatestRoutedTaskRow(inbound, seriesId),
+    isRecurringTaskSeries: (seriesId) => isRecurringTaskSeries(inbound, seriesId),
     getInboundRoutingAnchor: (messageId) => getInboundRoutingAnchor(inbound, messageId),
     getInboundRequestIdentity: (sequence) => getInboundRequestIdentity(inbound, sequence),
     getRecoverableLifecycleStatus: (outboundId) =>
@@ -905,14 +912,16 @@ function forkOps(
     listTurnUsageSince: (afterId) => readOutbound([], (outbound) => listTurnUsageSince(outbound, afterId)),
 
     insertTaskRow: (row) => insertTaskRow(inbound, row),
-    dispatchTaskEvent: (input) => dispatchTaskEvent(inbound, input, outboundPresent ? readableOutbound() : null),
+    dispatchTaskEvent: (input, containerLive) =>
+      dispatchTaskEvent(inbound, input, outboundPresent ? readableOutbound() : null, containerLive),
     hasTaskDispatchEvents: () => hasTaskDispatchEvents(inbound),
-    readTaskSettlement: (eventId, threadId, observer, futureInputs) =>
+    readTaskSettlement: (eventId, threadId, containerLive, observer, futureInputs) =>
       readTaskSettlement(
         inbound,
         outboundPresent ? readableOutbound() : null,
         eventId,
         threadId,
+        containerLive,
         observer,
         futureInputs,
       ),

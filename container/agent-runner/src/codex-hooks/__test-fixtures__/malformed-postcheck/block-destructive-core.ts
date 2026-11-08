@@ -5,7 +5,7 @@
  * re-check returns a MALFORMED verdict. runDestructiveGuard must DENY on the
  * malformed post-check, not fall through to allow. QA codex re-pass #2.
  *
- * Pointed at via NANOCLAW_DESTRUCTIVE_GUARD_CORE in runner.test.ts.
+ * Pointed at via setGuardCorePathsForTest({ destructive }) in runner.test.ts.
  */
 export const IS_NANOCLAW = false;
 

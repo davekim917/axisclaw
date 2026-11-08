@@ -64,6 +64,7 @@ import {
   recordTurnUsage,
   endProviderBusyScope,
   releaseProcessingClaims,
+  reclaimWorkContinuation,
   requeueWorkContinuationIfMatches,
   resetWorkContinuationForRealInbound,
   retainCompleteRecallUnits,
@@ -83,6 +84,7 @@ import { clearBatchAnchors, getBatchAnchor, setCurrentBatchAnchors } from './cur
 import { modelBelongsToProvider } from './providers/model-vocabulary.js';
 import { formatLocalTime, TIMEZONE } from './timezone.js';
 import { formatCredentialRotationNotice } from './credential-rotation-notice.js';
+import { formatBlockquoteLabel } from './providers/thinking-labels.js';
 import {
   formatMessages,
   extractAttachments,
@@ -103,7 +105,8 @@ import type {
   PromptAttachment,
 } from './providers/types.js';
 import { autoCommitDirtyWorktrees, type AutoSaveResult } from './worktree-autosave.js';
-import { recordWorktreeInFlight, snapshotWorktrees } from './worktree-in-flight.js';
+import { recordWorktreeInFlight, snapshotWorktrees, type WorktreeBaseline } from './worktree-in-flight.js';
+import { isAdmissibleTrigger, pollableRows, retainCompleteRecallPairs } from './pending-batch.js';
 import { buildSessionRecap, wrapRecap } from './session-recap.js';
 import { confirmProviderTurn, markProviderTurnUnconfirmed } from './provider-turn-completed.js';
 import { ensureFreshContextBootstrap } from './memory/bootstrap.js';
@@ -144,13 +147,29 @@ export function transientOverloadDelayMs(n: number, rand: number = Math.random()
  * The prompt is replaced by a pointer when the resumed transcript already holds
  * it, so the batch is not in context twice. Pass `rotation` only from the
  * rotation retry: the notice must never appear on a retry that swapped nothing.
+ * `acted: false` (no attempt at this batch started a tool call) drops the
+ * instruction to inspect side effects, since there are none.
  */
-function formatCredentialRetryPrompt(
+export function formatCredentialRetryPrompt(
   prompt: string,
   batch: MessageInRow[],
   rotation?: { rotated: boolean; position?: number; ringSize?: number },
   promptAlreadyInTranscript = false,
+  acted = true,
 ): string {
+  const payload = promptAlreadyInTranscript
+    ? 'The interrupted batch is the inbound message this attempt already recorded above in this conversation; it is not repeated here.\n'
+    : prompt;
+  if (!acted && rotation?.rotated) {
+    return (
+      '<runner-retry-provenance>\n' +
+      'The previous attempt at this batch was refused by the API before it took any action, so there is nothing to ' +
+      'inspect or undo. It ran on a credential that has since been rotated: any usage-limit text in this ' +
+      'conversation describes that credential, not this attempt.\n' +
+      '</runner-retry-provenance>\n\n' +
+      payload
+    );
+  }
   const task = batch.find((message) => message.kind === 'task');
   const occurrence = task ? ` Task occurrence ID: ${JSON.stringify(task.id)}.` : '';
   const rotationNotice =
@@ -165,10 +184,38 @@ function formatCredentialRetryPrompt(
     'Before repeating side effects, inspect durable effects already produced, then continue the unfinished work.\n' +
     '</runner-retry-provenance>\n\n' +
     rotationNotice +
-    (promptAlreadyInTranscript
-      ? 'The interrupted batch is the inbound message this attempt already recorded above in this conversation; it is not repeated here.\n'
-      : prompt)
+    payload
   );
+}
+
+/**
+ * Every rotation goes through here, so the host hears about a spent account and the thread sees the move, whichever
+ * retry path rotated.
+ */
+async function rotateOffCredential(
+  provider: AgentProvider,
+  providerName: string,
+  failure: unknown,
+  routing: RoutingContext,
+): Promise<ReturnType<NonNullable<AgentProvider['rotateApiKey']>> | undefined> {
+  const spent = provider.spentCredential?.(failure);
+  if (spent) await handleEvent({ type: 'claude_account_exhausted', ...spent }, routing);
+  const next = provider.rotateApiKey?.();
+  if (next?.rotated && next.position !== undefined && next.ringSize !== undefined) {
+    const reason = (failure instanceof ProviderEventError && failure.classification) || 'retryable error';
+    const label = `${providerName.charAt(0).toUpperCase()}${providerName.slice(1)}`;
+    await handleEvent(
+      {
+        type: 'progress',
+        message: formatBlockquoteLabel(
+          '↻',
+          `${label} credential rotating (${reason}) → slot ${next.position}/${next.ringSize}`,
+        ),
+      },
+      routing,
+    );
+  }
+  return next;
 }
 
 // A 5-min Codex idle-watchdog fire is almost always a real wedge, and each retry
@@ -203,6 +250,10 @@ export function isCorruptionError(msg: string): boolean {
 
 function log(msg: string): void {
   console.error(`[poll-loop] ${msg}`);
+}
+
+function errorText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
 }
 
 function generateId(): string {
@@ -375,6 +426,10 @@ export interface PollLoopConfig {
   autosaveWorktrees?: (reason: string) => Promise<AutoSaveResult>;
   /** Replaces the startup worktree baseline and its turn-end record. */
   recordWorktreeInFlight?: () => Promise<void>;
+  /** A startup baseline the caller already took; left undefined, the loop takes its own. */
+  worktreeBaseline?: WorktreeBaseline | null;
+  /** The caller already made this container's first poll, so `on_wake` rows written since belong to a replacement. */
+  firstPollDone?: boolean;
 }
 
 async function checkpointTurnEnd(
@@ -442,28 +497,23 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
   clearStaleProcessingAcks();
 
   // Before the first turn, so nothing this container writes can land in the baseline.
-  const worktreeBaseline = config.recordWorktreeInFlight ? null : await snapshotWorktrees(undefined, { log });
+  const worktreeBaseline = config.recordWorktreeInFlight
+    ? null
+    : config.worktreeBaseline !== undefined
+      ? config.worktreeBaseline
+      : await snapshotWorktrees(undefined, { log });
   const recordInFlight = config.recordWorktreeInFlight ?? (() => recordWorktreeInFlight(worktreeBaseline, { log }));
 
   let pollCount = 0;
-  let isFirstPoll = true;
+  let isFirstPoll = config.firstPollDone !== true;
   while (true) {
     if (config.signal?.aborted) return;
     if (evaluateAdmission()) {
       await sleep(POLL_INTERVAL_MS, config.signal);
       continue;
     }
-    // System rows are MCP tool responses; only recall_context reaches the prompt.
     // isFirstPoll: on_wake rows fire only on a fresh container's first poll.
-    const messages = getPendingMessages(isFirstPoll).filter((m) => {
-      if (m.kind !== 'system') return true;
-      try {
-        const parsed = JSON.parse(m.content) as { subtype?: string };
-        return parsed.subtype === 'recall_context';
-      } catch {
-        return false;
-      }
-    });
+    const messages = pollableRows(getPendingMessages(isFirstPoll));
     isFirstPoll = false;
     pollCount++;
 
@@ -503,9 +553,10 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
           rememberRequestCandidates(sourceBatch);
           let query: AgentQuery | undefined;
           const abortDirectQuery = () => query?.abort();
-          try {
+          const continuationStartedAt = Date.now();
+          const runContinuationAttempt = async (attemptPrompt: string): Promise<void> => {
             query = config.provider.query({
-              prompt,
+              prompt: attemptPrompt,
               continuation,
               cwd: config.cwd,
               model: settings.model,
@@ -536,10 +587,46 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
               continuation = result.continuation;
               setContinuation(config.providerName, continuation);
             }
-          } catch (err) {
+          };
+          // A server overload says the credential is fine, so it never rotates; the budget reset above ends the retries.
+          let continuationActed = false;
+          const promptAfterRotation = async (err: unknown): Promise<string | undefined> => {
+            continuationActed = continuationActed || (config.provider.lastAttemptActed?.() ?? true);
+            query?.abort();
+            if (continuation === undefined) continuation = getContinuation(config.providerName);
+            const rotatable =
+              config.provider.isRetryable?.(err) &&
+              !config.provider.isTransientOverload?.(err) &&
+              getActiveRepositoryMountBarrier() === null;
+            const rotation = rotatable
+              ? await rotateOffCredential(config.provider, config.providerName, err, routing)
+              : undefined;
+            if (rotation?.rotated && reclaimWorkContinuation(runningWork.id, runnerId)) {
+              idleSuppressedContinuationIds.delete(runningWork.id);
+              log(`Durable continuation retrying on the next credential after: ${errorText(err)}`);
+              return formatCredentialRetryPrompt(
+                prompt,
+                [],
+                rotation,
+                config.provider.transcriptHasPrompt?.(continuation, prompt, continuationStartedAt) ?? false,
+                continuationActed,
+              );
+            }
             requeueWorkContinuationIfMatches(runningWork.id, runnerId);
             idleSuppressedContinuationIds.add(runningWork.id);
-            log(`Durable continuation paused after query error: ${err instanceof Error ? err.message : String(err)}`);
+            log(`Durable continuation paused after query error: ${errorText(err)}`);
+            return undefined;
+          };
+          try {
+            let attemptPrompt: string | undefined = prompt;
+            while (attemptPrompt !== undefined) {
+              try {
+                await runContinuationAttempt(attemptPrompt);
+                attemptPrompt = undefined;
+              } catch (err) {
+                attemptPrompt = await promptAfterRotation(err);
+              }
+            }
           } finally {
             config.signal?.removeEventListener('abort', abortDirectQuery);
             clearCurrentReplyRoute();
@@ -651,14 +738,8 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     let keep: MessageInRow[] = normalMessages;
     let skipped: Array<{ id: string; reason: string }> = [];
     // MODULE-HOOK:scheduling-pre-task:start
-    const { applyPreTaskScripts } = await import('./scheduling/task-script.js');
-    const preTask = await applyPreTaskScripts(normalMessages);
-    keep = retainCompleteRecallPairs(normalMessages, preTask.keep);
-    skipped = preTask.skipped;
-    if (skipped.length > 0) {
-      markScriptSkipped(skipped);
-      log(`Pre-task script skipped ${skipped.length} task(s): ${skipped.map((s) => s.id).join(', ')}`);
-    }
+    const { gateBatchScripts } = await import('./scheduling/task-script.js');
+    ({ keep, skipped } = await gateBatchScripts(normalMessages));
     // MODULE-HOOK:scheduling-pre-task:end
 
     // No admissible trigger survived the scripts: leave the context rows
@@ -1029,9 +1110,14 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       // survives rotation (resume reads a local .jsonl). `!transient`: an
       // overload also matches isRetryable but was handled by the backoff above.
       const ringFailures: unknown[] = [err];
+      let batchActed = false;
+      const rotateOff = (failure: unknown) => {
+        batchActed = batchActed || (config.provider.lastAttemptActed?.() ?? true);
+        return rotateOffCredential(config.provider, config.providerName, failure, routing);
+      };
       let rotation =
         !transient && !recovered && repositoryRecoveryAllowed() && config.provider.isRetryable?.(err)
-          ? config.provider.rotateApiKey?.()
+          ? await rotateOff(err)
           : undefined;
       while (rotation?.rotated && !recovered) {
         log(`Upstream transient error — rotated credential, retrying same batch in-turn with provenance`);
@@ -1042,6 +1128,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
             keep,
             rotation,
             config.provider.transcriptHasPrompt?.(continuation, prompt, batchStartedAt) ?? false,
+            batchActed,
           );
           await retryInTurn(retryPrompt, continuation, effectiveModel);
           recovered = true;
@@ -1049,7 +1136,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
           const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
           log(`Retry after credential rotation also failed: ${retryMsg}`);
           ringFailures.push(retryErr);
-          rotation = config.provider.isRetryable?.(retryErr) ? config.provider.rotateApiKey?.() : undefined;
+          rotation = config.provider.isRetryable?.(retryErr) ? await rotateOff(retryErr) : undefined;
         }
       }
       const ringQuota = ringRateLimitQuota(ringFailures, !recovered && rotation?.rotated === false);
@@ -1268,12 +1355,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
   }
 }
 
-export function isAdmissibleTrigger(m: MessageInRow): boolean {
-  if (m.trigger !== 1) return false;
-  if (m.kind === 'system') return false;
-  if ((m.kind === 'chat' || m.kind === 'chat-sdk') && isClearCommand(m)) return false;
-  return true;
-}
+export { isAdmissibleTrigger, retainCompleteRecallPairs };
 
 function hasRealInbound(messages: MessageInRow[]): boolean {
   return messages.some((message) => {
@@ -1313,37 +1395,6 @@ function isContinuationRecoveryBatch(messages: MessageInRow[]): boolean {
     } catch {
       return false;
     }
-  });
-}
-
-function recallTargetId(m: MessageInRow): string | null {
-  if (m.kind !== 'system' || !m.id.startsWith('recall-')) return null;
-  try {
-    const parsed = JSON.parse(m.content) as { subtype?: unknown };
-    return parsed.subtype === 'recall_context' ? m.id.slice('recall-'.length) : null;
-  } catch {
-    return null;
-  }
-}
-
-export function retainCompleteRecallPairs(original: MessageInRow[], admitted: MessageInRow[]): MessageInRow[] {
-  const originalRecallByTarget = new Map<string, string>();
-  for (const row of original) {
-    const targetId = recallTargetId(row);
-    if (targetId !== null && original.some((candidate) => candidate.id === targetId)) {
-      originalRecallByTarget.set(targetId, row.id);
-    }
-  }
-  if (originalRecallByTarget.size === 0) return admitted;
-
-  const admittedIds = new Set(admitted.map((row) => row.id));
-  return admitted.filter((row) => {
-    const targetId = recallTargetId(row);
-    if (targetId !== null && originalRecallByTarget.get(targetId) === row.id) {
-      return admittedIds.has(targetId);
-    }
-    const recallId = originalRecallByTarget.get(row.id);
-    return recallId === undefined || admittedIds.has(recallId);
   });
 }
 
@@ -2443,7 +2494,19 @@ export async function handleEvent(event: ProviderEvent, routing: RoutingContext)
       await writeMessageOut({
         id: generateId(),
         kind: 'system',
-        content: JSON.stringify({ action: 'codex_account_exhausted', home: event.home }),
+        content: JSON.stringify({ action: 'codex_account_exhausted', home: event.home, resetAt: event.resetAt ?? null }),
+      });
+      break;
+    case 'claude_account_exhausted':
+      await writeMessageOut({
+        id: generateId(),
+        kind: 'system',
+        content: JSON.stringify({
+          action: 'claude_account_exhausted',
+          slot: event.slot,
+          fingerprint: event.fingerprint,
+          resetAt: event.resetAt,
+        }),
       });
       break;
     case 'progress':

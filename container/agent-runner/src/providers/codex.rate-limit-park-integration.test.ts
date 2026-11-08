@@ -15,8 +15,12 @@ import { closeSessionDb, initTestSessionDb } from '../modules/mailbox/testing.js
 import { MEMORY_SESSION_HOOK } from '../memory/session-hook.js';
 import { CodexProvider } from './codex.js';
 
+/** The image's guard chain, read from its source in the repo. */
+const SYSTEM_HOOKS = new URL('../../../codex-system/hooks.json', import.meta.url).pathname;
+
 const ORIGINAL_ENV = {
   PATH: process.env.PATH,
+  FAKE_CODEX_SYSTEM_HOOKS: process.env.FAKE_CODEX_SYSTEM_HOOKS,
   CODEX_HOME: process.env.CODEX_HOME,
   CODEX_FALLBACK_HOMES: process.env.CODEX_FALLBACK_HOMES,
   FAKE_CODEX_UNTRUSTED_HOME_MATCH: process.env.FAKE_CODEX_UNTRUSTED_HOME_MATCH,
@@ -101,29 +105,29 @@ lines.on('line', (line) => {
     return;
   }
   // verifyCodexHookTrust (codex-companion-setup.ts) refuses the spawn unless
-  // every generated guard handler reads back dispatchable. The provider writes
-  // hooks.json AND its trust entries immediately before each spawn, so a
-  // faithful fake reports exactly those two handlers trusted and enabled —
-  // which is what a real codex 0.154.0 does against the same home (measured).
+  // every handler of the image's system guard chain reads back dispatchable.
+  // Codex lists a system-layer handler as managed under every CODEX_HOME, so a
+  // faithful fake reports the chain's two handlers that way — as a real codex
+  // 0.163.0 does for /etc/codex/hooks.json (measured).
   if (request.method === 'hooks/list') {
     const home = process.env.CODEX_HOME || (process.env.HOME || '/home/node') + '/.codex';
-    const hooksPath = home + '/hooks.json';
+    const hooksPath = process.env.FAKE_CODEX_SYSTEM_HOOKS;
     // FAKE_CODEX_UNTRUSTED_HOME_MATCH models the silent failure: this home's
     // handlers load and codex reports them untrusted, so they would never be
     // dispatched. Scoped by substring so a rotation can land on an untrusted
     // fallback while the primary was fine.
     const untrustedMatch = process.env.FAKE_CODEX_UNTRUSTED_HOME_MATCH;
-    const trustStatus = untrustedMatch && home.includes(untrustedMatch) ? 'untrusted' : 'trusted';
+    const trustStatus = untrustedMatch && home.includes(untrustedMatch) ? 'untrusted' : 'managed';
     const rows = ['pre_tool_use', 'post_tool_use'].map((event, index) => ({
       key: hooksPath + ':' + event + ':0:0',
       eventName: event,
       handlerType: 'command',
       sourcePath: hooksPath,
-      source: 'user',
+      source: 'system',
       pluginId: null,
       displayOrder: index,
       enabled: true,
-      isManaged: false,
+      isManaged: true,
       trustStatus,
     }));
     send({ id: request.id, result: { data: [{ cwd: process.cwd(), hooks: rows, warnings: [], errors: [] }] } });
@@ -211,6 +215,7 @@ async function run(opts: {
   fs.writeFileSync(path.join(codexHome, 'auth.json'), JSON.stringify({ tokens: { account_id: 'acct-from-auth' } }));
 
   process.env.PATH = `${binDir}:${process.env.PATH ?? ''}`;
+  process.env.FAKE_CODEX_SYSTEM_HOOKS = SYSTEM_HOOKS;
   process.env.CODEX_HOME = codexHome;
   if (opts.fallbackHomes) process.env.CODEX_FALLBACK_HOMES = opts.fallbackHomes.join(':');
   else delete process.env.CODEX_FALLBACK_HOMES;
@@ -237,7 +242,10 @@ async function run(opts: {
   process.env.CODEX_HEALTH_PROBE_INTERVAL_MS = '1000';
   process.env.CODEX_HEALTH_PROBE_TIMEOUT_MS = '1000';
 
-  const provider = new CodexProvider({ providerConfig: { reasoning_effort: 'medium' } });
+  const provider = new CodexProvider(
+    { providerConfig: { reasoning_effort: 'medium' } },
+    { systemHooksPath: SYSTEM_HOOKS },
+  );
   provider.registerMemorySessionHook(MEMORY_SESSION_HOOK);
   const events: Run['events'] = [];
   let thrown: string | undefined;
@@ -353,7 +361,7 @@ describe('Codex rate-limit read → park through gen()', () => {
       events.some((e) => e.type === 'progress' && String(e.message).includes('Codex OAuth rotating (quota)')),
     ).toBe(true);
     expect(events.filter((e) => e.type === 'codex_account_exhausted')).toEqual([
-      { type: 'codex_account_exhausted', home: path.join(tmpDir, 'codex-home') },
+      { type: 'codex_account_exhausted', home: path.join(tmpDir, 'codex-home'), resetAt: RESET_ISO },
     ]);
     // Instance 1 was parked before any turn; instance 2 ran the one turn.
     const starts = requests.filter((r) => r.method === 'turn/start');
@@ -394,7 +402,7 @@ describe('Codex rate-limit read → park through gen()', () => {
     });
     expect(spawned).toBe(2);
     expect(events.filter((e) => e.type === 'codex_account_exhausted')).toEqual([
-      { type: 'codex_account_exhausted', home: fallbackHome },
+      { type: 'codex_account_exhausted', home: fallbackHome, resetAt: RESET_ISO },
     ]);
     expect(requests.filter((r) => r.method === 'turn/start').map((r) => r.instance)).toEqual([2]);
     expect(events.filter((e) => e.type === 'result')).toHaveLength(1);
@@ -528,7 +536,7 @@ describe('Codex rate-limit read → park through gen()', () => {
   // The fail-closed wiring itself, driven through the real provider rather than
   // by calling the verifier directly — otherwise deleting any of the four
   // `await verifyCodexHookTrust(...)` lines in codex.ts leaves every test green.
-  it('REFUSES the very first spawn when the app-server reports the generated guard chain untrusted', async () => {
+  it('REFUSES the very first spawn when the app-server reports the guard chain undispatchable', async () => {
     const { events, requests, spawned, thrown } = await run({
       weeklyByInstance: '20',
       untrustedHomeMatch: 'codex-home',
@@ -543,9 +551,9 @@ describe('Codex rate-limit read → park through gen()', () => {
   }, 5_000);
 
   it('REFUSES the rotated spawn when only the FALLBACK home reports the guard chain untrusted', async () => {
-    // The site that is easiest to lose in a refactor: CODEX_HOME has just moved,
-    // trust entries are keyed on the absolute hooks.json path, and the primary
-    // having been fine proves nothing about the home the turn will actually run in.
+    // The site that is easiest to lose in a refactor: CODEX_HOME has just moved
+    // to a new app-server, and the primary's server having been fine proves
+    // nothing about the server the turn will actually run in.
     const fallbackHome = path.join(tmpDir, 'codex-fallback-1');
     fs.mkdirSync(fallbackHome, { recursive: true });
     const { requests, spawned, thrown } = await run({

@@ -8,7 +8,7 @@
  * the core dynamically and bun memoizes the module, so a test that read an
  * export would be reading whatever the previous test left behind.
  *
- * Pointed at via NANOCLAW_DESTRUCTIVE_GUARD_CORE in runner.test.ts.
+ * Pointed at via setGuardCorePathsForTest({ destructive }) in runner.test.ts.
  */
 import fs from 'fs';
 

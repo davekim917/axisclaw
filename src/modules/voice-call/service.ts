@@ -1,5 +1,6 @@
 import { randomBytes } from 'crypto';
 
+import { neutralizeMentions } from '../../channels/neutralize-mentions.js';
 import { PREVIEW_ORIGIN_SUFFIX, TIMEZONE, VOICE_CALL_AGENT_GROUPS, VOICE_CALL_CODEX_BIN } from '../../config.js';
 import { deriveHumanRequest } from '../../caller-identity.js';
 import { withCentralSync } from '../../db/central-lease.js';
@@ -13,7 +14,7 @@ import { requestWake } from '../../request-wake.js';
 import { scrubSecrets } from '../../secret-scrubber.js';
 import { SessionWriteRefusedError, writeSessionMessage } from '../../session-manager.js';
 import { formatLocalTime } from '../../timezone.js';
-import { isChannelVariant, type AgentGroup } from '../../types.js';
+import { isChannelVariant, type AgentGroup, type MessagingGroup } from '../../types.js';
 import { agentGroupAccessUnderLease } from '../permissions/access.js';
 import { getUser } from '../permissions/db/users.js';
 import { ensureUserDm } from '../permissions/user-dm.js';
@@ -21,6 +22,8 @@ import { VoiceCallBridge, type CallPorts } from './call.js';
 import { openLiveCall, readCodexLogin } from './live.js';
 import { calls, type CallPageEvent, type CallRoute, type VoiceCall } from './registry.js';
 import { followSessionFeed } from './session-feed.js';
+import { isDiscordChannelType } from '../../discord-bot.js';
+import { platformName } from './prompts.js';
 
 export const RING_MS = 5 * 60_000;
 export const MAX_CALL_MS = 60 * 60_000;
@@ -93,6 +96,14 @@ export async function deliverText(
   );
 }
 
+/** Where `deliverText` reaches a DM `ensureUserDm` resolved. */
+export const dmRoute = (dm: MessagingGroup) => ({
+  channelType: dm.channel_type,
+  instance: dm.instance ?? dm.channel_type,
+  platformId: dm.platform_id,
+  threadId: null,
+});
+
 const requestIdPrefix = (call: VoiceCall) => `voice-${call.id}-`;
 
 function injectAsCaller(call: VoiceCall, text: string, wake: boolean): { id: string; written: Promise<void> } {
@@ -158,7 +169,7 @@ function portsFor(call: VoiceCall): CallPorts {
       ),
     inject: (text, wake) => injectAsCaller(call, text, wake),
     mirror: (text) =>
-      void deliverText(call.route, text).catch((err: unknown) =>
+      void deliverText(call.route, neutralizeMentions(text)).catch((err: unknown) =>
         log.warn('Voice call: thread post failed', { callId: call.id.slice(0, 8), err }),
       ),
     status: (text) => emit(call, { type: 'status', text }),
@@ -194,8 +205,9 @@ export async function mintVoiceCall(input: { sessionId: string; agentGroupId: st
     throw new VoiceCallRefused('Voice calls start from a conversation thread.');
   }
   const mg = await getMessagingGroup(session.messaging_group_id);
-  if (!mg || !(mg.channel_type === 'slack' || isChannelVariant(mg.channel_type, 'slack')))
-    throw new VoiceCallRefused('Voice calls start from Slack only for now.');
+  const chat = mg?.channel_type ?? '';
+  if (!mg || !(chat === 'slack' || isChannelVariant(chat, 'slack') || isDiscordChannelType(chat)))
+    throw new VoiceCallRefused('Voice calls start from Slack or Discord.');
   const request = await deriveHumanRequest(session);
   if (!request) throw new VoiceCallRefused('No person has asked in this thread, so there is no one to call.');
   const callerId = request.userId;
@@ -244,12 +256,7 @@ export async function mintVoiceCall(input: { sessionId: string; agentGroupId: st
 
   try {
     await deliverText(
-      {
-        channelType: dm.channel_type,
-        instance: dm.instance ?? dm.channel_type,
-        platformId: dm.platform_id,
-        threadId: null,
-      },
+      dmRoute(dm),
       `📞 Tap to call ${call.agentName}: ${voiceCallUrl(id)}\nIt works once and expires at ${formatLocalTime(new Date(call.expiresAt).toISOString(), TIMEZONE)}. Anyone with this link can speak as you, so don't forward it.`,
     );
   } catch (err) {
@@ -274,7 +281,10 @@ export async function answerVoiceCall(call: VoiceCall, offer: string): Promise<{
     MAX_CALL_MS,
   );
   call.timer.unref();
-  const bridge = new VoiceCallBridge({ agentName: call.agentName, callerName: call.callerName }, portsFor(call));
+  const bridge = new VoiceCallBridge(
+    { agentName: call.agentName, callerName: call.callerName, platform: platformName(call.route.channelType) },
+    portsFor(call),
+  );
   call.bridge = bridge;
   try {
     if (!(await stillMayCall(call))) throw new VoiceCallRefused(NOT_ALLOWED);

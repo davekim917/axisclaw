@@ -123,6 +123,11 @@ case "\$VERB" in
       *FAIL-SHOT*) echo "stub: screenshot failed" >&2; exit 1 ;;
       *)
         printf '%s' "$TINY_PNG_B64" | base64 -d >"\$DEST"
+        # Stamp the capture's width into the PNG header, as a real browser does.
+        WIDTH=1280
+        case "\$DEST" in *WRONG-WIDTH*) ;; *-390*) WIDTH=390 ;; esac
+        printf "\$(printf '\\\\x%02x\\\\x%02x\\\\x%02x\\\\x%02x' 0 0 \$((WIDTH >> 8)) \$((WIDTH & 255)))" |
+          dd of="\$DEST" bs=1 seek=16 conv=notrunc 2>/dev/null
         echo "✓ Screenshot saved to \$DEST"
         exit 0
         ;;
@@ -266,7 +271,7 @@ grep -q ' find text Get started click' "$STUB_LOG" \
 grep -q ' click text=' "$STUB_LOG" \
   && { echo "happy path: text= step must never be passed straight to click" >&2; exit 1; }
 
-echo "1/18 happy path ok"
+echo "1/19 happy path ok"
 
 # --- 2. A failed screen stays as a placeholder, never silently dropped ------
 RUN2="$(fresh_run_dir failed-screen)"
@@ -295,7 +300,7 @@ grep -q 'FAILED' "$RUN2/contact-sheet/grid.html" \
 grep -q 'class="desktop placeholder"' "$RUN2/contact-sheet/grid.html" \
   || { echo "failed screen: expected a desktop placeholder div" >&2; exit 1; }
 
-echo "2/18 failed screen stays a placeholder ok"
+echo "2/19 failed screen stays a placeholder ok"
 
 # --- 3. The 8-screen cap ------------------------------------------------------
 RUN3="$(fresh_run_dir cap)"
@@ -311,7 +316,7 @@ echo "$RESULT" | jq -e '.ok == true and .requested == 10 and .capped == true and
 jq -e '.requested == 10 and .capped == true and (.screens | length) == 8' "$RUN3/contact-sheet/manifest.json" \
   >/dev/null || { echo "cap: manifest did not record the 8-screen cap correctly" >&2; exit 1; }
 
-echo "3/18 8-screen cap ok"
+echo "3/19 8-screen cap ok"
 
 # --- 4. Missing auth state: refuse, never touch the browser ------------------
 RUN4="$(fresh_run_dir no-auth)"
@@ -329,7 +334,7 @@ echo "$RESULT" | jq -e '.ok == false and (.error | test("auth state"))' >/dev/nu
   || { echo "missing auth state: expected a refusal naming the auth state: $RESULT" >&2; exit 1; }
 [ ! -s "$STUB_LOG" ] || { echo "missing auth state: agent-browser must never be invoked" >&2; exit 1; }
 
-echo "4/18 missing auth state refuses before touching the browser ok"
+echo "4/19 missing auth state refuses before touching the browser ok"
 
 # --- 5. Empty shots file: refuse -----------------------------------------------
 RUN5="$(fresh_run_dir empty-shots)"
@@ -355,7 +360,7 @@ set -e
 echo "$RESULT" | jq -e '.ok == false' >/dev/null \
   || { echo "missing shots file: expected a refusal: $RESULT" >&2; exit 1; }
 
-echo "5/18 empty/missing shots file refuses ok"
+echo "5/19 empty/missing shots file refuses ok"
 
 # --- 6. Auth state inside the run dir: refuse ---------------------------------
 # The auth state file holds a live session token; the run dir is a shared,
@@ -390,7 +395,7 @@ set -e
   || { echo "auth in a newline-named run dir: expected a refusal naming the run dir (exit $EC): $RESULT" >&2; exit 1; }
 [ ! -s "$STUB_LOG" ] || { echo "auth in a newline-named run dir: agent-browser must never be invoked" >&2; exit 1; }
 
-echo "6/18 auth state inside the run dir refuses ok"
+echo "6/19 auth state inside the run dir refuses ok"
 
 # --- 7. Auth state under the shared workgroup tree: refuse --------------------
 # Override the workgroup root so the test never depends on /workspace/workgroup
@@ -424,7 +429,7 @@ RESULT="$(SMOKE_WORKGROUP_ROOT="$FAKE_WORKGROUP_ROOT" \
 echo "$RESULT" | jq -e '.ok == true' >/dev/null \
   || { echo "auth under workgroup root: a private auth path must still succeed: $RESULT" >&2; exit 1; }
 
-echo "7/18 auth state under the shared workgroup tree refuses ok"
+echo "7/19 auth state under the shared workgroup tree refuses ok"
 
 # --- 8. Caller-supplied source SHA rides through to the manifest verbatim ---
 # and the page is never sniffed for it (the stub's `eval` verb would answer
@@ -444,7 +449,7 @@ jq -e --arg sha "$FROZEN_SHA" '.buildSha == $sha' "$RUN8/contact-sheet/manifest.
 grep -q ' eval (document' "$STUB_LOG" \
   && { echo "source sha: must not sniff the page for a build sha when the caller already supplied one" >&2; exit 1; }
 
-echo "8/18 caller-supplied source sha rides through to the manifest ok"
+echo "8/19 caller-supplied source sha rides through to the manifest ok"
 
 # --- 9. A malformed source SHA is refused, never written into the manifest --
 RUN9="$(fresh_run_dir bad-sha)"
@@ -470,7 +475,7 @@ done
 # behaviour (already covered by the happy path in test 1, which asserts
 # buildSha == "stub-build-sha-123" with no fourth argument given).
 
-echo "9/18 malformed source sha is refused, never written into the manifest ok"
+echo "9/19 malformed source sha is refused, never written into the manifest ok"
 
 # --- 10. Every screen gets its own fresh session (state load THEN open, in
 # that session, before any other screen's session is ever touched) — and the
@@ -540,7 +545,7 @@ cat >"$RUN10B/contact-sheet/shots.json" <<'JSON'
 JSON
 check_fresh_nav "$RUN10B" "/" "/pricing"
 
-echo "10/18 fresh session per screen, order-independent ok"
+echo "10/19 fresh session per screen, order-independent ok"
 
 # --- 11. A grid viewport failure is visible; it must never post a clipped sheet
 RUN11="$(fresh_run_dir grid-viewport-failure)"
@@ -561,7 +566,7 @@ echo "$RESULT" | jq -e '.ok == false and (.error | test("grid viewport"))' >/dev
 grep -q -- ' screenshot --full .*sheet.png$' "$STUB_LOG" \
   && { echo "grid viewport: must not screenshot a grid after viewport failure" >&2; exit 1; }
 
-echo "11/18 grid viewport failure is visible, no clipped sheet emitted"
+echo "11/19 grid viewport failure is visible, no clipped sheet emitted"
 
 # --- 12. A page that never settles is captured but flagged, never silently graded
 RUN12="$(fresh_run_dir unsettled)"
@@ -593,7 +598,7 @@ jq -e '.screens[0].status == "failed" and (.screens[0].desktop.reason | test("fr
   "$RUN12B/contact-sheet/manifest.json" >/dev/null || { echo "freeze failure: expected a freeze reason" >&2; exit 1; }
 grep -q -- ' screenshot .*00-home' "$STUB_LOG" && { echo "freeze failure: must not screenshot an unfrozen page" >&2; exit 1; }
 
-echo "12/18 unsettled page is flagged; unfrozen page is never captured"
+echo "12/19 unsettled page is flagged; unfrozen page is never captured"
 
 # --- 13. Baseline diff: identical recipe, read-only, per-width diff, ordered sheet
 RUN13="$(fresh_run_dir baseline)"
@@ -669,7 +674,7 @@ CLOSED_SESSIONS="$(awk '$1=="--session" && $3=="close"{print $2}' "$STUB_LOG" | 
 [ "$SESSIONS_USED" -eq 9 ] && [ "$CLOSED_SESSIONS" -eq 9 ] \
   || { echo "baseline: expected 9 sessions (2 preflights + 3 base + 3 head + grid) all closed, saw $SESSIONS_USED/$CLOSED_SESSIONS" >&2; exit 1; }
 
-echo "13/18 baseline diff: identical read-only recipe, per-width diff, ordered sheet ok"
+echo "13/19 baseline diff: identical read-only recipe, per-width diff, ordered sheet ok"
 
 # --- 14. A baseline that cannot be captured degrades to "no diff", head untouched
 RUN14="$(fresh_run_dir baseline-down)"
@@ -684,7 +689,7 @@ jq -e '.screens[0].status == "captured" and .screens[0].desktop.captured == true
   "$RUN14/contact-sheet/manifest.json" >/dev/null || { echo "baseline down: expected a recorded reason" >&2; exit 1; }
 [ ! -e "$RUN14/contact-sheet/shots/00-home-1280-base.png" ] || { echo "baseline down: no baseline image expected" >&2; exit 1; }
 
-echo "14/18 baseline failure degrades to no diff with a reason ok"
+echo "14/19 baseline failure degrades to no diff with a reason ok"
 
 # --- 15. Baseline auth state obeys the same placement refusal ------------------
 RUN15="$(fresh_run_dir baseline-auth-in-rundir)"
@@ -703,7 +708,7 @@ EC=$?
 set -e
 [ "$EC" -eq 2 ] || { echo "bad baseline url: expected exit 2, got $EC" >&2; exit 1; }
 
-echo "15/18 baseline auth state placement and url are validated ok"
+echo "15/19 baseline auth state placement and url are validated ok"
 
 # --- 16. A baseline bounced to a login route is a FAILED diff, never `changed`
 RUN16="$(fresh_run_dir baseline-login-redirect)"
@@ -723,7 +728,7 @@ ls "$RUN16/contact-sheet/shots/" | grep -q -- '-base\.png\|-diff\.png' \
 grep -q -- ' -o [^ ]*-diff\.png$' "$STUB_LOG" \
   && { echo "baseline login redirect: must not diff against a redirected baseline" >&2; exit 1; }
 
-echo "16/18 redirected baseline is a failed diff with a reason, never changed ok"
+echo "16/19 redirected baseline is a failed diff with a reason, never changed ok"
 
 # --- 17. The head obeys the same rule; finalPath declares an intended navigation
 RUN17="$(fresh_run_dir head-login-redirect)"
@@ -752,7 +757,7 @@ jq -e '.screens[0].status == "captured" and .screens[1].status == "failed" and
        (.screens[1].mobile.reason | test("landed on /moved, expected /NAVSTEP "))' \
   "$RUN17B/contact-sheet/manifest.json" >/dev/null || { echo "finalPath: a declared navigation must capture, an undeclared one must fail" >&2; exit 1; }
 
-echo "17/18 redirected head fails with a reason; finalPath declares an intended navigation ok"
+echo "17/19 redirected head fails with a reason; finalPath declares an intended navigation ok"
 
 # --- 18. A failed FIRST screen costs one tile, never the whole sheet --------
 # No capture has run yet when the first screen's steps fail, so nothing else
@@ -795,6 +800,20 @@ for BASELINE_ARGS in "" "https://baseline.test"; do
     && { echo "$LABEL: script hit an unbound variable: $(cat "$WORK/run18.err")" >&2; exit 1; }
 done
 
-echo "18/18 failed first screen is one failed tile with its navigation error; the sheet continues ok"
+echo "18/19 failed first screen is one failed tile with its navigation error; the sheet continues ok"
+
+# --- 19. A capture that isn't the width it's labelled -------------------------
+RUN19="$(fresh_run_dir wrong-width)"
+cat >"$RUN19/contact-sheet/shots.json" <<'JSON'
+[{ "name": "WRONG-WIDTH", "path": "/" }]
+JSON
+RESULT="$(bash "$SCRIPT" "$RUN19" "https://example.test" "$AUTH_STATE" "$FROZEN_SHA")"
+jq -e '.screens[0].desktop.captured == true and
+       .screens[0].mobile.captured == false and .screens[0].mobile.file == null and
+       (.screens[0].mobile.reason | test("1280 wide, not the 390"))' \
+  "$RUN19/contact-sheet/manifest.json" >/dev/null \
+  || { echo "wrong width: expected a failed phone tile naming both widths: $(jq -c '.screens' "$RUN19/contact-sheet/manifest.json")" >&2; exit 1; }
+
+echo "19/19 a phone tile that came back desktop-sized fails with a reason ok"
 
 echo "smoke contact sheet tests passed"

@@ -5,6 +5,7 @@
  * in another workspace would inherit a role.
  */
 import { getKnownSlackBots, getKnownSlackHumans, type SlackBotIdentity } from './channels/slack-mentions.js';
+import { getUser } from './modules/permissions/db/users.js';
 
 /** The exact id plus same-workspace sibling forms; only the exact id until the adapter registers its identity. */
 export function equivalentSlackUserIds(
@@ -66,5 +67,14 @@ export function resolveOperatorSlackUserId(
     return { userId: approver, slackUserId };
   }
 
+  return null;
+}
+
+/** The person's name from any of their same-workspace bot identities: one they never messaged has no name of its own. */
+export async function displayNameAcrossBots(userId: string): Promise<string | null> {
+  for (const candidate of equivalentSlackUserIds(userId)) {
+    const name = (await getUser(candidate))?.display_name;
+    if (name) return name;
+  }
   return null;
 }

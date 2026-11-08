@@ -96,15 +96,17 @@ export interface TurnRequest {
  * What a delegation hands the agent. The voice service sends the whole turn so far, and again with more words in each
  * later delegation of the same turn, so the agent gets every word after the turn it already has, chatter included:
  * every rule that trimmed chatter also trimmed instructions. 'duplicate' when a re-send adds nothing within seconds of
- * the last; null when the turn never names the agent.
+ * the last; null when the turn is empty. Whether speech was meant for the agent is the voice's call, not this one's: the
+ * voice hears the audio, while the text it hands over can spell the name another way ("Kye" for "Kai") or leave it out.
  */
 export function requestFromTurn(
   turn: string,
   isName: (word: string) => boolean,
   previous: HandedOver | null = null,
   nowMs = Date.now(),
+  solo = false,
 ): TurnRequest | 'duplicate' | null {
-  if (!mentions(turn, isName)) return null;
+  if (turn.trim() === '') return null;
   const words = turn.trim().split(/\s+/);
   const before = previous ? previous.turn.trim().split(/\s+/) : [];
   let shared = 0;
@@ -115,7 +117,7 @@ export function requestFromTurn(
   const sentences = sentencesOf(text);
   let from = sentences.findIndex((sentence) => speaksTo(sentence, isName));
   if (from < 0) from = sentences.findIndex((sentence) => mentions(sentence, isName));
-  const shown = from >= 0 ? sentences.slice(from).join(' ') : UNNAMED_SHOWN;
+  const shown = solo ? text : from >= 0 ? sentences.slice(from).join(' ') : UNNAMED_SHOWN;
   return { text, shown: shown.length > MAX_SHOWN_CHARS ? `${shown.slice(0, MAX_SHOWN_CHARS)}…` : shown };
 }
 

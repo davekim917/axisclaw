@@ -9,6 +9,9 @@ import {
   voiceInstructions,
   truncateMiddle,
   voiceRequestText,
+  headcountChangeText,
+  onCallText,
+  voiceMirror,
 } from './prompts.js';
 import { startupContext, type FeedEvent, type SessionFeed } from './session-feed.js';
 
@@ -18,6 +21,8 @@ const SPOKEN_TRANSCRIPT_LIMIT = 8 * 1024;
 export interface CallParty {
   agentName: string;
   callerName: string;
+  /** The chat app the call came from, as people call it. */
+  platform: string;
   /** Several people on one call: requests pass `admit`, and the room's chatter is never written anywhere. */
   group?: boolean;
 }
@@ -38,15 +43,13 @@ export interface CallPorts {
    */
   inject(text: string, wake: boolean, sender?: string): { id: string; written: Promise<void> };
   /** Group calls only: the request in a delegated turn, or why it is not one. */
-  admit?(
-    delegationId: string,
-    turn: string,
-    arrivedAtMs: number,
-  ): Promise<AdmittedRequest | 'not-addressed' | 'duplicate'>;
+  admit?(delegationId: string, turn: string, arrivedAtMs: number): Promise<AdmittedRequest | 'empty' | 'duplicate'>;
   mirror(text: string): void;
   status(text: string): void;
   /** A piece of live transcript for the page's captions; `done` closes that side's line. */
   caption(role: 'caller' | 'voice', text: string, done: boolean): void;
+  /** The greeting went to the voice. */
+  greeted?(): void;
   ended(text: string): void;
 }
 
@@ -102,6 +105,7 @@ export class VoiceCallBridge {
   private connected = false;
   private greeted = false;
   private closed = false;
+  private onCall: string[] | null = null;
 
   constructor(
     private readonly party: CallParty,
@@ -111,11 +115,12 @@ export class VoiceCallBridge {
   async start(offer: string): Promise<string> {
     if (this.closed) throw new Error('The call ended before it connected.');
     this.feed = this.ports.feed((event) => this.onFeed(event));
-    const context = startupContext(this.feed.recent, this.party.agentName);
+    const context = startupContext(this.feed.recent, this.party.agentName, this.party.platform);
     const instructions =
       (this.party.group
-        ? groupVoiceInstructions(this.party.agentName)
-        : voiceInstructions(this.party.agentName, this.party.callerName)) + (context ? `\n\n${context}` : '');
+        ? groupVoiceInstructions(this.party.agentName, this.party.platform)
+        : voiceInstructions(this.party.agentName, this.party.callerName, this.party.platform)) +
+      (context ? `\n\n${context}` : '');
     try {
       this.live = await this.ports.openLive({ offer, instructions, onEvent: (event) => this.onLive(event) });
     } catch (err) {
@@ -138,10 +143,25 @@ export class VoiceCallBridge {
     this.greet();
   }
 
+  peopleOnCall(names: string[]): void {
+    if (!this.party.group || names.length === 0) return;
+    const sorted = [...names].sort();
+    const before = this.onCall;
+    if (before && before.length === sorted.length && before.every((name, i) => name === sorted[i])) return;
+    this.onCall = sorted;
+    this.context(onCallText(sorted), 'commentary');
+    const change = before && this.greeted ? headcountChangeText(before, sorted) : null;
+    if (change) this.context(change, 'speakable');
+  }
+
   private greet(): void {
     if (this.greeted || !this.connected || !this.live) return;
     this.greeted = true;
-    this.context((this.party.group ? groupGreeting : greeting)(this.party.agentName), 'speakable');
+    this.context(
+      this.party.group ? groupGreeting(this.party.agentName, this.onCall ?? []) : greeting(this.party.agentName),
+      'speakable',
+    );
+    this.ports.greeted?.();
   }
 
   private context(text: string, channel: ContextChannel, delegationId?: string): void {
@@ -186,7 +206,7 @@ export class VoiceCallBridge {
     this.requests.set(injected.id, id);
     injected.written.then(
       () => {
-        if (request.trim()) this.ports.mirror(`🎙️ *${this.party.callerName}* (voice): ${request.trim()}`);
+        if (request.trim()) this.ports.mirror(voiceMirror(this.party.callerName, request.trim()));
       },
       (err: unknown) => {
         log.warn('Voice call: request may not have reached the session', { err });
@@ -201,20 +221,18 @@ export class VoiceCallBridge {
 
   private async delegateInGroup(id: string, turn: string, arrivedAtMs: number): Promise<void> {
     this.spoken.take();
-    let admitted: AdmittedRequest | 'not-addressed' | 'duplicate';
+    let admitted: AdmittedRequest | 'empty' | 'duplicate';
     try {
       admitted = await this.ports.admit!(id, turn, arrivedAtMs);
     } catch (err) {
       log.warn('Voice call: could not read a group request', { err });
-      admitted = 'not-addressed';
+      if (!this.closed)
+        this.context(`That request did not reach ${this.party.agentName}. Ask them to say it again.`, 'speakable', id);
+      return;
     }
     if (this.closed) return;
-    if (admitted === 'not-addressed') {
-      this.context(
-        `No one addressed ${this.party.agentName} by name, so nothing was sent. Stay silent.`,
-        'commentary',
-        id,
-      );
+    if (admitted === 'empty') {
+      this.context('Nothing was said, so nothing was sent. Stay silent.', 'commentary', id);
       return;
     }
     if (admitted === 'duplicate') {
@@ -293,7 +311,8 @@ export class VoiceCallBridge {
           log.warn('Voice call: the end of the call did not reach the session', { err }),
         );
     }
-    if (!this.party.group) this.ports.mirror(`📞 Voice call ${dropped ? 'dropped' : 'ended'}.`);
+    if (!this.party.group)
+      this.ports.mirror(`📞 Voice call with ${this.party.agentName} ${dropped ? 'dropped' : 'ended'}.`);
     this.ports.ended(reason);
   }
 }

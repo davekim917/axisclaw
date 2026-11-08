@@ -36,6 +36,9 @@ export interface RunnerConfig {
   /** Only an explicit `false` disables it; missing, null or non-boolean means ON. */
   statusSubtext: boolean;
 
+  /** A recorded-sources line under replies; only an explicit `false` disables it. */
+  sourcesFooter: boolean;
+
   /** Channels whose outcomes belong to an existing terminal reporter; the host refuses a typed outcome to them. */
   outcomeReportingExternalChannels: string[];
 }
@@ -119,6 +122,7 @@ export function parseRawConfig(raw: Record<string, unknown>): RunnerConfig {
     fallbackApplied: onFallback,
     providerFallback: declaredFallback || undefined,
     statusSubtext: raw.statusSubtext !== false,
+    sourcesFooter: raw.sourcesFooter !== false,
     outcomeReportingExternalChannels: Array.isArray(raw.outcomeReportingExternalChannels)
       ? raw.outcomeReportingExternalChannels.filter((value): value is string => typeof value === 'string')
       : [],

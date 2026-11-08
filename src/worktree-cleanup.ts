@@ -40,8 +40,10 @@ import {
 } from './repository-workspaces.js';
 
 import { gitCommonDirIs } from './canonical-git-commondir.js';
-import { safeGitArgs, safeGitEnv, safeGitFilterNames } from './safe-git.js';
-import { dirSizeBytes, REGENERABLE_SWEEP_DIR_NAMES, sessionWasReclaimed } from './storage-manager.js';
+import { git, isWorktreeLocked, provenDisposable, safeDirectories } from './checkout-proof.js';
+import { openCheckoutProofs, type CheckoutProofs } from './checkout-proof-worker.js';
+import { safeGitArgs, safeGitEnv } from './safe-git.js';
+import { dirSizeBytes, sessionWasReclaimed } from './storage-manager.js';
 
 const CLEANUP_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const STARTUP_DELAY_MS = 60_000;
@@ -107,68 +109,6 @@ interface SessionRow {
   folder: string;
   workgroup_id: string;
   idle_since: string;
-}
-
-function git(
-  cwd: string,
-  args: string[],
-  env: NodeJS.ProcessEnv = {},
-  filterNames: readonly string[] = [],
-  input?: string,
-): string | null {
-  try {
-    return execFileSync('git', safeGitArgs(args, undefined, filterNames), {
-      cwd,
-      env: safeGitEnv(env),
-      encoding: 'utf8',
-      input,
-      stdio: [input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
-      timeout: 30_000,
-      maxBuffer: 64 * 1024 * 1024,
-    }).trim();
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Git's environment for a question about exactly one checkout. With a missing or corrupt `.git`, discovery would
- * walk up into the install's own checkout (`data/` sits inside it); the ceiling makes such a checkout unprovable.
- */
-function checkoutGitEnv(dir: string): NodeJS.ProcessEnv {
-  return { GIT_CEILING_DIRECTORIES: path.dirname(path.resolve(dir)) };
-}
-
-/**
- * Every filter the repository's effective config defines, so safeGitArgs can neutralize each by name; `null` when
- * the config cannot be read. A clone's `.git` is container-writable, and `status` runs clean filters.
- */
-function repositoryFilterNames(dir: string, env: NodeJS.ProcessEnv): string[] | null {
-  const gitDir = git(dir, ['rev-parse', '--absolute-git-dir'], env);
-  if (gitDir === null) return null;
-  try {
-    return safeGitFilterNames(gitDir, dir);
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Directory names under a topic's worktrees root, `[]` on ENOENT, or `null` on any other read failure: an
- * unreadable fleet must not look like a collected one. The caller counts it.
- */
-function safeDirectories(directory: string): string[] | null {
-  try {
-    return fs
-      .readdirSync(directory, { withFileTypes: true })
-      .filter((entry) => entry.isDirectory() && !entry.isSymbolicLink())
-      .map((entry) => entry.name)
-      .sort();
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return [];
-    log.warn('Worktree cleanup: worktrees root unreadable; preserving its topic', { directory, err });
-    return null;
-  }
 }
 
 /** A topic's checkouts, or `null` when its worktrees root could not be read (counted and preserved, never empty). */
@@ -475,8 +415,9 @@ async function cleanupOne(
   target: TopicWorktreeTarget,
   dataDir: string = DATA_DIR,
   liveness: () => Liveness = passLiveness(),
+  proofs?: CheckoutProofs,
 ): Promise<CloneCleanupDecision | undefined> {
-  if (target.shape === 'clone') return cleanupCloneCheckout(target, dataDir, liveness);
+  if (target.shape === 'clone') return cleanupCloneCheckout(target, dataDir, liveness, proofs);
   await cleanupLinkedCheckout(target, dataDir);
   return undefined;
 }
@@ -505,16 +446,39 @@ function checkoutIdleDays(checkoutPath: string): number {
   return newest === 0 ? 0 : (Date.now() - newest) / 86_400_000;
 }
 
+function checkoutActivitySignature(target: TopicWorktreeTarget): string {
+  return JSON.stringify(checkoutActivityMtimes(target.worktreePath));
+}
+
+function reusableProofFailure(target: TopicWorktreeTarget, signature: string): string | null {
+  const prior = failedCloneProofs.get(target.worktreePath);
+  return prior && prior.signature === signature && Date.now() - prior.at < FAILED_PROOF_REUSE_MS ? prior.reason : null;
+}
+
+/**
+ * Fills the failed-proof cache off the main thread, so the proof under the lock answers from it without running git.
+ * A passing proof records nothing: that one still runs under the lock, because only that one can authorize a delete.
+ */
+async function recordProofFailureOffThread(target: TopicWorktreeTarget, proofs: CheckoutProofs): Promise<void> {
+  const signature = checkoutActivitySignature(target);
+  if (reusableProofFailure(target, signature) !== null) return;
+  const proof = await proofs.prove({
+    path: target.worktreePath,
+    inheritedTags: readCheckoutInheritedTags(checkoutInheritedTagsPath(target.worktreePath), target.worktreePath),
+  });
+  if (proof && !proof.ok) {
+    failedCloneProofs.set(target.worktreePath, { signature, at: Date.now(), reason: proof.reason });
+  }
+}
+
 /**
  * The topic-clone proof, with `liveTopic`: plain `status` calls an ignored export, a `.env` or an edit behind an
  * index flag clean, and an open topic may still want them, so each of those refuses.
  */
 function cloneCheckoutProof(target: TopicWorktreeTarget): { ok: boolean; reason: string } {
-  const signature = JSON.stringify(checkoutActivityMtimes(target.worktreePath));
-  const prior = failedCloneProofs.get(target.worktreePath);
-  if (prior && prior.signature === signature && Date.now() - prior.at < FAILED_PROOF_REUSE_MS) {
-    return { ok: false, reason: prior.reason };
-  }
+  const signature = checkoutActivitySignature(target);
+  const reason = reusableProofFailure(target, signature);
+  if (reason !== null) return { ok: false, reason };
   const proof = disposability.proveCheckoutDisposable({
     path: target.worktreePath,
     shape: target.shape,
@@ -575,6 +539,7 @@ async function cleanupCloneCheckout(
   target: TopicWorktreeTarget,
   dataDir: string,
   liveness: () => Liveness,
+  proofs?: CheckoutProofs,
 ): Promise<CloneCleanupDecision> {
   const context = {
     workgroupId: target.workUnit.workgroupId,
@@ -585,6 +550,7 @@ async function cleanupCloneCheckout(
   const refusal = (): string | null => cloneCheckoutRefusal(target, dataDir, liveness);
   const early = refusal();
   if (early) return { collected: false, reason: early };
+  if (proofs) await recordProofFailureOffThread(target, proofs);
 
   return withRepositoryLifecycleClaims([target.workUnit], () =>
     withHostRepositoryLock(
@@ -665,25 +631,32 @@ async function cleanupLinkedCheckout(target: TopicWorktreeTarget, dataDir: strin
   );
 }
 
-export async function runWorktreeCleanupOnce(dataDir: string = DATA_DIR): Promise<void> {
+export async function runWorktreeCleanupOnce(
+  dataDir: string = DATA_DIR,
+  proofs: CheckoutProofs = openCheckoutProofs(),
+): Promise<void> {
   const { targets, filteredNames, unreadableRoots } = discover(dataDir, await readSessionInventory());
   // A failing target is skipped and counted, never allowed to abort the rest of the fleet's pass.
   let skipped = 0;
   const liveness = passLiveness();
-  for (const target of targets) {
-    // Each target's git work is synchronous; a macrotask between targets lets message routing run.
-    await new Promise((resolve) => setImmediate(resolve));
-    try {
-      await cleanupOne(target, dataDir, liveness);
-    } catch (err) {
-      skipped += 1;
-      log.warn('Worktree cleanup: target failed; continuing pass', {
-        workgroupId: target.workUnit.workgroupId,
-        workUnit: target.workUnit.key,
-        repo: target.repo,
-        err,
-      });
+  try {
+    for (const target of targets) {
+      // A target's remaining git work is synchronous; a macrotask between targets lets message routing run.
+      await new Promise((resolve) => setImmediate(resolve));
+      try {
+        await cleanupOne(target, dataDir, liveness, proofs);
+      } catch (err) {
+        skipped += 1;
+        log.warn('Worktree cleanup: target failed; continuing pass', {
+          workgroupId: target.workUnit.workgroupId,
+          workUnit: target.workUnit.key,
+          repo: target.repo,
+          err,
+        });
+      }
     }
+  } finally {
+    proofs.close();
   }
   // A pass that collected nothing because of failures, filtering or unreadable roots must not read like one
   // that had nothing to do.
@@ -755,190 +728,6 @@ function emptyReport(mode: 'dry-run' | 'apply', ran: boolean): GcReport {
 
 function gcMode(): 'dry-run' | 'apply' {
   return process.env[GC_APPLY_ENV] === 'apply' ? 'apply' : 'dry-run';
-}
-
-/**
- * Ignored output a clean, fully pushed checkout may take to the trash beyond REGENERABLE_SWEEP_DIR_NAMES, which the
- * regenerable sweep deletes from live checkouts with no git proof and so must stay narrow. `dist` is not here: a
- * gh-pages clone or a hand-placed export commonly lives in it.
- */
-const RECLAIM_IGNORABLE_DIR_NAMES: ReadonlySet<string> = new Set(['allure-results', '.pytest_cache', '.ruff_cache']);
-const RECLAIM_IGNORABLE_FILE_SUFFIX = '.tsbuildinfo';
-const NESTED_REPOSITORY_SCAN_LIMIT = 50_000;
-
-/** No repository, `.git` or bare, anywhere under `root`; a tree too large or unreadable to finish refuses. */
-function holdsNoRepository(root: string): boolean {
-  const stack = [root];
-  let seen = 0;
-  while (stack.length > 0) {
-    const current = stack.pop()!;
-    let entries: fs.Dirent[];
-    try {
-      entries = fs.readdirSync(current, { withFileTypes: true });
-    } catch {
-      return false;
-    }
-    const names = new Set(entries.map((entry) => entry.name));
-    if (names.has('HEAD') && names.has('objects')) return false;
-    for (const entry of entries) {
-      if (entry.name === '.git' || ++seen > NESTED_REPOSITORY_SCAN_LIMIT) return false;
-      if (entry.isDirectory() && !entry.isSymbolicLink()) stack.push(path.join(current, entry.name));
-    }
-  }
-  return true;
-}
-
-/**
- * `entry` is a porcelain path. Git collapses a directory to one `dir/` entry when it is ignored, and also when it is
- * not but everything in it is, so a listed name counts only once `isIgnoredDirectory` says the directory itself is.
- * That question goes without the trailing slash: `check-ignore dir/` also matches `dir/*`, which ignores only the
- * contents.
- */
-function reclaimIgnorable(dir: string, entry: string, isIgnoredDirectory: (entry: string) => boolean): boolean {
-  const segments = entry.split('/').filter(Boolean);
-  if (segments.some((segment) => REGENERABLE_SWEEP_DIR_NAMES.has(segment))) return true;
-  if (!entry.endsWith('/')) return segments.at(-1)?.endsWith(RECLAIM_IGNORABLE_FILE_SUFFIX) ?? false;
-  return (
-    RECLAIM_IGNORABLE_DIR_NAMES.has(segments.at(-1) ?? '') &&
-    isIgnoredDirectory(entry.slice(0, -1)) &&
-    holdsNoRepository(path.join(dir, entry))
-  );
-}
-
-/**
- * A `git worktree lock` marker makes a checkout non-disposable: the agent said "don't touch", and `worktree prune`
- * (git 2.43) keeps a locked registration even once its path is gone. No-op for a plain clone.
- */
-function isWorktreeLocked(dir: string): boolean {
-  const gitDir = git(dir, ['rev-parse', '--path-format=absolute', '--git-dir'], checkoutGitEnv(dir));
-  return gitDir !== null && fs.existsSync(path.join(gitDir, 'locked'));
-}
-
-/**
- * Positive proof that a checkout holds nothing worth keeping; reach it through proveCheckoutDisposable. A git
- * invocation that fails (pruned admin dir, container-only gitdir) returns unprovable, never clean.
- */
-function provenDisposable(
-  dir: string,
-  scope: 'head' | 'all',
-  inheritedTags: ReadonlyMap<string, string> | null = null,
-  liveTopic = false,
-): { ok: boolean; reason: string } {
-  if (isWorktreeLocked(dir)) return { ok: false, reason: 'worktree-locked' };
-  const env = checkoutGitEnv(dir);
-
-  // Host git runs in a repository a container may have configured: signature programs are off and every filter
-  // is neutralized by name. An embedded repository is refused before `status` could recurse into it; one whose
-  // config or index cannot be read is unprovable.
-  const filters = repositoryFilterNames(dir, env);
-  if (filters === null) return { ok: false, reason: 'status-unprovable' };
-  const modes = git(dir, ['ls-files', '-z', '--format=%(objectmode)'], env, filters);
-  if (modes === null) return { ok: false, reason: 'status-unprovable' };
-  if (modes.split('\0').includes('160000')) return { ok: false, reason: 'submodule' };
-
-  const status = git(
-    dir,
-    ['status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignore-submodules=all'],
-    env,
-    filters,
-  );
-  if (status === null) return { ok: false, reason: 'status-unprovable' };
-  if (status !== '') return { ok: false, reason: 'dirty' };
-  if (liveTopic) {
-    // `status` reads a skip-worktree or assume-unchanged entry as clean whatever its file holds.
-    const tags = git(dir, ['ls-files', '-v', '-z'], env, filters);
-    if (tags === null) return { ok: false, reason: 'status-unprovable' };
-    if (tags.split('\0').some((entry) => entry !== '' && !entry.startsWith('H '))) {
-      return { ok: false, reason: 'index-flagged' };
-    }
-    const ignored = git(
-      dir,
-      [
-        'status',
-        '--porcelain=v1',
-        '-z',
-        '--ignored=traditional',
-        '--untracked-files=normal',
-        '--ignore-submodules=all',
-      ],
-      env,
-      filters,
-    );
-    if (ignored === null) return { ok: false, reason: 'status-unprovable' };
-    const kept = ignored
-      .split('\0')
-      .filter((entry) => entry.startsWith('!! '))
-      .some(
-        (entry) =>
-          !reclaimIgnorable(
-            dir,
-            entry.slice(3),
-            // A leading `./` keeps a name that starts with `:` from reading as pathspec magic.
-            (candidate) => git(dir, ['check-ignore', '-q', '--', `./${candidate}`], env, filters) !== null,
-          ),
-      );
-    if (kept) return { ok: false, reason: 'ignored-files' };
-  }
-
-  const stashVerdict = (): { ok: boolean; reason: string } | null => {
-    const stash = git(dir, ['stash', 'list'], env);
-    if (stash === null) return { ok: false, reason: 'stash-unprovable' };
-    return stash === '' ? null : { ok: false, reason: 'stashed' };
-  };
-  // For a clone the stash is read before the log below, which counts refs/stash too and would call it 'unpushed'.
-  if (scope === 'all') {
-    const stashed = stashVerdict();
-    if (stashed) return stashed;
-  }
-
-  // Scope 'all': every local ref's commits must be on origin. `--all` covers tags, notes and a detached HEAD,
-  // which `--branches` would miss; HEAD stays explicit because `--all` alone exits 0 silently on an unborn HEAD.
-  // Only origin counts as evidence: another remote can hold commits no real remote has. Scope 'head' checks HEAD
-  // against every remote-tracking ref. Exception: tags the host recorded when it built the clone, still at the
-  // same object, are the canonical's (a release tag off every branch would otherwise keep every clone forever).
-  // The record is host-only; matching name and object only drops roots, so a commit another ref holds still counts.
-  let unpushed: string | null;
-  if (scope === 'all' && inheritedTags !== null && inheritedTags.size > 0) {
-    const refs = git(dir, ['for-each-ref', '--format=%(objectname) %(refname)'], env);
-    if (refs === null) return { ok: false, reason: 'log-unprovable' };
-    const roots = refs
-      .split('\n')
-      .filter(Boolean)
-      .flatMap((line) => {
-        const separator = line.indexOf(' ');
-        const object = line.slice(0, separator);
-        return inheritedTags.get(line.slice(separator + 1)) === object ? [] : [`${object}\n`];
-      });
-    unpushed = git(dir, ['log', '--oneline', 'HEAD', '--stdin', '--not', '--remotes=origin'], env, [], roots.join(''));
-  } else {
-    const unpushedArgs =
-      scope === 'all'
-        ? ['log', '--all', 'HEAD', '--not', '--remotes=origin', '--oneline']
-        : ['log', 'HEAD', '--not', '--remotes', '--oneline'];
-    unpushed = git(dir, unpushedArgs, env);
-  }
-  if (unpushed === null) return { ok: false, reason: 'log-unprovable' };
-  if (unpushed !== '') return { ok: false, reason: 'unpushed' };
-
-  if (scope === 'head') {
-    const stashed = stashVerdict();
-    if (stashed) return stashed;
-  }
-
-  // A clone backing linked worktrees owns their shared object store. Asked here (git's own registry) rather than
-  // only at scan time, so the post-move re-proof catches a `git worktree add` made in between. Clones only.
-  if (scope === 'all') {
-    const gitDir = git(dir, ['rev-parse', '--path-format=absolute', '--git-dir'], env);
-    if (gitDir === null) return { ok: false, reason: 'gitdir-unprovable' };
-    const registered = safeDirectories(path.join(gitDir, 'worktrees'));
-    // null is "exists but unreadable": unprovable, not empty.
-    if (registered === null && fs.existsSync(path.join(gitDir, 'worktrees'))) {
-      return { ok: false, reason: 'worktree-registry-unprovable' };
-    }
-    if (registered !== null && registered.length > 0) return { ok: false, reason: 'backs-worktrees' };
-  }
-
-  return { ok: true, reason: 'clean-and-pushed' };
 }
 
 /**

@@ -473,8 +473,7 @@ describe('anti-noise — a nudge must produce work, not chat', () => {
     expect(prompt).toContain('post ONE message that @-mentions whoever owes it');
     expect(prompt).toContain('a human or another agent');
     expect(prompt).toContain('ONLY sanctioned post');
-    // The delivery caveat: a nudge task's post lands top-level in a channel, so
-    // the message has to carry its own context.
+    // The reader gets this one notification, so it has to carry its own context.
     expect(prompt).toContain('stand alone');
     expect(prompt).toContain('which claim');
     // And it must not leave the agent room to hedge by posting anyway.
@@ -1045,15 +1044,48 @@ describe('human-blocked claims — a suppression window, not an exemption', () =
     expect(prompt).not.toContain('Automatic nudge');
   });
 
-  it('links the claim thread so the human answers there, not under the alert', async () => {
+  it.each([
+    ['escalation', () => blocked(40)],
+    ['nudge', () => claim(30)],
+    ['takeover', () => claim(30, { auto_nudge_count: 2, auto_nudged_at: new Date(NOW - 25 * HOUR).toISOString() })],
+  ])('a %s says its post lands in the claim thread, so it never sends the reader away from it', async (_rung, body) => {
     const url = 'https://acme.slack.com/archives/C0AAA/p1786621514008659?thread_ts=1786621514.008659&cid=C0AAA';
     const resolveThreadUrl = vi.fn(async () => url);
-    const d = deps(root({ held: blocked(40) }), { resolveThreadUrl });
+    const d = deps(root({ held: body() }), { resolveThreadUrl });
     await sweepClaimsSelfHeal(NOW, d);
 
     expect(resolveThreadUrl).toHaveBeenCalledWith('slack:C0AAA:1786621514.008659');
-    expect(d.sent[0].prompt).toContain(url);
-    expect(d.sent[0].prompt).toContain('reply THERE');
+    const prompt = d.sent[0].prompt;
+    expect(prompt).toContain(`lands in the claim's thread (${url})`);
+    expect(prompt).not.toContain('not under your post');
+    expect(prompt).not.toContain('top of a channel');
+    // A post sent elsewhere is the one case the link still earns its place.
+    expect(prompt).toContain('Only a post you send somewhere else needs that link and a request to reply THERE');
+  });
+
+  it.each([
+    ['the claim thread', OWNER, 'slack:C0AAA:1786621514.008659'],
+    [
+      "a task-series claim's delivery thread",
+      { ...OWNER, deliverThreadId: 'slack:C0BBB:1786000000.000001' },
+      'slack:C0BBB:1786000000.000001',
+    ],
+  ])('names the thread the REAL task is created in: %s', async (_case, target, thread) => {
+    const { dispatch } = await import('../../cli/dispatch.js');
+    vi.mocked(dispatch).mockClear();
+    vi.mocked(dispatch).mockResolvedValue({ id: 'x', ok: true, data: { series_id: 's' } } as never);
+    const resolveThreadUrl = vi.fn(async () => 'https://x/thread');
+
+    await sweepClaimsSelfHeal(NOW, {
+      root: root({ held: blocked(40) }),
+      enabled: true,
+      resolveOwner: async () => target,
+      resolveThreadUrl,
+      isOwnerLive: async () => false,
+    });
+
+    expect(vi.mocked(dispatch).mock.calls[0]![0].args).toMatchObject({ thread_id: thread });
+    expect(resolveThreadUrl).toHaveBeenCalledWith(thread);
   });
 
   it('links the delivery thread for a task-series claim, never its task-session thread', async () => {

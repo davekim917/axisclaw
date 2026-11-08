@@ -81,7 +81,12 @@ async function seedAgentGroup(id: string): Promise<void> {
 function seedSession(
   id: string,
   agentGroupId: string,
-  opts: { title?: string | null; title_generated_at?: string | null; title_basis_seq?: number | null } = {},
+  opts: {
+    title?: string | null;
+    title_generated_at?: string | null;
+    title_basis_seq?: number | null;
+    thread_id?: string;
+  } = {},
 ): void {
   getRawDb()
     .prepare(
@@ -90,7 +95,7 @@ function seedSession(
       // active NULL/NULL rows per agent group is a shape production never has.
       "INSERT OR IGNORE INTO sessions (id, agent_group_id, messaging_group_id, thread_id, status, created_at) VALUES (?, ?, NULL, ?, 'active', ?)",
     )
-    .run(id, agentGroupId, `system:tasks:${id}`, now());
+    .run(id, agentGroupId, opts.thread_id ?? `system:tasks:${id}`, now());
   if (opts.title !== undefined || opts.title_generated_at !== undefined || opts.title_basis_seq !== undefined) {
     getRawDb()
       .prepare(`UPDATE sessions SET title = ?, title_generated_at = ?, title_basis_seq = ? WHERE id = ?`)
@@ -224,6 +229,7 @@ describe('runSessionTitleSweep', () => {
       title: 'old title',
       title_generated_at: new Date(Date.now() - 3 * 3600_000).toISOString(),
       title_basis_seq: 50,
+      thread_id: 'slack:C0:quiet',
     });
     // Write enough messages so the max seq is only 5 beyond basis_seq.
     // Each writeInboundMessages call resets seq at 0, so we seed the table
@@ -236,6 +242,7 @@ describe('runSessionTitleSweep', () => {
     );
     db.prepare(`INSERT INTO messages_in VALUES ('m1', 54, 'chat', ?, 'pending', '{"text":"hi"}')`).run(now());
     db.close();
+    getRawDb().prepare('UPDATE sessions SET last_active = ? WHERE id = ?').run(now(), 'sess-stale-but-quiet');
 
     const backend = vi.fn(async () => 'newer title');
     setTitleBackendForTest(backend);
@@ -250,6 +257,7 @@ describe('runSessionTitleSweep', () => {
       title: 'old title',
       title_generated_at: new Date(Date.now() - 3 * 3600_000).toISOString(),
       title_basis_seq: 10,
+      thread_id: 'slack:C0:busy',
     });
     const dir = path.join(TMP_DIR, 'v2-sessions', 'ag-1', 'sess-busy');
     fs.mkdirSync(dir, { recursive: true });
@@ -267,6 +275,8 @@ describe('runSessionTitleSweep', () => {
       );
     }
     db.close();
+
+    getRawDb().prepare('UPDATE sessions SET last_active = ? WHERE id = ?').run(now(), 'sess-busy');
 
     setTitleBackendForTest(async () => 'refreshed title');
     const result = await runSessionTitleSweep();
@@ -598,7 +608,7 @@ describe('runSessionTitleSweep', () => {
     try {
       const result = await runSessionTitleSweep();
       expect(result).toEqual({ generated: 0, skipped: 0 });
-      // No row should be stamped — gate runs BEFORE pickCandidates.
+      // No row should be stamped — the gate runs before any candidate is picked.
       const row = getRawDb()
         .prepare('SELECT title, title_generated_at FROM sessions WHERE id = ?')
         .get('sess-no-backend') as { title: string | null; title_generated_at: string | null };

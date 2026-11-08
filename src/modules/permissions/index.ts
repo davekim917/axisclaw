@@ -227,6 +227,10 @@ export function setSiblingBotIdsProvider(provider: () => ReadonlySet<string>): v
   getSiblingBotIds = provider;
 }
 
+export function isOwnBotSender(userId: string): boolean {
+  return isSiblingBotSender(userId, getSiblingBotIds());
+}
+
 setAccessGate(async (event, userId, mg, agentGroupId, effectiveThreadId): Promise<AccessGateResult> => {
   // Public channels skip the access check entirely.
   if (mg.unknown_sender_policy === 'public') {
@@ -249,7 +253,7 @@ setAccessGate(async (event, userId, mg, agentGroupId, effectiveThreadId): Promis
 
   // Our own sibling bots pass the strict / request_approval gate so they can
   // hand off to each other; unknown humans and third-party bots do not.
-  if (isSiblingBotSender(userId, getSiblingBotIds())) {
+  if (isOwnBotSender(userId)) {
     log.debug('ACCESS — sibling agent bot allowed past gate', {
       messagingGroupId: mg.id,
       agentGroupId,

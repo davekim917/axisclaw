@@ -4,10 +4,8 @@
  * Synchronous builds on the main thread were the dominant cause of event-loop stalls. One persistent worker, as in
  * `src/storage-maintenance-worker.ts`, which also serializes builds so concurrent spawns cannot stampede the source.
  */
-import { fileURLToPath } from 'node:url';
-import { Worker } from 'node:worker_threads';
-
 import { onHostShutdown } from '../host-lifecycle.js';
+import { startHostWorker } from '../host-worker.js';
 import { log } from '../log.js';
 import { materializeArchiveProjection } from './per-agent-projections.js';
 import type { ArchiveProjectionResult } from './per-agent-projections.js';
@@ -25,21 +23,7 @@ interface WorkerLike {
 export type ArchiveProjectionWorkerFactory = () => WorkerLike;
 
 function createWorker(): WorkerLike {
-  const runningTypeScript = import.meta.url.endsWith('.ts');
-  const workerUrl = new URL(
-    runningTypeScript ? './archive-projection-worker-thread.ts' : './archive-projection-worker-thread.js',
-    import.meta.url,
-  );
-  if (runningTypeScript) {
-    // Node does not apply `--import tsx` hooks to a file-backed Worker, so tsx is registered inside an eval
-    // bootstrap.
-    const entryPath = fileURLToPath(workerUrl);
-    const parentPath = fileURLToPath(import.meta.url);
-    const bootstrap = `const { require: tsxRequire } = require('tsx/cjs/api'); tsxRequire(${JSON.stringify(entryPath)}, ${JSON.stringify(parentPath)});`;
-    return new Worker(bootstrap, { eval: true, execArgv: [] });
-  }
-  // Never inherit parent-only flags such as `--input-type=module`; Node rejects them for a file-URL Worker.
-  return new Worker(workerUrl, { execArgv: [] });
+  return startHostWorker('./archive-projection-worker-thread', import.meta.url);
 }
 
 /** The worker could not be used at all, as opposed to a build that ran and failed. */

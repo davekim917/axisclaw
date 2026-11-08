@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { closeDb, createAgentGroup, getRawDb, initMigratedTestDb } from '../../db/index.js';
+import { insertAutoThreadTitle, recordThreadPinned, storeThreadPlatformName } from '../../db/thread-titles.js';
 import { ATTENTION_ITEM_PREFIX, ATTENTION_MEMO_TTL_MS, clearAttentionMemo } from '../../attention-sources.js';
 import { ASSIGN_DEDUPE_MS } from '../db/item-assignments.js';
 import type { AuthedRequestContext } from '../router.js';
@@ -609,6 +610,84 @@ describe('buildThreadList — grouping', () => {
 
     const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, deps());
     expect(threads[0]!.title).toBe('newer title');
+  });
+
+  it.each([
+    ['an `auto` row', 'auto'],
+    ['a frozen row', null],
+  ])('shows the title on %s over a fresher generated one', async (_name, source) => {
+    const thread = 'discord:g1:c1:t1';
+    await seedAgentGroup('ag-1');
+    insertSession({
+      id: 's-1',
+      agentGroupId: 'ag-1',
+      threadId: thread,
+      title: 'generated title',
+      titleGeneratedAt: iso(1_000),
+    });
+    getRawDb()
+      .prepare(
+        `INSERT INTO thread_titles (thread_id, channel_type, title, first_message, attempts, created_at, title_source)
+         VALUES (?, 'discord', 'row title', 'x', 0, ?, ?)`,
+      )
+      .run(thread, iso(600_000), source);
+
+    const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, deps());
+    expect(threads[0]!.title).toBe('row title');
+  });
+
+  it('shows a name someone asked for, over any generated title', async () => {
+    const thread = 'discord:g1:c1:t1';
+    await seedAgentGroup('ag-1');
+    insertSession({
+      id: 's-1',
+      agentGroupId: 'ag-1',
+      threadId: thread,
+      title: 'generated title',
+      titleGeneratedAt: iso(1_000),
+    });
+    await recordThreadPinned(thread, 'discord', 'asked for');
+
+    const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, deps());
+    expect(threads[0]!.title).toBe('asked for');
+  });
+
+  it('never shows the name a platform gave a thread, which is not a title', async () => {
+    const thread = 'discord:g1:c1:t1';
+    await seedAgentGroup('ag-1');
+    insertSession({
+      id: 's-1',
+      agentGroupId: 'ag-1',
+      threadId: thread,
+      title: 'generated title',
+      titleGeneratedAt: iso(1_000),
+    });
+    await insertAutoThreadTitle(thread, 'discord', 'the opener', null);
+    await storeThreadPlatformName(thread, 'Thread 10/1/2026, 12:00:00 PM');
+
+    const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, deps());
+    expect(threads[0]!.title).toBe('generated title');
+  });
+
+  it('falls back to the generated title when the row has none', async () => {
+    const thread = 'discord:g1:c1:t1';
+    await seedAgentGroup('ag-1');
+    insertSession({
+      id: 's-1',
+      agentGroupId: 'ag-1',
+      threadId: thread,
+      title: 'generated title',
+      titleGeneratedAt: iso(1_000),
+    });
+    getRawDb()
+      .prepare(
+        `INSERT INTO thread_titles (thread_id, channel_type, first_message, attempts, created_at)
+         VALUES (?, 'discord', 'x', 5, ?)`,
+      )
+      .run(thread, iso(600_000));
+
+    const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, deps());
+    expect(threads[0]!.title).toBe('generated title');
   });
 
   it('resolves the channel key to a friendly name from messaging_groups', async () => {

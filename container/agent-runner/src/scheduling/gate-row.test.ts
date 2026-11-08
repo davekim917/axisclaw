@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { resetGuardCorePathsForTest, setGuardCorePathsForTest } from '../guard-core-paths.js';
 
 import { getPendingMessages, markScriptSkipped } from '../db/messages-in.js';
 import { getInboundDb, getOutboundDb } from '../mailbox/sqlite/connection.js';
@@ -14,9 +15,8 @@ import { closeSessionDb, initTestSessionDb } from '../modules/mailbox/testing.js
 import { applyPreTaskScripts } from './task-script.js';
 
 /** The pre-task classifier reads the real shared destructive core, as task-script.test.ts does. */
+const CLASSIFIER_CORE = '/home/ubuntu/plugins/bootstrap/plugins/workflow-agents/hooks/guards/block-destructive-core.ts';
 const CLASSIFIER_ENV: Record<string, string> = {
-  NANOCLAW_DESTRUCTIVE_GUARD_CORE:
-    '/home/ubuntu/plugins/bootstrap/plugins/workflow-agents/hooks/guards/block-destructive-core.ts',
   NANOCLAW_HOST_DATA_DIR: '/srv/nanoclaw/data',
   NANOCLAW_HOST_TOPIC_WORKTREES_DIR: '/srv/nanoclaw/data/topic-worktrees',
 };
@@ -28,6 +28,7 @@ beforeEach(() => {
     savedEnv.set(name, process.env[name]);
     process.env[name] = value;
   }
+  setGuardCorePathsForTest({ destructive: CLASSIFIER_CORE });
   scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'gate-row-'));
   initTestSessionDb();
 });
@@ -40,6 +41,7 @@ afterEach(() => {
     else process.env[name] = value;
   }
   savedEnv.clear();
+  resetGuardCorePathsForTest();
 });
 
 function queueTask(id: string, content: Record<string, unknown>): void {

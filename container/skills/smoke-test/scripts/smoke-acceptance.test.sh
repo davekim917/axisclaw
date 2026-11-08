@@ -31,7 +31,7 @@ new_run() { # [block-json]: a run whose intent/ holds the three frozen sources a
   rm -rf "$RUN"; mkdir -p "$RUN/intent" "$RUN/evidence/A1"
   # AC1's words, wrapped mid-sentence with a tab: provenance is whitespace-normalised
   printf 'Issue 412\n\nWhen a loan is overdue, a borrower with an overdue loan sees\n   the fine on the borrower card\tbefore the librarian confirms a new loan (the card).\n' > "$RUN/intent/issue-412.md"
-  printf '[thread lantern-desk/1726000000.000100]\nrowan: %s -- north must never read south.\n' "$Q2" > "$RUN/intent/slack-lantern-desk-1726000000.000100.md"
+  printf '[thread example-desk/1726000000.000100]\ncarol: %s -- north must never read south.\n' "$Q2" > "$RUN/intent/slack-example-desk-1726000000.000100.md"
   block_body "${1:-$(cat "$EXAMPLE")}" > "$RUN/intent/pr-body.md"
 }
 extract() { python3 "$TOOL" extract "$RUN" "$@" || true; }
@@ -51,7 +51,7 @@ OUT="$(extract)"
 expect 1-example '.ok == true and .origin == "pr-body" and .itemCount == 3 and .problems == [] and .blocks == [{"carrier":"pr-body.md","status":"present","problems":[]}]' "$OUT"
 DOC="$(cat "$RUN/intent/acceptance.json")"
 expect 1-doc '.schemaVersion == 1 and .origin == "pr-body" and [.items[].id] == ["AC1","AC2","AC3"] and
-  .sources == {"R1":{"request":"issue#412"},"R2":{"request":"slack:lantern-desk/1726000000.000100"},"R3":{"request":"pr-body"}} and
+  .sources == {"R1":{"request":"issue#412"},"R2":{"request":"slack:example-desk/1726000000.000100"},"R3":{"request":"pr-body"}} and
   .none == [] and (.items | all(.carrier == "pr-body.md" and (has("derived") | not)))' "$DOC"
 # Write-once: a second extract is refused unless forced.
 expect 1-write-once '.ok == false and (.error | test("written once"))' "$(extract)"
@@ -144,7 +144,8 @@ rows "[$(row AC1 met '["evidence/A1/ac1.png"]'),$(row AC2 met '["evidence/A1/ac2
 OUT="$(check)"
 expect 2-all-good '.ok == true and .origin == "pr-body" and .itemCount == 3 and .provenance == {"AC1":"supported","AC2":"supported","AC3":"supported"} and
   .unsupported == [] and .missingRows == [] and .rowProblems == [] and .verdicts.met == 3 and .resultFiles == ["evidence/A1/acceptance-results.json"]' "$OUT"
-[ "$(report)" = "Acceptance: present(3) — 0 unsupported, 0 missing rows" ] || fail "2-sentence: $(report)"
+[ "$(report)" = "Acceptance: present(3) — 0 unsupported, 0 missing rows, 1 builder claim" ] || fail "2-sentence: $(report)"
+expect 2-builder-claims '.builderClaims == ["AC3"] and .ok == true' "$OUT"
 python3 "$TOOL" check "$RUN" >/dev/null || fail "2-exit-code: ok run exited non-zero"
 python3 "$TOOL" check "$RUN" --lane A1 >/dev/null || fail "2-lane-flag"
 # THE TAUTOLOGY: a pr-body quote that exists only inside the acceptance block.
@@ -152,7 +153,7 @@ python3 "$TOOL" check "$RUN" --lane A1 >/dev/null || fail "2-lane-flag"
 # words the prose never said validates against nothing but itself.
 new_run "$(jq '.items[2].quote = "the phone shows the fine in red"' "$EXAMPLE")"; extract >/dev/null
 rows "[$(row AC1 met '[]'),$(row AC2 met '[]'),$(row AC3 met '[]')]"
-expect 2-self-quoting '.ok == false and .provenance.AC3 == "unsupported" and
+expect 2-self-quoting '.ok == false and .provenance.AC3 == "unsupported" and .builderClaims == [] and
   (.unsupported | map(.id)) == ["AC3"] and (.unsupported[0].reason | test("its acceptance-v1 block removed"))' "$(check)"
 # ...even when the block is the ONLY thing in the body.
 new_run; printf '```acceptance-v1\n%s\n```\n' "$(cat "$EXAMPLE")" > "$RUN/intent/pr-body.md"; extract >/dev/null
@@ -163,9 +164,9 @@ expect 2-block-only-body '.provenance.AC3 == "unsupported" and .provenance.AC1 =
 # form, or in none -- the PR body is unavailable and every item citing it is
 # unsupported, even one whose quote really is in the prose. No parser has to
 # recognise the form that hides a quote.
-pr_body_item() { # <quote> -> a derived doc with one pr-body item
-  jq -cn --arg q "$1" '{schemaVersion:1,origin:"derived",sources:{R3:{request:"pr-body"}},
-    items:[{id:"AC3",source:"R3",quote:$q,when:"open",then:{surface:"native:loans",expect:"x"},platform:"native",carrier:"pr-body.md",derived:true}]}' \
+pr_body_item() { # <quote> -> an authored doc with one pr-body item
+  jq -cn --arg q "$1" '{schemaVersion:1,origin:"pr-body",sources:{R3:{request:"pr-body"}},
+    items:[{id:"AC3",source:"R3",quote:$q,when:"open",then:{surface:"native:loans",expect:"x"},platform:"native",carrier:"pr-body.md"}]}' \
     > "$RUN/intent/acceptance.json"
 }
 HIDDEN="the phone shows the fine in red"
@@ -214,7 +215,7 @@ expect 2-carrier-alias '.provenance.AC3 == "unsupported" and any(.unsupported[];
 # A quote must match the named source, not any frozen file: AC1's words in the
 # Slack thread do not support an item that names the issue.
 new_run "$(jq '.items[0].source = "R2"' "$EXAMPLE")"; extract >/dev/null
-expect 2-wrong-source '.provenance.AC1 == "unsupported" and (.unsupported[0].reason | test("slack-lantern-desk"))' "$(check)"
+expect 2-wrong-source '.provenance.AC1 == "unsupported" and (.unsupported[0].reason | test("slack-example-desk"))' "$(check)"
 # An unfrozen source (named, never fetched) is unsupported, naming the file.
 new_run; rm "$RUN/intent/issue-412.md"; extract >/dev/null
 expect 2-unfrozen '.provenance.AC1 == "unsupported" and (.unsupported[0].reason | test("unfrozen: intent/issue-412.md is missing"))' "$(check)"
@@ -289,7 +290,7 @@ new_run; extract >/dev/null; shot ac1.png; shot ac3.png
 # ignored; a duplicate row is a problem.
 rows "[$(row AC1 met '["evidence/A1/ac1.png"]'),$(row AC9 met '["evidence/A1/ac1.png"]')]"
 expect 3-missing-and-unknown '.ok == false and .missingRows == ["AC2","AC3"] and .unknownRows == [{"file":"evidence/A1/acceptance-results.json","itemId":"AC9"}] and .rowProblems == []' "$(check)"
-[ "$(report)" = "Acceptance: present(3) — 0 unsupported, 2 missing rows" ] || fail "3-sentence: $(report)"
+[ "$(report)" = "Acceptance: present(3) — 0 unsupported, 2 missing rows, 1 builder claim" ] || fail "3-sentence: $(report)"
 rows "[$(row AC1 met '["evidence/A1/ac1.png"]'),$(row AC1 met '["evidence/A1/ac1.png"]'),$(row AC2 blocked '[]' 'seat lost'),$(row AC3 met '["evidence/A1/ac3.png"]')]"
 expect 3-duplicate-row 'any(.rowProblems[]; .itemId == "AC1" and any(.problems[]; test("duplicate row")))' "$(check)"
 # No results file at all: every item is a missing row, and the file is named.
@@ -351,7 +352,7 @@ expect 4-absent-refused '.ok == false and .origin == "absent" and any(.problems[
 [ "$(report)" = "Acceptance: absent — 0 unsupported, 0 missing rows" ] || fail "4-sentence-absent: $(report)"
 # The lane derives from the frozen request sources into the same file.
 derived() { # <jq-edit on the derived doc>
-  jq "$1" <<<'{"schemaVersion":1,"origin":"derived","sources":{"R1":{"request":"issue#412","frozen":"issue-412.md"},"R2":{"request":"slack:lantern-desk/1726000000.000100","frozen":"slack-lantern-desk-1726000000.000100.md"}},
+  jq "$1" <<<'{"schemaVersion":1,"origin":"derived","sources":{"R1":{"request":"issue#412","frozen":"issue-412.md"},"R2":{"request":"slack:example-desk/1726000000.000100","frozen":"slack-example-desk-1726000000.000100.md"}},
     "items":[{"id":"AC1","source":"R1","quote":"'"$Q1"'","when":"open the desk","then":{"surface":"web:/desk","expect":"fine shown"},"platform":"web","derived":true},
              {"id":"AC2","source":"R2","quote":"'"$Q2"'","when":"GET fines","then":{"surface":"api:GET /api/fines","expect":"403"},"platform":"api","derived":true}]}' > "$RUN/intent/acceptance.json"
 }
@@ -361,6 +362,11 @@ expect 4-derived-ok '.ok == true and .origin == "derived" and .itemCount == 2' "
 [ "$(report)" = "Acceptance: derived(2) — 0 unsupported, 0 missing rows" ] || fail "4-sentence-derived: $(report)"
 derived 'del(.items[1].derived)'
 expect 4-derived-flag-required '.ok == false and any(.problems[]; test("item AC2: a derived contract marks every item derived: true"))' "$(check)"
+# A derived contract comes from the frozen request sources, never the PR prose:
+# a pr-body source stops the check (an authored block's pr-body items stay
+# builder claims, section 2).
+derived '.sources.R3 = {"request":"pr-body"} | .items[1].source = "R3"'
+expect 4-derived-no-pr-body '.ok == false and .stopped != null and any(.problems[]; test("sources.R3: a derived contract derives from the frozen request sources, never the PR prose"))' "$(check)"
 derived '.origin = "pr-body"'
 expect 4-authored-cannot-be-derived 'any(.problems[]; test("authored contract cannot carry derived items"))' "$(check)"
 derived '.items[1].id = "AC1"'
@@ -511,5 +517,142 @@ derived '.items = [] | .none = [{"reason":"dependency bump"}]'
 expect 6-clean-zero-not-stopped '.ok == true and has("stopped") and .stopped == null' "$(check)"
 rm "$RUN/intent/acceptance.json"
 expect 6-missing-is-stopped '.stopped == "contract missing"' "$(check)"
+
+# --- 7. one adjudicated result -------------------------------------------------
+new_run; extract >/dev/null
+shot a.png
+all_met() { rows "[$(row AC1 met '["evidence/A1/a.png"]'),$(row AC2 "${1:-met}" '["evidence/A1/a.png"]'),$(row AC3 met '["evidence/A1/a.png"]')]"; }
+all_met
+mkdir -p "$RUN/coordinator" "$RUN/challenger"
+challenger() { printf '%s' "$1" > "$RUN/challenger/acceptance-check.json"; }
+record() { # <AC2 status> [extra items json, comma-led] : a documented record covering AC1-AC3
+  challenger "{\"obligations\":[{\"id\":\"O1\",\"status\":\"covered\",\"itemId\":\"AC1\"},{\"id\":\"O2\",\"status\":\"missing\",\"itemId\":null}],\"items\":[{\"itemId\":\"AC1\",\"status\":\"supported\"},{\"itemId\":\"AC2\",\"status\":\"$1\"},{\"itemId\":\"AC3\",\"status\":\"supported\"}${2:-}]}"
+}
+rulings() { printf '%s' "$1" > "$RUN/coordinator/acceptance-rulings.json"; }
+expect 7-no-dispute '.ok == true and .unruled == [] and .outcomes == {"AC1":"met","AC2":"met","AC3":"met"}' "$(check)"
+record narrowed
+expect 7-dispute-is-unruled '.ok == false and .unruled == ["AC2"] and .outcomes.AC2 == "unruled" and .outcomes.AC1 == "met"' "$(check)"
+[ "$(report)" = "Acceptance: present(3) — 0 unsupported, 0 missing rows, 1 builder claim, 1 disputed and unruled" ] || fail "7-unruled-sentence: $(report)"
+challenger '{"items":[{"id":"AC1","support":"supported"},{"id":"AC2","support":"unsupported"},{"id":"AC3","mapping":"supported"}]}'
+expect 7-older-record-shapes-are-read '.ok == false and .unruled == ["AC2"] and .challengerRecord == "ok"' "$(check)"
+for BAD in '{"items":[{"itemId":"AC2","status":["unsupported"]}]}' '{"items":[null,{"itemId":"AC1","status":"supported"}]}' \
+           '{"items":[{"itemId":7,"status":"narrowed"}]}' '{"items":[{"itemId":"AC2"}]}' '{"items":[{"itemId":"AC-2","status":"unsupported"}]}' \
+           '{"items":[{"itemId":"AC2","status":"narrowed"}' '{"items":{"AC2":"narrowed"}}' '{"items":[{"itemId":"AC2","status":"unsuported"}]}'; do
+  challenger "$BAD"
+  expect 7-unreadable-challenger-record '.ok == false and .unruled == [] and .challengerRecord == "unusable" and any(.problems[]; test("acceptance-check.json: unreadable"))' "$(check)"
+done
+[ "$(report)" = "Acceptance: present(3) — 0 unsupported, 0 missing rows, 1 builder claim, 1 adjudication record problem" ] || fail "7-unreadable-sentence: $(report)"
+rm -f "$RUN/challenger/acceptance-check.json"; ln -s "$RUN/challenger/gone.json" "$RUN/challenger/acceptance-check.json"
+expect 7-dangling-challenger-link '.ok == false and any(.problems[]; test("acceptance-check.json: unreadable"))' "$(check)"
+rm -f "$RUN/challenger/acceptance-check.json"
+record unsupported
+all_met not_met
+expect 7-only-a-disputed-met-needs-a-ruling '.unruled == []' "$(check)"
+all_met
+RAW="$(cat "$RUN/evidence/A1/acceptance-results.json")"
+rulings '[{"itemId":"AC2","outcome":"not_met","why":"phone width shows the old rail"}]'
+expect 7-ruling-replaces-the-row '.ok == true and .unruled == [] and .outcomes.AC2 == "not_met" and .outcomes.AC1 == "met"' "$(check)"
+[ "$(report)" = "Acceptance: present(3) — 0 unsupported, 0 missing rows, 1 builder claim, 1 ruled not met or unproved" ] || fail "7-not-met-sentence: $(report)"
+rulings '[{"itemId":"AC2","outcome":"unproved","why":"the phone width was never reached"}]'
+[ "$(report)" = "Acceptance: present(3) — 0 unsupported, 0 missing rows, 1 builder claim, 1 ruled not met or unproved" ] || fail "7-unproved-sentence: $(report)"
+[ "$(cat "$RUN/evidence/A1/acceptance-results.json")" = "$RAW" ] || fail "7-raw-rows-stay-as-observed"
+rulings '[{"itemId":"AC2","outcome":"changed","why":"scope cut"}]'
+expect 7-changed-needs-who '.ok == false and any(.problems[]; test("AC2: changed needs decidedBy"))' "$(check)"
+rulings '[{"itemId":"AC2","outcome":"changed","why":"scope cut","decidedBy":"carol, example-desk thread"}]'
+expect 7-changed '.ok == true and .changed == ["AC2"] and .outcomes.AC2 == "changed"' "$(check)"
+[ "$(report)" = "Acceptance: present(3) — 0 unsupported, 0 missing rows, 1 builder claim, 1 changed" ] || fail "7-changed-sentence: $(report)"
+rulings '[{"itemId":"AC2","outcome":"deferred","why":"moved","decidedBy":"carol"}]'
+expect 7-deferred-needs-an-issue '.ok == false and any(.problems[]; test("AC2: deferred needs followUp"))' "$(check)"
+[ "$(report)" = "Acceptance: present(3) — 0 unsupported, 0 missing rows, 1 builder claim, 1 adjudication record problem, 1 disputed and unruled" ] || fail "7-invalid-ruling-sentence: $(report)"
+rulings '[{"itemId":"AC2","outcome":"deferred","why":"moved","decidedBy":"carol","followUp":"#88"}]'
+expect 7-deferred '.ok == true and .deferred == ["#88"] and .outcomes.AC2 == "deferred"' "$(check)"
+[ "$(report)" = "Acceptance: present(3) — 0 unsupported, 0 missing rows, 1 builder claim, 1 deferred (#88)" ] || fail "7-deferred-sentence: $(report)"
+rulings '[{"itemId":"AC9","outcome":"met","why":"x"},{"itemId":["AC1"],"outcome":"met","why":"x"},"AC2"]'
+expect 7-ruling-for-nothing '.ok == false and ([.problems[] | select(test("unknown item"))] | length) == 3' "$(check)"
+rulings '[{"itemId":"AC2","outcome":"met","why":"a"},{"itemId":"AC2","outcome":"not_met","why":"b"}]'
+expect 7-one-ruling-per-item '.ok == false and any(.problems[]; test("more than one ruling for AC2"))' "$(check)"
+rulings '[{"itemId":"AC2","outcome":"waived","why":"a"}]'
+expect 7-unknown-outcome '.ok == false and .unruled == ["AC2"] and any(.problems[]; test("outcome must be one of"))' "$(check)"
+rulings '{"itemId":"AC2"}'
+expect 7-rulings-not-a-list '.ok == false and any(.problems[]; test("not a JSON list"))' "$(check)"
+[ "$(report)" = "Acceptance: present(3) — 0 unsupported, 0 missing rows, 1 builder claim, 1 adjudication record problem, 1 disputed and unruled" ] || fail "7-unreadable-rulings-sentence: $(report)"
+rm -f "$RUN/coordinator/acceptance-rulings.json"; ln -s "$RUN/coordinator/gone.json" "$RUN/coordinator/acceptance-rulings.json"
+expect 7-dangling-rulings-link '.ok == false and any(.problems[]; test("not a JSON list"))' "$(check)"
+rm -f "$RUN/coordinator/acceptance-rulings.json"
+
+# --- 8. carry-forward ------------------------------------------------------------
+# A campaign extracts with --carry-from its baseline run. Whatever that run left
+# unresolved (its outcome is not met and not ruled changed) is carried; a later
+# met on a carried obligation needs a ruling, and an open one stays on the report.
+# Each campaign's own ids differ (real freeze runs prefix them pr<n>/, and their
+# ranges are disjoint), so later runs here rename AC* to BC* and CC*.
+renamed() { jq --arg p "$1" '.items |= map(.id |= sub("^AC"; $p))' "$EXAMPLE"; }
+PRIOR="$WORK/prior"; NEXT="$WORK/next"
+RUN="$PRIOR"; new_run; extract >/dev/null; shot a.png; mkdir -p "$RUN/coordinator"
+rows "[$(row AC1 met '["evidence/A1/a.png"]'),$(row AC2 not_demonstrable '["evidence/A1/a.png"]' 'no phone build'),$(row AC3 met '["evidence/A1/a.png"]')]"
+rulings '[{"itemId":"AC3","outcome":"deferred","why":"cut to a follow-up","decidedBy":"carol","followUp":"#88"}]'
+expect 8-prior-ok '.ok == true' "$(check)"
+RUN="$NEXT"; new_run "$(renamed BC)"
+OUT="$(extract --carry-from "$PRIOR")"
+expect 8-carried '.ok == true and .carriedCount == 2' "$OUT"
+expect 8-carried-entries '[.carried[] | {id: .item.id, priorOutcome, priorRun, firstRun, followUp, request}] == [
+  {id:"AC2", priorOutcome:"not_demonstrable", priorRun:"prior", firstRun:"prior", followUp:null, request:"slack:example-desk/1726000000.000100"},
+  {id:"AC3", priorOutcome:"deferred", priorRun:"prior", firstRun:"prior", followUp:"#88", request:"pr-body"}]' "$(cat "$RUN/intent/acceptance.json")"
+cp "$RUN/intent/acceptance.json" "$WORK/next-doc.json"
+shot a.png; mkdir -p "$RUN/coordinator"
+EV='["evidence/A1/a.png"]'
+OWN="$(row BC1 met "$EV"),$(row BC2 met "$EV"),$(row BC3 met "$EV")"
+# The same obligation, met again with no ruling, is held for adjudication.
+rows "[$OWN,$(row AC2 met "$EV"),$(row AC3 met "$EV")]"
+expect 8-met-needs-a-ruling '.ok == false and .unruled == ["AC2","AC3"] and .carriedOpen == ["AC2","AC3"]' "$(check)"
+rulings '[{"itemId":"AC2","outcome":"met","why":"walked on the phone build"},{"itemId":"AC3","outcome":"changed","why":"scope cut stands","decidedBy":"carol"}]'
+expect 8-ruled '.ok == true and .unruled == [] and .carriedOpen == []' "$(check)"
+# A carried obligation with no row this campaign is not a missing row; it stays open.
+rm -f "$RUN/coordinator/acceptance-rulings.json"
+jq '.items |= map(select(.id == "BC1")) | .sources |= {R1}' "$WORK/next-doc.json" > "$WORK/one.json"
+cp "$WORK/one.json" "$RUN/intent/acceptance.json"
+rows "[$(row BC1 met "$EV")]"
+expect 8-open-not-missing '.ok == true and .missingRows == [] and .carriedOpen == ["AC2","AC3"]' "$(check)"
+[ "$(report)" = "Acceptance: present(1) — 0 unsupported, 0 missing rows, 2 carried open from earlier campaigns (AC2, AC3)" ] || fail "8-sentence: $(report)"
+# The prior run is named by its directory, however --carry-from spells it.
+RUN="$WORK/dotted"; new_run "$(renamed BC)"
+(cd "$NEXT" && python3 "$TOOL" extract "$RUN" --carry-from . >/dev/null) || true
+expect 8-carry-from-dot '[.carried[].priorRun] == ["next","next"]' "$(cat "$RUN/intent/acceptance.json")"
+# An open carried obligation carries on, with its first run kept.
+THIRD="$WORK/third"; RUN="$THIRD"; new_run "$(renamed CC)"
+expect 8-chain '.ok == true and .carriedCount == 2' "$(extract --carry-from "$NEXT")"
+expect 8-chain-entries '[.carried[] | {id: .item.id, priorRun, firstRun}] == [{id:"AC2", priorRun:"next", firstRun:"prior"}, {id:"AC3", priorRun:"next", firstRun:"prior"}]' "$(cat "$RUN/intent/acceptance.json")"
+# An id this run's items reuse is never merged with or replaced by the carried
+# obligation: extract refuses, and a contract holding the clash stops the check.
+RUN="$WORK/clash"; new_run
+expect 8-clash-refused '.ok == false and (.error | test("reuse carried ids AC2, AC3"))' "$(extract --carry-from "$NEXT")"
+[ ! -e "$RUN/intent/acceptance.json" ] || fail "8-clash: a refused carry wrote the contract"
+RUN="$NEXT"
+jq '.items += [(.carried[0].item | .source = "R1")]' "$WORK/one.json" > "$RUN/intent/acceptance.json"
+expect 8-clash-in-doc '.ok == false and .stopped != null and any(.problems[]; test("carried AC2: an item of this run reuses its id"))' "$(check)"
+# A malformed carried item is a contract problem, never a crash, and a prior
+# holding one refuses the carry because its check stopped.
+for edit in 'del(.carried[0].item.then)' '.carried[0].item.source = ["R1"]'; do
+  jq "$edit" "$WORK/one.json" > "$NEXT/intent/acceptance.json"
+  RUN="$NEXT"
+  expect "8-carried-item-checked $edit" '.ok == false and .stopped != null and any(.problems[]; test("carried AC2 item: (then must be an object|source must name a key)"))' "$(check)"
+  RUN="$WORK/sixth"; new_run "$(renamed CC)"
+  expect "8-malformed-prior-refused $edit" '.ok == false and (.error | test("check stopped"))' "$(extract --carry-from "$NEXT")"
+done
+cp "$WORK/one.json" "$NEXT/intent/acceptance.json"
+# A ruled-changed or met obligation is not carried, and an unreadable prior refuses.
+RUN="$WORK/fourth"; new_run
+rm -f "$PRIOR/coordinator/acceptance-rulings.json"; rulings_prior() { printf '%s' "$1" > "$PRIOR/coordinator/acceptance-rulings.json"; }
+rulings_prior '[{"itemId":"AC2","outcome":"changed","why":"dropped","decidedBy":"carol"},{"itemId":"AC3","outcome":"met","why":"walked"}]'
+expect 8-resolved-not-carried '.ok == true and .carriedCount == 0' "$(extract --carry-from "$PRIOR")"
+rm -f "$RUN/intent/acceptance.json"
+expect 8-unreadable-prior '.ok == false and (.error | test("carry-from"))' "$(extract --carry-from "$WORK/no-such-run")"
+[ ! -e "$RUN/intent/acceptance.json" ] || fail "8: a refused carry wrote the contract"
+# The carried list is checked like the rest of the contract.
+RUN="$NEXT"
+jq '.carried[0].priorRun = ""' "$WORK/one.json" > "$RUN/intent/acceptance.json"
+expect 8-bad-carried '.ok == false and any(.problems[]; test("carried: every entry"))' "$(check)"
+jq '.items[0].id = []' "$WORK/one.json" > "$RUN/intent/acceptance.json"
+expect 8-non-text-item-id '.ok == false and .stopped != null and any(.problems[]; test("id must match"))' "$(check)"
 
 echo "smoke-acceptance.test.sh: all sections passed"

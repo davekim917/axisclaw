@@ -11,6 +11,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import urllib.parse
 from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -26,6 +27,7 @@ SCOPE = {"mode": "deny", "tenants": ["sandbox", "playground"],
 SEAT_TENANTS = {"m@example.test": {"tenantId": "sandbox"}, "g@example.test": {"tenantId": "globex"},
                 "n@example.test": {"sub": "9"}, "w@example.test": {"tenantId": "sandbox", "tenant_id": "globex"},
                 "o@example.test": {"sub": "11"}}
+MEDIA_URL = "https://media.example.test/fixture-bucket/photos/a.jpg"
 
 
 def token_for(claims):
@@ -354,6 +356,50 @@ class Guard(Harness):
                 text = fh.read()
             for secret in ("FICTIONAL-TOKEN", "fictional-pw", issued):
                 self.assertNotIn(secret, text, "{} leaks {}".format(f, secret))
+
+    def test_signed_url_secrets_never_reach_evidence_or_stdout(self):
+        signed = (MEDIA_URL + "?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=FAKE-CRED-ID%2F20260101%2Faws4_request"
+                  "&X-Amz-Expires=3600&X-Amz-Security-Token=FAKE-SESSION&X-Amz-SignedHeaders=host"
+                  "&X-Amz-Signature=FAKE-SIG-0123")
+        gcs = MEDIA_URL + "?X-Goog-Credential=FAKE-GCRED&X-Goog-Signature=FAKE-GSIG"
+        Backend.replies[("GET", "/media/9")] = (200, {"data": {"items": [{"thumb": {"src": signed}}],
+                                                              "note": "Download it from {} (link expires)".format(gcs),
+                                                              signed: {"width": 640}}})
+        self.pin()
+        out = os.path.join(self.tmp.name, "stdout.txt")
+        with open(out, "w") as f, contextlib.redirect_stdout(f):
+            h = self.client("M")
+            h.call("u1", "M", "GET", "/media/9")
+            h.call("u2", "M", "GET", "/media/9?X-Amz-Credential=FAKE-CRED-ID&X-Amz-Signature=FAKE-SIG-0123")
+            h.call("u3", "M", "GET", "/media/fetch?src=" + urllib.parse.quote(signed, safe=""))
+            self.assert_sent(h, "u4", "POST", "/notes", {"body": "any note", "attachment": {"url": signed},
+                                                        "gallery": (gcs,)})
+            with self.assertRaises(api.WriteScopeRefused):
+                h.own_item("u5", "M", "/media/9?X-Amz-Credential=FAKE-CRED-ID&X-Amz-Signature=FAKE-SIG-0123")
+        for name in (out, "u1.json", "u2.json", "u3.json", "u4.json", "u5.json", "00-timeline.txt"):
+            with open(os.path.join(h.out, name)) as fh:
+                text = fh.read()
+            for secret in ("FAKE-CRED-ID", "FAKE-SESSION", "FAKE-SIG-0123", "FAKE-GCRED", "FAKE-GSIG"):
+                self.assertNotIn(secret, text, "{} leaks {}".format(name, secret))
+        with open(os.path.join(h.out, "u1.json")) as fh:
+            response = json.load(fh)["response"]["data"]
+        self.assertEqual(response["items"][0]["thumb"]["src"],
+                         MEDIA_URL + "?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=[REDACTED]"
+                         "&X-Amz-Expires=3600&X-Amz-Security-Token=[REDACTED]&X-Amz-SignedHeaders=host"
+                         "&X-Amz-Signature=[REDACTED]")
+        self.assertTrue(response["note"].startswith("Download it from " + MEDIA_URL + "?X-Goog-Credential=[REDACTED]&"),
+                        response["note"])
+        with open(out) as fh:
+            self.assertIn("GET /media/9?X-Amz-Credential=[REDACTED]", fh.read())
+
+    def test_a_broken_browser_allowlist_does_not_stop_the_lane_client_loading(self):
+        allow = os.path.join(self.tmp.name, "ab-net-allow.txt")
+        with open(allow, "w") as f:
+            f.write("(" * 2000 + ")" * 2000 + "\n")
+        env = {"PATH": os.environ["PATH"], "PYTHONDONTWRITEBYTECODE": "1", "AB_NET_REDACT_ALLOW_FILE": allow}
+        r = subprocess.run([sys.executable, "-c", "import smoke_lane_api; print(smoke_lane_api.scrub_str('/a?sig=FAKE'))"],
+                           cwd=HERE, env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual((r.returncode, r.stdout), (0, "/a?sig=[REDACTED]\n"), r.stderr[-300:])
 
     def test_scope_from_another_run_refused(self):
         self.pin()
@@ -699,6 +745,162 @@ class ApprovalModeGuard(Harness):
         self.assertIn("unreadable-scope", str(ctx.exception), "a tampered pin refuses every write")
 
 
+OWNED = {"path": "/trips/(?P<parent>[^/]+)/stops/(?P<item>[^/]+)", "read": "/trips/{parent}", "items": "data.stops",
+         "require": {"visited": [False], "visitedAt": [None], "checkedInAt": [None]}}
+OWNED_SCOPE = dict(SCOPE, denyPaths=SCOPE["denyPaths"] + ["/trips/[^/]+/stops/[^/]+"], ownedDeletes=[OWNED])
+UNUSED = {"visited": False, "visitedAt": None, "checkedInAt": None}
+
+
+def trip(*stops):
+    return 200, {"data": {"id": "T1", "stops": [dict(UNUSED, id=s) if isinstance(s, int) else s for s in stops]}}
+
+
+class OwnedDelete(Harness):
+    """DELETE alone may pass a deny, for an item this run ledgered and a fresh read still shows unused."""
+
+    def setUp(self):
+        super().setUp()
+        self.pin(OWNED_SCOPE)
+        Backend.modes["/trips/T1"] = trip(51, 53, dict(UNUSED, id=52, visited=True, visitedAt="2026-01-01T00:00:00Z"))
+
+    def sent_since(self, before):
+        return [(m, p) for m, p, _ in Backend.seen[before:]]
+
+    def test_a_ledgered_unused_item_is_deleted_and_no_other_method_opens(self):
+        h = self.client("M")
+        h.own_item("o1", "M", "/trips/T1/stops/51")
+        before = len(Backend.seen)
+        code, _ = h.call("d1", "M", "DELETE", "/trips/T1/stops/51")
+        self.assertEqual(code, 200)
+        self.assertEqual(self.sent_since(before), [("GET", "/trips/T1"), ("DELETE", "/trips/T1/stops/51")])
+        for method in ("PATCH", "PUT", "POST"):
+            self.assert_blocked(h, "w-" + method, method, "/trips/T1/stops/51", {"visited": True}, "denied-path")
+
+    def test_an_unledgered_item_is_refused_before_any_read(self):
+        h = self.client("M")
+        self.assert_blocked(h, "d2", "DELETE", "/trips/T1/stops/53", None, "owned-delete not-ledgered")
+
+    def test_the_item_is_read_again_and_any_sign_of_use_refuses(self):
+        h = self.client("M")
+        h.own_item("o3", "M", "/trips/T1/stops/51")
+        cases = (
+            ("visited", trip(dict(UNUSED, id=51, visited=True)), "in-use field=visited"),
+            ("visitedAt", trip(dict(UNUSED, id=51, visitedAt="2026-01-02T00:00:00Z")), "in-use field=visitedAt"),
+            ("checkedIn", trip(dict(UNUSED, id=51, checkedInAt="2026-01-02T00:00:00Z")), "in-use field=checkedInAt"),
+            ("absentField", trip({"id": 51, "visited": False, "visitedAt": None}), "in-use field=checkedInAt"),
+            ("gone", trip(53), "item-not-found"),
+            ("forbidden", (403, {"data": {"stops": [dict(UNUSED, id=51)]}}), "unreadable status=403"),
+            ("notAList", (200, {"data": {"stops": {"51": UNUSED}}}), "unreadable"),
+        )
+        for tag, reply, reason in cases:
+            Backend.modes["/trips/T1"] = reply
+            before = len(Backend.seen)
+            with self.assertRaises(api.WriteScopeRefused, msg=tag) as ctx:
+                h.call(tag, "M", "DELETE", "/trips/T1/stops/51")
+            self.assertIn(reason, str(ctx.exception), tag)
+            self.assertEqual(self.sent_since(before), [("GET", "/trips/T1")], tag)
+
+    def test_an_item_read_on_its_own_is_the_one_candidate(self):
+        os.unlink(os.path.join(self.run_dir, api.SCOPE_FILE))
+        route = {"path": "/routes/(?P<item>[0-9]+)", "read": "/routes/{item}", "items": "data",
+                 "require": {"isEmpty": [True]}}
+        self.pin(dict(OWNED_SCOPE, denyPaths=OWNED_SCOPE["denyPaths"] + ["/routes/[^/]+"],
+                      ownedDeletes=[OWNED, route]))
+        empty = (200, {"data": {"id": 7, "isEmpty": True}})
+        Backend.modes["/routes/7"] = empty
+        h = self.client("M")
+        h.own_item("r7", "M", "/routes/7")
+        for tag, data, reason in (("busy", {"id": 7, "isEmpty": False}, "in-use field=isEmpty"),
+                                  ("other", {"id": 8, "isEmpty": True}, "item-not-found"),
+                                  ("noId", {"isEmpty": True}, "unreadable"),
+                                  ("boolId", {"id": True, "isEmpty": True}, "unreadable")):
+            Backend.modes["/routes/7"] = (200, {"data": data})
+            with self.assertRaises(api.WriteScopeRefused, msg=tag) as ctx:
+                h.call(tag, "M", "DELETE", "/routes/7")
+            self.assertIn(reason, str(ctx.exception), tag)
+        Backend.modes["/routes/7"] = empty
+        before = len(Backend.seen)
+        self.assertEqual(h.call("rd", "M", "DELETE", "/routes/7")[0], 200)
+        self.assertEqual(self.sent_since(before), [("GET", "/routes/7"), ("DELETE", "/routes/7")])
+
+    def test_scope_checks_still_bind_an_owned_delete(self):
+        h = self.client("M", "G")
+        h.own_item("o4", "M", "/trips/T1/stops/51")
+        self.assert_blocked(h, "d4", "DELETE", "/trips/T1/stops/51", None, "foreign-tenant", seat="G")
+
+    def test_own_item_ledgers_only_an_unused_item_it_read(self):
+        h = self.client("M")
+        for tag, path, reason in (("v", "/trips/T1/stops/52", "in-use field=visited"),
+                                  ("missing", "/trips/T1/stops/99", "item-not-found"),
+                                  ("unlisted", "/notes/T1/stops/51", "no-owned-delete")):
+            with self.assertRaises(api.WriteScopeRefused, msg=tag) as ctx:
+                h.own_item(tag, "M", path)
+            self.assertIn(reason, str(ctx.exception), tag)
+        self.assertEqual(self.ledger(), set())
+        h.own_item("ok", "M", "/trips/T1/stops/51")
+        self.assertEqual(self.ledger(), {"/trips/T1/stops/51"})
+
+    def test_no_spelling_lets_one_ledgered_item_cover_another(self):
+        Backend.modes["/trips/T1"] = trip(dict(UNUSED, id="A"), dict(UNUSED, id="a"), 51)
+        Backend.modes["/api/trips/T1"] = Backend.modes["/trips/T1"]
+        h = self.client("M")
+        h.own_item("oA", "M", "/trips/T1/stops/A")
+        self.assert_blocked(h, "case", "DELETE", "/trips/T1/stops/a", None, "owned-delete not-ledgered")
+        h.own_item("o51", "M", "/trips/T1/stops/51")
+        for i, path in enumerate(("/trips/T1/stops/51%3Fx", "/trips/T1/stops/51%23x", "/trips/T1/stops/5%31")):
+            self.assert_blocked(h, "enc%d" % i, "DELETE", path, None, "denied-path")
+        os.unlink(os.path.join(self.run_dir, api.SCOPE_FILE))
+        os.unlink(os.path.join(self.run_dir, api.LEDGER_FILE))
+        self.pin(dict(OWNED_SCOPE, denyPaths=["/api/trips/[^/]+/stops/[^/]+"],
+                      ownedDeletes=[dict(OWNED, path="/api/trips/(?P<parent>[^/]+)/stops/(?P<item>[^/]+)",
+                                         read="/api/trips/{parent}")]))
+        based = api.H(os.path.join(self.run_dir, "lanes", "l2"), run_dir=self.run_dir, base=self.base + "/api",
+                      seats={"M": "m@example.test"}, password_helper=self.helper)
+        based.tok["M"] = token_for({"tenantId": "sandbox"})
+        based.own_item("b51", "M", "/trips/T1/stops/51")
+        for i, path in enumerate(("/trips/T1/stops/51%3Fx", "/trips/T1/stops/51%23x")):
+            self.assert_blocked(based, "benc%d" % i, "DELETE", path, None, "denied-path")
+        before = len(Backend.seen)
+        self.assertEqual(based.call("bok", "M", "DELETE", "/trips/T1/stops/51")[0], 200)
+        self.assertEqual(self.sent_since(before), [("GET", "/api/trips/T1"), ("DELETE", "/api/trips/T1/stops/51")])
+
+    def test_a_row_without_an_id_matches_no_item(self):
+        h = self.client("M")
+        for i, row in enumerate((dict(UNUSED), {"id": None, **UNUSED})):
+            Backend.modes["/trips/T1"] = trip(row)
+            with self.assertRaises(api.WriteScopeRefused, msg=row) as ctx:
+                h.own_item("oNone%d" % i, "M", "/trips/T1/stops/None")
+            self.assertIn("item-not-found", str(ctx.exception))
+        self.assertEqual(self.ledger(), set())
+
+    def test_a_fixture_ledgered_by_own_is_not_an_owned_delete(self):
+        api.record_fixture(self.run_dir, "/trips/T1/stops", "51", PREFIX + "stop")
+        self.assert_blocked(self.client("M"), "fx", "DELETE", "/trips/T1/stops/51", None, "owned-delete not-ledgered")
+
+    def test_cli_check_names_what_it_cannot_read(self):
+        self.client("M").own_item("o6", "M", "/trips/T1/stops/51")
+        cli = [sys.executable, os.path.join(HERE, "smoke_lane_api.py")]
+        env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+        for method, path, reason in (("DELETE", "/trips/T1/stops/51", "owned-delete-unread read=/trips/T1"),
+                                     ("DELETE", "/trips/T1/stops/53", "owned-delete not-ledgered"),
+                                     ("PATCH", "/trips/T1/stops/51", "denied-path")):
+            out = subprocess.run(cli + ["check", self.run_dir, method, path, "--tenant", "sandbox"],
+                                 capture_output=True, text=True, env=env)
+            self.assertEqual(out.returncode, 77, path)
+            self.assertIn(reason, out.stderr, (method, path))
+
+    def test_malformed_owned_deletes_fail_closed(self):
+        os.unlink(os.path.join(self.run_dir, api.SCOPE_FILE))
+        bad = ({}, [dict(OWNED, extra=1)], [{k: v for k, v in OWNED.items() if k != "require"}],
+               [dict(OWNED, path="/trips/(?P<parent>[^/]+)/stops/[^/]+")], [dict(OWNED, path="/trips/")],
+               [dict(OWNED, read="trips/{parent}")], [dict(OWNED, read="/trips/{nope}")], [dict(OWNED, items="")],
+               [dict(OWNED, require={})], [dict(OWNED, require={"visited": []})], [dict(OWNED, require={"visited": [1]})])
+        for entries in bad:
+            with self.assertRaises((ValueError, api.re.error), msg=entries):
+                self.pin(dict(OWNED_SCOPE, ownedDeletes=entries))
+            self.assertFalse(os.path.exists(os.path.join(self.run_dir, api.SCOPE_FILE)), entries)
+
+
 SEAT_SCOPE = dict(SCOPE, tenants=[], authPaths=["/users/login", "/users/switch-role"], seats=["n@example.test"])
 PASSWORD = "fictional-file-pw-7Qx"
 
@@ -882,6 +1084,24 @@ class SeatScope(Harness):
             self.assertEqual(no.returncode, 77, extra)
             self.assertIn(reason, no.stderr)
 
+
+
+class RelativeRunDir(Harness):
+    """The run id is the run directory's own name, however the caller spells the path."""
+
+    def test_a_run_dir_given_as_dot_pins_and_loads_as_its_directory_name(self):
+        src = os.path.join(self.tmp.name, "scope.json")
+        with open(src, "w") as f:
+            json.dump(SCOPE, f)
+        old = os.getcwd()
+        os.chdir(self.run_dir)
+        try:
+            self.assertEqual(api.init_scope(".", src)["runId"], RUN_ID)
+            self.assertEqual(api.fixture_prefix("."), PREFIX)
+            self.assertEqual(api.load_scope(".")["tenants"], SCOPE["tenants"])
+        finally:
+            os.chdir(old)
+        self.assertEqual(api.judge(self.run_dir, "POST", "/notes", {"k": 1}, ["sandbox"]), "write")
 
 if __name__ == "__main__":
     unittest.main(verbosity=1)

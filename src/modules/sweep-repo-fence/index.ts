@@ -5,6 +5,14 @@ import type { Session } from '../../types.js';
 
 const id = SWEEP_DUTY_INVENTORY;
 
+async function scanForOrphanedRepoFences(sessions: Session[]): Promise<void> {
+  try {
+    await sweepOrphanedRepoIngressFences(sessions);
+  } catch (err) {
+    log.warn('Orphaned repository fence sweep step failed', { err });
+  }
+}
+
 function registerSweepRepoFenceDuties(): void {
   registerSweepDuty({
     name: id.T22,
@@ -12,12 +20,10 @@ function registerSweepRepoFenceDuties(): void {
     order: 50,
     // Nothing else releases a fence whose publication is gone; a leaked fence
     // holds every inbound row and refuses every spawn for that session.
-    run: async (ctx) => {
-      try {
-        await sweepOrphanedRepoIngressFences(ctx.sessions as Session[]);
-      } catch (err) {
-        log.warn('Orphaned repository fence sweep step failed', { err });
-      }
+    // Not awaited: the scan opens every session's mailbox, which on a cold or busy
+    // host outlasts the tick and takes every later duty and session down with it.
+    run: (ctx) => {
+      void scanForOrphanedRepoFences(ctx.sessions as Session[]);
     },
   });
 

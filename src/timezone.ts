@@ -102,9 +102,8 @@ export function resolveTimezone(tz: string): string {
 }
 
 /**
- * Convert a UTC ISO timestamp to a localized display string.
- * Uses the Intl API (no external dependencies).
- * Falls back to UTC if the timezone is invalid.
+ * Convert a UTC ISO timestamp to a display string that names its zone ("Oct 29, 2026, 3:14 PM EDT"; a zone with no
+ * abbreviation reads "GMT+5:30"). Falls back to UTC if the timezone is invalid.
  */
 export function formatLocalTime(utcIso: string, timezone: string): string {
   const date = new Date(utcIso);
@@ -116,6 +115,7 @@ export function formatLocalTime(utcIso: string, timezone: string): string {
     hour: 'numeric',
     minute: '2-digit',
     hour12: true,
+    timeZoneName: 'short',
   });
 }
 

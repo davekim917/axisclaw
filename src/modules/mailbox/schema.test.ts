@@ -29,6 +29,29 @@ describe('scheduled_for backfill', () => {
   });
 });
 
+describe('sweep predicates never scan messages_in', () => {
+  it.each([
+    ['the due count', "status = 'pending' AND repo_fence_epoch IS NULL AND trigger = 1", 'idx_messages_in_status'],
+    ['the settled-ack read', "status NOT IN ('completed', 'failed')", 'idx_messages_in_status'],
+    [
+      'the recurrence read',
+      "status IN ('completed', 'failed', 'expired') AND recurrence IS NOT NULL",
+      'idx_messages_in_recurring',
+    ],
+  ])('%s reads its index on a database that predates it', (_name, where, index) => {
+    const db = new Database(':memory:');
+    ensureNanoclawInboundSchema(db);
+    db.exec(`DROP INDEX ${index}`);
+
+    ensureNanoclawInboundSchema(db);
+
+    const plan = db.prepare(`EXPLAIN QUERY PLAN SELECT id FROM messages_in WHERE ${where}`).all() as Array<{
+      detail: string;
+    }>;
+    expect(plan.map((row) => row.detail).join(' | ')).toContain(index);
+  });
+});
+
 describe('repo_ingress_fence generation upgrade', () => {
   /** A session DB from before the fence carried a generation, with a fence still active. */
   function legacyFenceDb(epoch: string): Database.Database {

@@ -10,7 +10,7 @@
 #   finish   <run-dir>          coordinator pre-publication check: identity.json present; after a
 #                                re-freeze, every required lane redispatched since it; ≥1 prior check
 #                                at the CURRENT freeze generation and every such check ok; live
-#                                pair unchanged
+#                                pair unchanged, or moved only after the evidence closed (below)
 #   read                        print the current live pair as JSON
 #
 # For a PR-owned completion contract, start/check/finish also require both
@@ -24,10 +24,10 @@
 # drift ok, second drift blocked, stale generation ignored, finish refused until
 # every lane is redispatched — all fail closed).
 #
-# Exit: 0 unchanged/frozen/re-frozen · 2 unreadable/invalid/unwritable/misconfigured, or
-#       finish refused (a lane not redispatched since a re-freeze) · 3 DRIFT or a
-#       PR-contract source mismatch (lane finishes BLOCKED) · 4 refused (re-start
-#       after freeze, or a second re-freeze)
+# Exit: 0 unchanged/frozen/re-frozen, or finish's pair moved after the evidence closed ·
+#       2 unreadable/invalid/unwritable/misconfigured, or finish refused (a lane not
+#       redispatched since a re-freeze) · 3 DRIFT or a PR-contract source mismatch (lane
+#       finishes BLOCKED) · 4 refused (re-start after freeze, or a second re-freeze)
 #
 # Env: RENDER_API_KEY; SMOKE_GATE_FRONTEND_SERVICE / SMOKE_GATE_BACKEND_SERVICE (required by
 #      start and read — no defaults; a missing id fails closed rather than silently identifying
@@ -75,6 +75,15 @@
 # script still keeps no lane state of its own and never touches markers or the contract;
 # the snapshot is the scaffold's field, copied at one moment. A refreeze with no contract
 # yet snapshots no lanes (none was dispatched); one with markers but no contract refuses.
+#
+# MOVED AFTER EVIDENCE. Shared dev redeploys for unrelated changes, so `finish`'s own live
+# read can find the pair moved after every lane is done; that alone would block runs whose
+# evidence was all gathered on the frozen pair. It is not drift under the run when the
+# newest ok check at the current generation read the frozen pair strictly after every
+# markers/*.json (at least one) and challenger/challenge.complete.json was last modified.
+# `finish` then exits 0 and records both pairs once in
+# coordinator/identity-moved-after-evidence.json, not in identity-checks.ndjson: the
+# evidence barrier and the controller read that journal, and a drift line there blocks.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 jq_here() { (cd "$HERE" && jq -L "$HERE" "$@"); }
@@ -247,12 +256,13 @@ use_frozen_pair() { # <identity.json> <verb>
   TIP_BE="$(jq -r '.backend.commit // empty | strings' "$f" 2>/dev/null)"
 }
 
-compare() { # $1 frozen file, $2 now json, $3 label, $4 rc-of-read, $5 log, $6 freeze-generation, $7 expected-source-sha → prints verdict, exit 0/2/3
-  python3 - "$1" "$2" "$3" "$4" "$5" "$6" "$7" <<'PY'
-import json, sys, os
+compare() { # $1 frozen file, $2 now json, $3 label, $4 rc-of-read, $5 log, $6 freeze-generation, $7 expected-source-sha,
+           # $8 run dir (finish only: a move after the evidence closed is accepted) → prints verdict, exit 0/2/3
+  python3 - "$1" "$2" "$3" "$4" "$5" "$6" "$7" "${8:-}" <<'PY'
+import json, sys, os, glob, tempfile, datetime
 try: frozen = json.load(open(sys.argv[1]))
 except Exception as e: print(f"{sys.argv[3]}: unreadable — identity.json: {e}"); sys.exit(2)
-now = json.loads(sys.argv[2]); label = sys.argv[3]; rc = int(sys.argv[4]); log = sys.argv[5]; expected = sys.argv[7]
+now = json.loads(sys.argv[2]); label = sys.argv[3]; rc = int(sys.argv[4]); log = sys.argv[5]; expected = sys.argv[7]; run = sys.argv[8]
 try: generation = int(sys.argv[6])
 except Exception: generation = 1
 def key(o, s): return (o.get(s, {}).get("service"), o.get(s, {}).get("deploy"), o.get(s, {}).get("commit"))
@@ -266,6 +276,54 @@ rec = {"label": label, "verdict": verdict, "freezeGeneration": generation,
        "frozen": {s: frozen.get(s) for s in ("frontend", "backend")},
        "now": {s: now.get(s) for s in ("frontend", "backend")}, "readAt": now.get("readAt"),
        "expectedSourceSha": expected or None}
+def utc(ts): return datetime.datetime.fromtimestamp(ts, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+def evidence_closed():
+    try:
+        cur = [r for r in (json.loads(l) for l in open(log).read().splitlines() if l.strip())
+               if int(r.get("freezeGeneration", 1) or 1) == generation]
+    except Exception: return None
+    if not cur or any(r.get("verdict") != "ok" for r in cur): return None
+    timed = []
+    for i, r in enumerate(cur):
+        try: timed.append((datetime.datetime.strptime(r.get("readAt"), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc).timestamp(), i, r))
+        except Exception: pass
+    markers = glob.glob(os.path.join(glob.escape(run), "markers", "*.json"))
+    challenge = os.path.join(run, "challenger", "challenge.complete.json")
+    if not timed or not markers: return None
+    try: newest = max((os.stat(p).st_mtime, p) for p in markers + ([challenge] if os.path.lexists(challenge) else []))
+    except OSError: return None
+    closing_at, _, closing = max(timed)
+    return (closing, newest) if closing_at > newest[0] else None
+def record_once(path, doc):
+    """True when installed now, or already there naming the same two pairs: a later, different move never overwrites it."""
+    d = os.path.dirname(path); fd, tmp = tempfile.mkstemp(prefix=".moved.", dir=d)
+    try:
+        with os.fdopen(fd, "w") as f: f.write(json.dumps(doc, separators=(",", ":")) + "\n"); f.flush(); os.fsync(f.fileno())
+        try: os.link(tmp, path)
+        except FileExistsError:
+            try:
+                prior = json.load(open(path))
+                return all(key(prior[k], s) == key(doc[k], s) for k in ("frozen", "now") for s in ("frontend", "backend"))
+            except Exception: return False
+        dfd = os.open(d, os.O_RDONLY); os.fsync(dfd); os.close(dfd)
+        return True
+    finally: os.unlink(tmp)
+closed = evidence_closed() if verdict == "drift" and run else None
+if closed:
+    closing, (newest_at, newest_path) = closed
+    moved_path = os.path.join(run, "coordinator", "identity-moved-after-evidence.json")
+    doc = {"verdict": "moved-after-evidence", "freezeGeneration": generation, "frozen": rec["frozen"], "now": rec["now"],
+           "readAt": rec["readAt"], "closingCheck": {"label": closing.get("label"), "readAt": closing.get("readAt")},
+           "newestEvidence": {"path": os.path.relpath(newest_path, run), "mtime": utc(newest_at)},
+           "expectedSourceSha": expected or None}
+    try: installed = record_once(moved_path, doc)
+    except Exception as e: print(f"{label}: unreadable — could not record the move after evidence: {e}"); sys.exit(2)
+    if installed:
+        def pair(p): return " ".join(f"{s}={(p.get(s) or {}).get('service')}@{(p.get(s) or {}).get('deploy')}/{(p.get(s) or {}).get('commit')}" for s in ("frontend", "backend"))
+        print(f"{label}: moved-after-evidence — frozen pair {pair(rec['frozen'])} is now {pair(rec['now'])}; "
+              f"the closing ok check ({closing.get('label')}, {closing.get('readAt')}) read the frozen pair after the newest evidence "
+              f"({doc['newestEvidence']['path']}, {doc['newestEvidence']['mtime']}). Recorded in {moved_path}; the run record and the verdict must cite both pairs")
+        sys.exit(0)
 try:
     with open(log, "a") as f: f.write(json.dumps(rec, separators=(",", ":")) + "\n"); f.flush(); os.fsync(f.fileno())
 except Exception as e: print(f"{label}: unreadable — check log not writable: {e}"); sys.exit(2)
@@ -451,7 +509,7 @@ print("identity re-frozen: " + payload)
 PY
     exit $? ;;
   check|finish)
-    RUN="${2:?run dir}"; LABEL="${3:-$1}"; F="$RUN/coordinator/identity.json"; LOG="$RUN/coordinator/identity-checks.ndjson"
+    RUN="${2:?run dir}"; LABEL="${3:-$1}"; F="$RUN/coordinator/identity.json"; LOG="$RUN/coordinator/identity-checks.ndjson"; MOVED_RUN=""
     [ -s "$F" ] || { echo "$LABEL: unreadable — no identity.json in $RUN (run start first) (exit 2)"; exit 2; }
     use_frozen_pair "$F" "$1"
     require_services
@@ -513,7 +571,8 @@ bad = [v for v in verdicts if v != "ok"]
 if bad: print(f"finish: unreadable — non-ok identity checks {bad} at the current freeze generation; finish requires every check recorded at this generation to be ok (exit 2)"); sys.exit(2)
 PY
       LABEL="finish-prepublication"
+      MOVED_RUN="$RUN"
     fi
-    NOW="$(read_pair)"; rc=$?; compare "$F" "$NOW" "$LABEL" "$rc" "$LOG" "$CUR_GEN" "$EXPECTED_SOURCE_SHA"; exit $? ;;
+    NOW="$(read_pair)"; rc=$?; compare "$F" "$NOW" "$LABEL" "$rc" "$LOG" "$CUR_GEN" "$EXPECTED_SOURCE_SHA" "$MOVED_RUN"; exit $? ;;
   *) sed -n 2,24p "$0"; exit 1 ;;
 esac

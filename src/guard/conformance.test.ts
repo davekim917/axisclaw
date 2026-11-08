@@ -28,6 +28,7 @@ import '../dashboard/thread-close-guard.js';
 import '../dashboard/observatory-assign-guard.js';
 
 import { commandGuard, listCommands } from '../cli/registry.js';
+import { getChoiceHandler } from '../modules/approvals/choices.js';
 import { getApprovalHandler } from '../modules/approvals/primitive.js';
 import { defineGuardedAction, listGuardedActions } from './guard-actions.js';
 import { HOLD } from './types.js';
@@ -37,7 +38,10 @@ describe('guard conformance', () => {
     const holding = listGuardedActions().filter((spec) => spec.grantActionName);
     expect(holding.length).toBeGreaterThan(0);
 
-    const dangling = holding.filter((spec) => !getApprovalHandler(spec.grantActionName as string));
+    const dangling = holding.filter(
+      (spec) =>
+        !getApprovalHandler(spec.grantActionName as string) && !getChoiceHandler(spec.grantActionName as string),
+    );
     expect(dangling.map((s) => s.action)).toEqual([]);
   });
 
@@ -60,6 +64,7 @@ describe('guard conformance', () => {
       'channels.register',
       'threads.close',
       'observatory.assign',
+      'approved_run.execute',
     ]) {
       expect(actions.has(expected), `catalog is missing "${expected}"`).toBe(true);
     }

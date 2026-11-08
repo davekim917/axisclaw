@@ -106,13 +106,14 @@ function makeTwoWorkgroupSource(label: string): string {
       -- the host's upsert does not supply created_at, so a fixture without it
       -- fails NOT NULL on any write driven through ARCHIVE_UPSERT_SQL.
       created_at          TEXT NOT NULL DEFAULT (datetime('now')),
-      channel_name        TEXT
+      channel_name        TEXT,
+      sender_is_bot       INTEGER
     );
     CREATE INDEX idx_archive_ag_sent ON messages_archive(agent_group_id, sent_at);
     CREATE INDEX idx_archive_thread ON messages_archive(agent_group_id, thread_id, sent_at);
   `);
   // The mutation counters the freshness stamp reads, taken from the writer that
-  // owns them so the fixture cannot drift from what `initSchema` creates.
+  // owns them so the fixture cannot drift from what `initArchiveSchema` creates.
   db.exec(ARCHIVE_MUTATION_MARKS_SQL);
   const insert = db.prepare(
     `INSERT INTO messages_archive
@@ -267,6 +268,7 @@ function upsertThroughHostStatement(file: string, msg: Partial<ArchiveUpsert> & 
       role: msg.role ?? 'assistant',
       senderId: msg.senderId ?? 'ag-one-a',
       senderName: msg.senderName ?? 'Someone',
+      senderIsBot: null,
       text: msg.text ?? 'text',
       sentAt: msg.sentAt ?? '2026-01-01T10:01:00Z',
     });

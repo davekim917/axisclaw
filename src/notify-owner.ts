@@ -14,6 +14,7 @@ import { readEnvValue } from './env-file.js';
 import { botTokenKeyForChannelType, slackPostMessage } from './channels/slack-lib.js';
 import { extractSlackChannelId } from './channels/slack.js';
 import { formatLocalStamp, isValidTimezone } from './timezone.js';
+import { discordApiBase, discordBotTokenKey, isDiscordChannelType } from './discord-bot.js';
 
 /**
  * From THIS FILE's location, not `src/config.ts`'s cwd-derived paths: invoked from elsewhere, an alerting primitive
@@ -42,17 +43,8 @@ function resolveAlertChannel(dbPath: string, messagingGroupId: string): OwnerDm 
   }
 }
 
-function isDiscordChannelType(channelType: string): boolean {
-  return channelType === 'discord' || channelType.startsWith('discord-');
-}
-
-function discordBotTokenKey(channelType: string): string {
-  if (channelType === 'discord') return 'DISCORD_BOT_TOKEN';
-  return `DISCORD_BOT_TOKEN_${channelType.slice('discord-'.length).toUpperCase().replace(/-/g, '_')}`;
-}
-
 async function discordPostMessage(token: string, channelId: string, content: string): Promise<void> {
-  const base = process.env.DISCORD_API_URL || 'https://discord.com/api/v10';
+  const base = discordApiBase();
   const res = await fetch(`${base}/channels/${channelId}/messages`, {
     method: 'POST',
     headers: { Authorization: `Bot ${token}`, 'Content-Type': 'application/json' },

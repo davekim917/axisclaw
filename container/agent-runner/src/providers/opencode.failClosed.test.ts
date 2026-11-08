@@ -1,15 +1,21 @@
 import { describe, it, expect, beforeEach, afterEach, spyOn } from 'bun:test';
 import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 
 import {
   buildOpenCodeConfig,
   buildOpencodeServerEnv,
   commentRulePlugins,
+  missingPluginReceipts,
   OPENCODE_PERMISSIONS,
+  requiredOpenCodePluginReceipts,
   runtimeConfigKey,
 } from './opencode.js';
+import { ManagedGitWorktreeGuard } from '../managed-git-guard-opencode.js';
 import { MCP_HEADER_ONLY_SECRET_VARS } from './secret-env.js';
 import { splitExcludedPlugins } from '../plugin-exclusions.js';
+import { CODEX_SHIM_DIR, withCodexShimPath } from '../codex-shim-path.js';
 
 // The guard plugin path buildOpenCodeConfig probes via fs.existsSync. We never
 // touch the real filesystem here — every test stubs fs.existsSync so "present"
@@ -228,6 +234,18 @@ describe('OpenCode gateway routing', () => {
   });
 });
 
+describe('buildOpencodeServerEnv — peer codex rotation shim', () => {
+  // The shim lives on the container's skills mount, so this runs only where that mount exists.
+  (fs.existsSync(path.join(CODEX_SHIM_DIR, 'codex')) ? it : it.skip)(
+    "the agent's shells resolve codex through the rotation shim, and the runner's own env keeps the real one",
+    () => {
+      const childEnv = buildOpencodeServerEnv({ PATH: '/pnpm:/usr/bin' }, {});
+      expect(childEnv.PATH).toBe(`${CODEX_SHIM_DIR}:/pnpm:/usr/bin`);
+      expect(process.env.PATH?.split(':')).not.toContain(CODEX_SHIM_DIR);
+    },
+  );
+});
+
 describe('buildOpencodeServerEnv — child env hygiene (F2)', () => {
   // Snapshot/restore the secret keys we set so we never leak into sibling test
   // files (process.env is process-global under `bun test`).
@@ -275,7 +293,9 @@ describe('buildOpencodeServerEnv — child env hygiene (F2)', () => {
     const config = { permission: 'allow', model: 'anthropic/claude-opus-4-8' };
     const childEnv = buildOpencodeServerEnv(base, config);
 
-    expect(childEnv.PATH).toBe('/usr/bin:/bin');
+    // Kept, behind the peer codex rotation shim where the skills mount provides it.
+    expect(childEnv.PATH).toBe(withCodexShimPath('/usr/bin:/bin'));
+    expect(childEnv.PATH?.endsWith('/usr/bin:/bin')).toBe(true);
     expect(childEnv.HOME).toBe('/home/agent');
     expect(childEnv.NANOCLAW_IS_MAIN).toBe('1');
     expect(childEnv.OPENCODE_MODEL).toBe('anthropic/claude-opus-4-8');
@@ -411,5 +431,41 @@ describe('comment-rule feedback plugin', () => {
     expect(commentRulePlugins(splitExcludedPlugins(['bootstrap/plugins/comment-rule']))).toEqual([]);
     expect(commentRulePlugins(splitExcludedPlugins(['bootstrap']))).toEqual([]);
     expect(commentRulePlugins(splitExcludedPlugins(['bootstrap/plugins/wwbd']))).toEqual([COMMENT_RULE_PLUGIN]);
+  });
+});
+
+describe('a required OpenCode plugin must leave its load receipt', () => {
+  it('requires both guards, and the opt-out drops only the destructive-action guard', () => {
+    expect(requiredOpenCodePluginReceipts()).toEqual(['managed-git-guard', 'nanoclaw-guard']);
+    process.env.OPENCODE_ALLOW_UNGUARDED = '1';
+    expect(requiredOpenCodePluginReceipts()).toEqual(['managed-git-guard']);
+  });
+
+  it('names each receipt that is missing', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oc-receipts-'));
+    try {
+      expect(missingPluginReceipts(dir, ['managed-git-guard', 'nanoclaw-guard'])).toEqual([
+        'managed-git-guard',
+        'nanoclaw-guard',
+      ]);
+      fs.writeFileSync(path.join(dir, 'nanoclaw-guard'), 'x');
+      expect(missingPluginReceipts(dir, ['managed-git-guard', 'nanoclaw-guard'])).toEqual(['managed-git-guard']);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('the managed-Git plugin writes its receipt when it builds its hooks', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oc-receipts-'));
+    const saved = process.env.NANOCLAW_OPENCODE_PLUGIN_RECEIPTS;
+    process.env.NANOCLAW_OPENCODE_PLUGIN_RECEIPTS = dir;
+    try {
+      await ManagedGitWorktreeGuard();
+      expect(missingPluginReceipts(dir, ['managed-git-guard'])).toEqual([]);
+    } finally {
+      if (saved === undefined) delete process.env.NANOCLAW_OPENCODE_PLUGIN_RECEIPTS;
+      else process.env.NANOCLAW_OPENCODE_PLUGIN_RECEIPTS = saved;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

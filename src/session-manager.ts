@@ -1267,7 +1267,7 @@ function dueAdmissionRows(mailbox: NanoclawMailboxSession, withheld: ReadonlySet
   // deferred rows with their original triggers, so this defers rather than drops.
   if (mailbox.readRepoIngressFence()?.state === 'active') return [];
 
-  // Legacy rows were stored trigger=1: demote only unpaired live tasks before selecting due work.
+  // Demote live task rows with no pending recall (legacy trigger=1 rows, or a partner that ended) so they re-pair.
   mailbox.demoteUnpairedLegacyTasks();
 
   return mailbox.listDueAdmissionRows().filter((task) => !withheld.has(task.id));

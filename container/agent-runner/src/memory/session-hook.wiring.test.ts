@@ -9,7 +9,7 @@ describe('provider memory lifecycle wiring', () => {
       fs.readFileSync(path.join(import.meta.dir, '..', 'providers', `${name}.ts`), 'utf-8'),
     ]),
   );
-  const runnerSource = fs.readFileSync(path.join(import.meta.dir, '..', 'index.ts'), 'utf-8');
+  const runnerSource = fs.readFileSync(path.join(import.meta.dir, '..', 'runner-main.ts'), 'utf-8');
   const providerTypesSource = fs.readFileSync(path.join(import.meta.dir, '..', 'providers', 'types.ts'), 'utf-8');
   const codexAppServerSource = fs.readFileSync(
     path.join(import.meta.dir, '..', 'providers', 'codex-app-server.ts'),

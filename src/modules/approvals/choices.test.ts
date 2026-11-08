@@ -295,6 +295,18 @@ describe('choice receipts', () => {
     expect(cardEdits.at(-1)!.split('\n\n').at(-1)!.length).toBeLessThanOrEqual(98);
   });
 
+  it("fits a Discord edit, question intact, whatever the approver's name", async () => {
+    await upsertUser({ id: USER, kind: 'slack-fixture', display_name: 'N'.repeat(200), created_at: now() });
+    const question = 'q'.repeat(1590);
+    const approval = await seedApproval({ title: 't'.repeat(140), question });
+    handler.mockResolvedValue(fakeSession('sess-target'));
+    await resolveChoice(approval, 'ship-a', USER);
+    const edit = cardEdits.at(-1)!;
+    expect(edit.length).toBeLessThanOrEqual(1900);
+    expect(edit.split('\n\n')[1]).toBe(question);
+    expect(edit.split('\n\n').at(-1)).toMatch(/^✅ Ship A — N+…$/);
+  });
+
   it('records the holds a warning card showed in its receipt, sorted, beside the pinned head', async () => {
     const approval = await seedApproval({
       payload: JSON.stringify({

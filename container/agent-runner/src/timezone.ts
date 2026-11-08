@@ -31,9 +31,8 @@ export function resolveTimezone(tz: string): string {
 }
 
 /**
- * Convert a UTC ISO timestamp to a localized display string.
- * Uses the Intl API (no external dependencies).
- * Falls back to UTC if the timezone is invalid.
+ * Convert a UTC ISO timestamp to a display string that names its zone ("Oct 29, 2026, 3:14 PM EDT"; a zone with no
+ * abbreviation reads "GMT+5:30"). Falls back to UTC if the timezone is invalid.
  */
 export function formatLocalTime(utcIso: string, timezone: string): string {
   const date = new Date(utcIso);
@@ -45,18 +44,25 @@ export function formatLocalTime(utcIso: string, timezone: string): string {
     hour: 'numeric',
     minute: '2-digit',
     hour12: true,
+    timeZoneName: 'short',
   });
 }
 
 /**
- * Full weekday-qualified wall clock ("Monday, January 5, 2026 at 11:30 AM") for a task run's `current_time`; an
- * invalid TZ renders UTC. Container-only on purpose: nothing on the host renders this shape.
+ * Full weekday-qualified wall clock ("Monday, January 5, 2026 at 11:30 AM EST") for a task run's `current_time`; an
+ * invalid TZ renders UTC. Container-only on purpose: nothing on the host renders this shape. Spelled out field by
+ * field because Intl rejects `timeZoneName` alongside `dateStyle`/`timeStyle`.
  */
 export function formatLocalDateTimeFull(date: Date, timezone: string): string {
   return date.toLocaleString('en-US', {
     timeZone: resolveTimezone(timezone),
-    dateStyle: 'full',
-    timeStyle: 'short',
+    weekday: 'long',
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+    timeZoneName: 'short',
   });
 }
 

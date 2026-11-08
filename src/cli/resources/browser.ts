@@ -48,12 +48,16 @@ registerResource({
     finish: {
       access: 'open',
       description:
-        "After the owner says they signed in: save that browser's session to /workspace/browser-state/<site>.json and close it. Then `agent-browser state load <that path>`, and check you landed signed in.",
+        "After the owner says they signed in: save that browser's session to /workspace/browser-state/<site>.json (/workspace/browser-state-private/<site>.json when this agent's config widens that site) and close it. Then `agent-browser state load <the path it prints>`, and check you landed signed in.",
       args: [],
       examples: ['ncl browser finish'],
       handler: async (_args, ctx) => finishBrowserTakeover(agentSession(ctx).sessionId),
-      formatHuman: (data) =>
-        `Saved. Run: agent-browser state load ${(data as { path: string }).path} — it is a live login shared with your workgroup's agents; never print, copy or commit it.`,
+      formatHuman: (data) => {
+        const { path, privateToAgent } = data as { path: string; privateToAgent?: true };
+        return privateToAgent
+          ? `Saved. Run: agent-browser state load ${path} — it is a live login that also holds an identity provider's sign-in, approved for this agent alone; never print, copy or commit it.`
+          : `Saved. Run: agent-browser state load ${path} — it is a live login shared with your workgroup's agents; never print, copy or commit it.`;
+      },
     },
   },
 });

@@ -4,6 +4,7 @@
  */
 import { registerDeliveryAction } from '../../delivery.js';
 import { unguarded } from '../../guard/index.js';
+import { handleClaudeAccountExhausted } from './claude-account.js';
 import { handleCodexAccountExhausted } from './codex-account.js';
 import { handleProviderUnavailable } from './handler.js';
 import { handleProviderRetryPrimary } from './retry-primary.js';
@@ -21,9 +22,14 @@ const PROVIDER_RETRY_PRIMARY_ACTION = unguarded(
 registerDeliveryAction('provider_retry_primary', handleProviderRetryPrimary, PROVIDER_RETRY_PRIMARY_ACTION);
 
 const CODEX_ACCOUNT_EXHAUSTED_ACTION = unguarded(
-  'reports that one of the calling session own mounted Codex accounts hit its quota; the handler only marks that account for an hour so new containers start on the next one, and the runner still rotates on its own if the mark is wrong',
+  'reports that one of the calling session own mounted Codex accounts hit its quota; the handler only marks that account until its reported reset (at most a week) or for an hour, so new containers start on the next one, and the runner still rotates on its own if the mark is wrong',
 );
 registerDeliveryAction('codex_account_exhausted', handleCodexAccountExhausted, CODEX_ACCOUNT_EXHAUSTED_ACTION);
+
+const CLAUDE_ACCOUNT_EXHAUSTED_ACTION = unguarded(
+  'reports that one of the calling session own forwarded Claude OAuth tokens hit an account-wide limit; the handler only marks that token, when the group still forwards it and for at most a week, so new containers start on a later slot, and the runner still rotates through every slot if the mark is wrong',
+);
+registerDeliveryAction('claude_account_exhausted', handleClaudeAccountExhausted, CLAUDE_ACCOUNT_EXHAUSTED_ACTION);
 
 /** Strictly weaker than `provider_unavailable`: it can only clear a window older than the reported turn. */
 const PROVIDER_TURN_COMPLETED_ACTION = unguarded(

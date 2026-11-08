@@ -61,7 +61,7 @@ export const BRIDGE_SCRIPT = String.raw`
   const slots = {};
   const sources = {};
   const keep = [];
-  let room = null, live = null, pieces = [], delegations = [];
+  let room = null, live = null, pieces = [], delegations = [], voice = null;
   // Chrome feeds a remote WebRTC stream into Web Audio only while a media element is playing it, muted or not.
   const play = (stream) => { const el = new Audio(); el.muted = true; el.srcObject = stream; el.play().catch(() => {}); keep.push(el); };
   const freeSlot = () => { const used = new Set(Object.values(slots)); for (let s = 0; s < SLOTS - 1; s++) if (!used.has(s)) return s; return -1; };
@@ -83,6 +83,8 @@ export const BRIDGE_SCRIPT = String.raw`
       });
       room.on('trackUnsubscribed', (t, p, participant) => detach(participant.identity));
       room.on('participantDisconnected', (participant) => detach(participant.identity));
+      // LiveKit sends this once a person's copy of the track is connected, so what the voice says from then on is heard.
+      room.on(L.RoomEvent.LocalTrackSubscribed, (pub) => { if (pub.trackName === 'voice') voice = 'heard'; });
       await room.connect(roomUrl, token, { autoSubscribe: true });
       return true;
     },
@@ -102,13 +104,14 @@ export const BRIDGE_SCRIPT = String.raw`
         const out = ctx.createMediaStreamDestination();
         ctx.createMediaStreamSource(e.streams[0]).connect(out);
         await room.localParticipant.publishTrack(out.stream.getAudioTracks()[0], { source: L.Track.Source.Microphone, name: 'voice', dtx: false });
+        voice ??= 'published';
       };
       await pc.setLocalDescription(await pc.createOffer());
       return pc.localDescription.sdp;
     },
     async liveAnswer(sdp) { await live.setRemoteDescription({ type: 'answer', sdp }); return true; },
     collect() {
-      const out = { frames, pieces, delegations, slots: { ...slots }, live: live ? live.connectionState : null, room: room ? room.state : null, people: Object.keys(sources) };
+      const out = { frames, pieces, delegations, slots: { ...slots }, live: live ? live.connectionState : null, voice, room: room ? room.state : null, people: Object.keys(sources) };
       frames = []; pieces = []; delegations = [];
       return out;
     },

@@ -78,7 +78,8 @@ export const CENTRAL_DB_RAW_TRANSACTION_FILES: readonly string[] = ['src/db/migr
 
 /**
  * Raw transactions on a better-sqlite3 handle that is NOT the central DB —
- * session mailboxes (inbound.db/outbound.db), the per-agent archive
+ * session mailboxes (inbound.db/outbound.db), the message archive
+ * (archive.db) and its per-workgroup search index, the per-agent archive
  * projections, and the mnemon ingest database. The receiver type is identical,
  * so the checker cannot separate them from the central sites; the split is
  * recorded here instead of pretending one list means one database.
@@ -89,6 +90,7 @@ export const CENTRAL_DB_RAW_TRANSACTION_FILES: readonly string[] = ['src/db/migr
  * cannot appear anywhere without a reviewer seeing it.
  */
 export const OTHER_SQLITE_RAW_TRANSACTION_FILES: readonly string[] = [
+  'src/archive-search-index.ts',
   'src/db/migrations/019-mnemon-ingest-db.ts',
   'src/db/migrations/021-mnemon-recall-feedback.ts',
   'src/db/migrations/022-mnemon-daemon-state.ts',
@@ -97,6 +99,7 @@ export const OTHER_SQLITE_RAW_TRANSACTION_FILES: readonly string[] = [
   'src/mailbox/sqlite/index.ts',
   'src/mailbox/sqlite/session-db.ts',
   'src/mailbox/sqlite/tasks.ts',
+  'src/message-archive.ts',
   'src/modules/mailbox/ops/admission.ts',
   'src/modules/mailbox/ops/continuation.ts',
   'src/modules/mailbox/ops/fence.ts',

@@ -5,6 +5,7 @@ import type { Duplex } from 'stream';
 import { PREVIEW_ORIGIN_SUFFIX, PREVIEW_PORT } from '../../config.js';
 import { log } from '../../log.js';
 import { openContainerLoopback } from '../browser-takeover/bridge.js';
+import { handleMobileRequest, isMobileHost } from '../mobile/http.js';
 import { handleGroupCallRequest, handleGroupCallUpgrade } from '../voice-call/group/http.js';
 import { handleVoiceCallRequest } from '../voice-call/http.js';
 import { PREVIEW_ID_RE, resolvePreview } from './service.js';
@@ -166,6 +167,10 @@ export function createPreviewProxy(deps: PreviewProxyDeps = defaultDeps): http.S
   };
 
   const server = http.createServer((req, res) => {
+    if (isMobileHost(req.headers.host)) {
+      handleMobileRequest(req, res);
+      return;
+    }
     const id = previewIdFromHost(req.headers.host);
     if (id && (handleVoiceCallRequest(id, req, res) || handleGroupCallRequest(id, req, res))) return;
     const target = targetFor(req);

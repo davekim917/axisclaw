@@ -4,6 +4,7 @@ import os from 'os';
 import path from 'path';
 
 import { effectiveDockerArgBeforeFinalRun } from '../../../../setup/lib/dockerfile-version.js';
+import { CODEX_SHIM_DIR } from '../codex-shim-path.js';
 
 // Mock the SDK before importing claude.ts, so sdkQuery is interceptable.
 // We capture the options passed to sdkQuery to verify sticky config behavior.
@@ -627,6 +628,22 @@ describe('subagent model env', () => {
     // And a family the spawn env did not carry is not invented here either.
     expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBeUndefined();
   });
+});
+
+describe('peer codex rotation shim', () => {
+  // The shim lives on the container's skills mount, so this runs only where that mount exists.
+  (fs.existsSync(path.join(CODEX_SHIM_DIR, 'codex')) ? it : it.skip)(
+    "the agent's shells resolve codex through the rotation shim, and the runner's own env keeps the real one",
+    () => {
+      capturedSdkOptions = null;
+      mockSdkQuery.mockClear();
+      const provider = makeClaudeProvider({ env: { PATH: '/pnpm:/usr/bin' } });
+      provider.query({ prompt: 'hi', cwd: '/tmp' });
+      const env = capturedSdkOptions?.env as Record<string, string | undefined>;
+      expect(env.PATH).toBe(`${CODEX_SHIM_DIR}:/pnpm:/usr/bin`);
+      expect(process.env.PATH?.split(':')).not.toContain(CODEX_SHIM_DIR);
+    },
+  );
 });
 
 describe('container GitNexus retirement', () => {

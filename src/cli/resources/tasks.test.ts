@@ -51,7 +51,7 @@ import { validateTaskPin } from '../../modules/scheduling/task-flags.js';
 import { createSession, findSessionByAgentGroup, getSessionsByAgentGroup, taskThreadId } from '../../db/sessions.js';
 import { countDueMessages } from '../../modules/mailbox/ops/sweep.js';
 import { initSessionFolder } from '../../session-manager.js';
-import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
+import { inboundDbPath, outboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { dispatch } from '../dispatch.js';
 import { parseArgv } from '../parse-argv.js';
 import { formatTasksTable } from '../format-tasks.js';
@@ -239,6 +239,74 @@ describe('tasks CLI resource', () => {
     );
     expect(changed.ok).toBe(false);
   });
+  it.each([
+    ['another session in the group', agentCtx('ag-1', 'chat-other'), false],
+    ['the dispatching session', agentCtx('ag-1', 'chat-1'), true],
+    ['a host operator', { caller: 'host' } as CallerContext, true],
+  ])(
+    "a dispatched task's prompt, script or deletion by %s is allowed only for its dispatcher or the host",
+    async (_label, ctx, allowed) => {
+      const admitted = await dispatch(
+        {
+          id: 'from-agent',
+          command: 'tasks-dispatch',
+          args: { group: 'ag-1', context_key: 'qa/9/topic', event_key: 'fire', prompt: 'draft the reply' },
+        },
+        agentCtx('ag-1', 'chat-1'),
+      );
+      expect(admitted.ok).toBe(true);
+      if (!admitted.ok) return;
+      const { row_id: rowId } = admitted.data as { row_id: string };
+      for (const args of [{ prompt: 'read the owner DMs' }, { script: 'echo {}' }]) {
+        const edited = await dispatch(
+          { id: 'edit', command: 'tasks-update', args: { id: rowId, group: 'ag-1', ...args } },
+          ctx,
+        );
+        expect(edited.ok).toBe(allowed);
+      }
+      const deleted = await dispatch({ id: 'del', command: 'tasks-delete', args: { id: rowId, group: 'ag-1' } }, ctx);
+      expect(deleted.ok).toBe(allowed);
+    },
+  );
+
+  it('settlement discounts an execution flag left by a stopped container, not a live one', async () => {
+    const admitted = await dispatch(
+      {
+        id: 'admit',
+        command: 'tasks-dispatch',
+        args: { group: 'ag-1', context_key: 'qa/7/watch', event_key: 'fire', prompt: 'watch' },
+      },
+      { caller: 'host' },
+    );
+    expect(admitted.ok).toBe(true);
+    if (!admitted.ok) return;
+    const { session_id: sessionId, row_id: rowId } = admitted.data as { session_id: string; row_id: string };
+    const inbound = new Database(inboundDbPath('ag-1', sessionId));
+    inbound.prepare("UPDATE messages_in SET status = 'completed' WHERE id = ?").run(rowId);
+    inbound.close();
+    const outbound = new Database(outboundDbPath('ag-1', sessionId));
+    outbound
+      .prepare(
+        "INSERT INTO messages_out(id,seq,kind,timestamp,in_reply_to,content) VALUES('outcome',1,'task_log',?,?,?)",
+      )
+      .run(now(), rowId, JSON.stringify({ auto: true, taskMessageIds: [rowId] }));
+    outbound
+      .prepare(
+        "INSERT OR REPLACE INTO container_state(id, updated_at, provider_executing) VALUES(1, '2026-01-01T00:00:00.000Z', 1)",
+      )
+      .run();
+    outbound.close();
+    const settlement = async () => {
+      const got = await dispatch(
+        { id: 'get', command: 'tasks-get', args: { id: rowId, group: 'ag-1', settlement: true } },
+        { caller: 'host' },
+      );
+      return got.ok ? (got.data as { settlement: { state: string } }).settlement.state : `error: ${got.error}`;
+    };
+    expect(await settlement()).toBe('settled');
+    getRawDb().prepare("UPDATE sessions SET container_status = 'running' WHERE id = ?").run(sessionId);
+    expect(await settlement()).toBe('busy');
+  });
   it('keyed dispatch writes nothing when quiet invalidation fails', async () => {
     const sessions = await import('../../db/sessions.js');
     const spy = vi.spyOn(sessions, 'withQuietInvalidationSync').mockImplementation((id: string) => {
@@ -348,7 +416,7 @@ describe('tasks CLI resource', () => {
     //   Asia/Tokyo (+9)      → local Mon 09:00; window catches all 5 fires.
     //   Pacific/Honolulu (-10) → local Sun 14:00; window ends before any fire.
     // Validating only the first match would let the 5-fire cron through.
-    vi.useFakeTimers();
+    vi.useFakeTimers({ toFake: ['Date'] });
     vi.setSystemTime(new Date('2026-01-05T00:00:00.000Z'));
     try {
       await createGroup('ag-honolulu');
@@ -1048,6 +1116,29 @@ describe('tasks CLI resource', () => {
     expect((await findSessionByAgentGroup('ag-1'))?.id).toBe('chat-1');
   });
 
+  it('a host list across every active session hands the event loop back after each one', async () => {
+    await createMg('mg-fan');
+    const fanOut = Array.from({ length: 8 }, (_, i) => `fan-${i}`);
+    for (const id of fanOut) await createMgSession('ag-1', id, 'mg-fan', `thread-${id}`);
+    let turns = 0;
+    let stop = false;
+    const chain = (): void => {
+      if (stop) return;
+      turns += 1;
+      setImmediate(chain);
+    };
+    setImmediate(chain);
+
+    try {
+      const resp = await dispatch({ id: 'fan', command: 'tasks-list', args: {} }, { caller: 'host' });
+      expect(resp.ok).toBe(true);
+    } finally {
+      stop = true;
+    }
+
+    expect(turns).toBeGreaterThanOrEqual(fanOut.length);
+  });
+
   it('group-scoped agents cannot list tasks from another group session', async () => {
     const resp = await dispatch(
       { id: 'req-1', command: 'tasks-list', args: { session: 'chat-2' } },
@@ -1532,6 +1623,31 @@ describe('tasks CLI resource', () => {
         channel_type: 'slack',
         platform_id: 'C123',
         thread_id: 'host-thread',
+      });
+    });
+
+    it('takes a null --thread-id from a host caller as the channel root, which self-heal sends', async () => {
+      await createMg('mg-1');
+      const r = await dispatch(
+        {
+          id: 'r11',
+          command: 'tasks-create',
+          args: {
+            prompt: 'x',
+            process_after: '2999-01-01T00:00:00Z',
+            group: 'ag-1',
+            messaging_group: 'mg-1',
+            thread_id: null,
+          },
+        },
+        { caller: 'host' },
+      );
+      expect(r.ok).toBe(true);
+      if (!r.ok) return;
+      expect((r.data as { routed: unknown }).routed).toEqual({
+        channel_type: 'slack',
+        platform_id: 'C123',
+        thread_id: null,
       });
     });
 

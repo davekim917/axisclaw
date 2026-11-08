@@ -985,6 +985,47 @@ describe('branch clone checkouts', () => {
     expect(fs.existsSync(checkoutInheritedTagsPath(refused[0]!.checkout))).toBe(true);
   });
 
+  describe('a pass with a proof worker', () => {
+    function dirtyClone(threadId: string): string {
+      const { checkout } = cloneCheckout(canonicalFixture('repo-a'), threadId, 'repo-a@feat', 'feat');
+      fs.writeFileSync(path.join(checkout, 'scratch.txt'), 'uncommitted\n');
+      age(checkout);
+      state.rows = [closedRow(threadId)];
+      return checkout;
+    }
+
+    it('takes a failed proof from the worker and runs no git proof on the main thread', async () => {
+      const checkout = dirtyClone('p1725-refused');
+      const mainThreadProof = vi.spyOn(disposability, 'proveCheckoutDisposable');
+      const proofs = { prove: vi.fn(async () => ({ ok: false, reason: 'dirty' })), close: vi.fn() };
+      try {
+        await runWorktreeCleanupOnce(state.dataDir, proofs);
+        expect(proofs.prove).toHaveBeenCalledWith(expect.objectContaining({ path: checkout }));
+        expect(mainThreadProof).not.toHaveBeenCalled();
+      } finally {
+        mainThreadProof.mockRestore();
+      }
+      expect(proofs.close).toHaveBeenCalledOnce();
+      expect(fs.existsSync(checkout)).toBe(true);
+    });
+
+    it.each([
+      ['says the clone is disposable', { ok: true, reason: 'clean-and-pushed' }],
+      ['gives no answer', null],
+    ])('still proves under the lock when the worker %s, so only that proof can delete', async (_name, answer) => {
+      const checkout = dirtyClone(`p1725-${answer ? 'passed' : 'silent'}`);
+      const mainThreadProof = vi.spyOn(disposability, 'proveCheckoutDisposable');
+      try {
+        await runWorktreeCleanupOnce(state.dataDir, { prove: async () => answer, close: vi.fn() });
+        expect(mainThreadProof).toHaveBeenCalledOnce();
+      } finally {
+        mainThreadProof.mockRestore();
+      }
+      expect(fs.existsSync(checkout)).toBe(true);
+      expect(state.trashed).toEqual([]);
+    });
+  });
+
   it(
     'reclaims a clean pushed clone inside an open topic, one checkout at a time, and refuses what is live (#1400)',
     { timeout: 30_000 },

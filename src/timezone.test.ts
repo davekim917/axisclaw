@@ -42,6 +42,16 @@ describe('formatLocalTime', () => {
     expect(result).toContain('12:00');
     expect(result).toContain('PM');
   });
+
+  it.each([
+    ['2026-02-04T18:30:00.000Z', 'America/New_York', 'Feb 4, 2026, 1:30 PM EST'],
+    ['2026-10-29T18:01:00.000Z', 'America/New_York', 'Oct 29, 2026, 2:01 PM EDT'],
+    ['2026-10-29T18:01:00.000Z', 'UTC', 'Oct 29, 2026, 6:01 PM UTC'],
+    ['2026-10-29T18:01:00.000Z', 'Asia/Kolkata', 'Oct 29, 2026, 11:31 PM GMT+5:30'],
+    ['2026-10-29T18:01:00.000Z', 'IST-2', 'Oct 29, 2026, 6:01 PM UTC'],
+  ])('labels %s in %s with its zone', (iso, tz, expected) => {
+    expect(formatLocalTime(iso, tz)).toBe(expected);
+  });
 });
 
 describe('isValidTimezone', () => {

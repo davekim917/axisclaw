@@ -37,6 +37,29 @@ operator's `config.toml`, `hooks.json`, `hooks/` or `AGENTS.md`, so none can
 plant a hook a host-side `codex` run would execute. OpenCode's default-model
 config is staged into a session-private XDG tree.
 
+No codex home carries the destructive-action guard chain either. The image
+installs it root-owned at `/etc/codex/hooks.json`, beside a `requirements.toml`
+that pins `[features] hooks = true` (sources: `container/codex-system/`). Codex
+reads that system layer under every `CODEX_HOME` and dispatches it as managed,
+with no per-home trust row. So `--disable hooks`, `-c features.hooks=false`, an
+edited or emptied home `hooks.json`, a user or project `enabled = false`, or a
+copied `auth.json` in a fresh home all still run the guard. The hook command
+starts bun by absolute path with a fixed `--config` and unsets bun's preload and
+inspector variables, and the runner loads guard cores only from their installed
+paths (`guard-core-paths.ts`). Each spawn's `hooks/list` check refuses a
+provider=codex session, and a peer runtime fails closed, when the system chain
+is missing or not dispatchable.
+
+What this does not close: the agent can read every `auth.json`, so it can call
+the model API with the token from its own code, outside codex. Codex runs hook
+commands as `<login shell> -c` under the caller's environment, so bash startup
+variables (`BASH_ENV`, `SHELLOPTS` with `PS4`, exported functions) and
+`LD_PRELOAD` still run code before the guard. The env scrub in the hook command
+is a list of names, not an allowlist. Closing these needs a credential the agent
+cannot read. Plugin hooks (workflow-agents' `codex-guard.sh` among them) stay
+in each home's user layer: they are workflow aids, and the agent can remove
+them.
+
 One READ path is deliberately wider. A `provider: codex` group also gets its
 resolved host Codex home mounted READ-ONLY at `/home/node/.codex-host-primary`,
 because `refreshCodexAuthFromHost` re-reads `auth.json` from it when the host
@@ -124,6 +147,16 @@ own folder under `groups/`. `agent_groups.workgroup_id` determines whether
 their canonical memory and archive are shared or isolated.
 
 ---
+
+## Bind sources
+
+An agent can plant a symlink in any tree it can write, and Docker follows a symlinked bind source as root. So `buildMounts` ends with one pass over every mount (`pinMountSources`, `src/mount-source-gate.ts`), whichever site added it:
+
+- **Agent-writable trees** are the spawn's writable mounts, plus the group's own and sibling folders and the workgroup tree. A sibling's container writes those even when this spawn does not mount them.
+- A source inside those trees must resolve inside them, and is bound by its resolved path, so a later swap of the link moves nothing. Anything else is dropped with a WARN, and the spawn continues.
+- A real source swapped for a link after that pass aborts the spawn at the last check before `docker run` (log: `Spawn stage timing` `stage="mount-sources-pinned"`). Only runc's own resolution, a window of milliseconds, stays open.
+
+Two rules sit beside it. A link into a sibling's folder mounts read-only, as does a link into the workgroup tree in memory-only mode, which withholds that tree, and a link never reaches a group folder or a `container.json`. A path bound read-only over a writable parent (`plugins/`, for one) stays read-only by every other route.
 
 ## How to Decide
 

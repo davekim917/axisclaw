@@ -27,6 +27,7 @@ export const GROUP_SCOPE_RESOURCES = new Set([
   'browser',
   'preview',
   'voice',
+  'mobile',
 ]);
 
 export type Access = 'open' | 'approval' | 'hidden';
@@ -57,6 +58,11 @@ export type CommandDef<TArgs = unknown, TData = unknown> = {
    * that's how general commands like `help` stay reachable in group scope.
    */
   resource?: string;
+  /**
+   * This one verb is open under `cli_scope: 'group'` though its resource is not on the whitelist. Only for a verb that
+   * takes its target from the calling session, so that there is no scope for the guard to check.
+   */
+  groupScopeVerb?: boolean;
   /**
    * Set on the auto-generated `list` / `get` handlers (see `registerResource`).
    * These return raw DB rows that carry the resource's `scopeField`, so the

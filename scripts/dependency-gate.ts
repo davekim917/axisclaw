@@ -30,6 +30,8 @@ export interface DependencyFiles {
   bunLock: string | null;
   remotionPackageJson: string | null;
   remotionLock: string | null;
+  mobilePackageJson: string | null;
+  mobileLock: string | null;
   dockerfile: string | null;
   updateSources: string | null;
 }
@@ -41,6 +43,8 @@ export const DEPENDENCY_FILE_PATHS: Record<keyof DependencyFiles, string> = {
   bunLock: 'container/agent-runner/bun.lock',
   remotionPackageJson: 'container/remotion/package.json',
   remotionLock: 'container/remotion/pnpm-lock.yaml',
+  mobilePackageJson: 'mobile/package.json',
+  mobileLock: 'mobile/package-lock.json',
   dockerfile: 'container/Dockerfile',
   updateSources: 'container/update-sources.json',
 };
@@ -70,6 +74,23 @@ interface PnpmLock {
   packages?: Record<string, unknown>;
   snapshots?: Record<string, { dependencies?: Record<string, string>; optionalDependencies?: Record<string, string> }>;
   patchedDependencies?: Record<string, string | { hash?: string }>;
+}
+
+type NpmEntry = {
+  version?: string;
+  dependencies?: Record<string, string>;
+  devDependencies?: Record<string, string>;
+  optionalDependencies?: Record<string, string>;
+  peerDependencies?: Record<string, string>;
+};
+
+/** Node's lookup over package-lock install paths: the nearest `node_modules/<dep>` walking up from `key`. */
+function npmResolve(entries: Record<string, NpmEntry>, key: string, dep: string): string | null {
+  for (let scope = key; ; scope = scope.slice(0, Math.max(scope.lastIndexOf('/node_modules/'), 0))) {
+    const candidate = `${scope ? `${scope}/` : ''}node_modules/${dep}`;
+    if (entries[candidate]) return candidate;
+    if (!scope) return null;
+  }
 }
 
 /** Package names in a bun.lock key: `a/@s/b/c` is a → @s/b → c. */
@@ -141,7 +162,7 @@ function baseImages(dockerfile: string): string[] {
 }
 
 /** Where a version is locked. Each lockfile is its own dependency tree; pooling names across trees conflates them. */
-type Source = 'host' | 'runner' | 'remotion' | 'docker';
+type Source = 'host' | 'runner' | 'remotion' | 'mobile' | 'docker';
 
 export interface Locked {
   versions: Map<Source, Map<string, Set<string>>>;
@@ -240,6 +261,35 @@ export function lockedVersions(
       }
     }
   }
+  if (files.mobileLock) {
+    const entries = (JSON.parse(files.mobileLock) as { packages?: Record<string, NpmEntry> }).packages ?? {};
+    const nodeOf = (key: string): string | null => {
+      const version = entries[key]?.version;
+      return key && version
+        ? `${key.slice(key.lastIndexOf('node_modules/') + 'node_modules/'.length)}@${version}`
+        : null;
+    };
+    for (const [key, entry] of Object.entries(entries)) {
+      const node = key === '' ? importerNode('') : nodeOf(key);
+      const spec = node ? splitSpec(node) : null;
+      if (!node || (key !== '' && !spec)) continue;
+      if (spec) add(tree(locked.versions, 'mobile'), spec[0], spec[1]);
+      tree(locked.graph, 'mobile').set(node, tree(locked.graph, 'mobile').get(node) ?? new Set());
+      for (const dep of Object.keys({
+        ...entry.dependencies,
+        ...(key === '' ? entry.devDependencies : {}),
+        ...entry.optionalDependencies,
+        ...entry.peerDependencies,
+      })) {
+        if (spec) add(tree(locked.dependsOn, 'mobile'), spec[0], dep);
+        const target = nodeOf(npmResolve(entries, key, dep) ?? '');
+        if (!target) continue;
+        add(tree(locked.graph, 'mobile'), node, target);
+        // `name@version` unions every copy's edges, so copies that swap resolutions need a node of their own.
+        if (spec) add(tree(locked.graph, 'mobile'), importerNode(`${key}@${spec[1]}`), target);
+      }
+    }
+  }
   if (files.dockerfile) {
     const docker = tree(locked.versions, 'docker');
     for (const { id, version } of dockerPins(files.dockerfile, tools)) add(docker, `docker:${id}`, version);
@@ -250,7 +300,12 @@ export function lockedVersions(
 
 export function directDependencies(files: DependencyFiles): Set<string> {
   const names = new Set<string>();
-  for (const manifest of [files.hostPackageJson, files.runnerPackageJson, files.remotionPackageJson]) {
+  for (const manifest of [
+    files.hostPackageJson,
+    files.runnerPackageJson,
+    files.remotionPackageJson,
+    files.mobilePackageJson,
+  ]) {
     if (!manifest) continue;
     const json = JSON.parse(manifest) as Record<string, Record<string, string> | undefined>;
     for (const field of ['dependencies', 'devDependencies', 'optionalDependencies']) {
@@ -313,7 +368,7 @@ function versionList(versions: Iterable<string>): string {
   return sorted.length > 0 ? sorted.join(',') : 'none';
 }
 
-const SOURCES: Source[] = ['host', 'runner', 'remotion', 'docker'];
+const SOURCES: Source[] = ['host', 'runner', 'remotion', 'mobile', 'docker'];
 
 export function packageChanges(
   base: Locked,

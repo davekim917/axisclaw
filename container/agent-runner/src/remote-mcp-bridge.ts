@@ -5,6 +5,7 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import {
+  type CallToolRequest,
   CallToolRequestSchema,
   CompleteRequestSchema,
   GetPromptRequestSchema,
@@ -14,6 +15,8 @@ import {
   ListToolsRequestSchema,
   ReadResourceRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
+
+import { appendLedgerEntry } from './source-ledger.js';
 
 const DEFAULT_VERSION = '1.0.0';
 
@@ -54,13 +57,54 @@ function errorText(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-async function main(): Promise<void> {
-  const name = remoteName();
-  const url = remoteUrl();
+/** One tool call on the remote, with `timeoutMs` in place of the MCP SDK's 60-second default when it is given. */
+export async function callRemoteTool(
+  client: Pick<Client, 'callTool'>,
+  params: CallToolRequest['params'],
+  timeoutMs?: number,
+): Promise<Awaited<ReturnType<Client['callTool']>>> {
+  try {
+    return await client.callTool(params, undefined, timeoutMs === undefined ? undefined : { timeout: timeoutMs });
+  } catch (err) {
+    return {
+      content: [{ type: 'text' as const, text: `Remote MCP error: ${errorText(err)}` }],
+      isError: true,
+    };
+  }
+}
+
+/**
+ * Records one call of a bridged data source. `origin` is the system the bridge itself was configured to reach, so the
+ * host can refuse a footer for any system other than the group's own.
+ */
+export function recordSourceCall(
+  source: { server: string; origin: string },
+  params: CallToolRequest['params'],
+  isError: boolean,
+): void {
+  appendLedgerEntry({
+    v: 1,
+    ts: new Date().toISOString(),
+    recorder: 'mcp',
+    server: source.server,
+    origin: source.origin,
+    tool: params.name,
+    args: params.arguments ?? {},
+    ok: !isError,
+  });
+}
+
+/** Serves `url`'s Streamable-HTTP MCP on this process's stdio until a signal ends it. */
+export async function bridgeStdioTo(
+  name: string,
+  url: string,
+  headers: HeadersInit | undefined,
+  callTimeoutMs?: number,
+  /** Set only for a data source whose calls a reply's sources footer may name. */
+  source?: { origin: string },
+): Promise<void> {
   const httpTransport = new StreamableHTTPClientTransport(new URL(url), {
-    requestInit: {
-      headers: requestHeaders(),
-    },
+    requestInit: { headers },
   });
   const client = new Client({ name: `${name}-stdio-bridge`, version: DEFAULT_VERSION });
 
@@ -84,14 +128,9 @@ async function main(): Promise<void> {
     server.setRequestHandler(ListToolsRequestSchema, async (request) => client.listTools(request.params));
 
     server.setRequestHandler(CallToolRequestSchema, async (request) => {
-      try {
-        return await client.callTool(request.params);
-      } catch (err) {
-        return {
-          content: [{ type: 'text' as const, text: `Remote MCP error: ${errorText(err)}` }],
-          isError: true,
-        };
-      }
+      const result = await callRemoteTool(client, request.params, callTimeoutMs);
+      if (source) recordSourceCall({ server: name, origin: source.origin }, request.params, result.isError === true);
+      return result;
     });
   }
 
@@ -122,10 +161,14 @@ async function main(): Promise<void> {
     void httpTransport.close().finally(() => process.exit(0));
   });
 
+  log(`${name} bridge ready (${url})`);
+}
+
+async function main(): Promise<void> {
   if (!process.env.HTTPS_PROXY) {
     log('WARN: HTTPS_PROXY not set — remote MCP calls may go out unauthenticated');
   }
-  log(`${name} bridge ready (${url})`);
+  await bridgeStdioTo(remoteName(), remoteUrl(), requestHeaders());
 }
 
 if (import.meta.main) {

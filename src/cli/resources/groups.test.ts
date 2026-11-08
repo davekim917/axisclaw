@@ -1316,6 +1316,31 @@ describe('groups config — the container.json + container_configs dual write ho
     const run = (command: string, args: Record<string, unknown>) =>
       dispatch({ id: `req-${command}`, command, args }, { caller: 'host' });
 
+    it('sets, shows and clears the approvals channel, and refuses a non-Slack bot or a bare channel id', async () => {
+      const { registerSlackBot } = await import('../../channels/slack-mentions.js');
+      registerSlackBot('slack-queue-fixture', { userId: 'U0QBOT', username: 'queue', teamId: 'T0FIXTURE' });
+      const set = { workgroup: 'team', bot: 'slack-queue-fixture', channel: 'slack:C0QUEUE' };
+      expect(await run('groups-config-set-approvals-channel', set)).toMatchObject({ ok: true });
+      expect(await run('groups-config-get', { workgroup: 'team' })).toMatchObject({
+        ok: true,
+        data: { approvals_channel: { channelType: 'slack-queue-fixture', platformId: 'slack:C0QUEUE' } },
+      });
+
+      const notSlack = await run('groups-config-set-approvals-channel', { ...set, bot: 'discord-fixture' });
+      expect(notSlack.ok).toBe(false);
+      expect(JSON.stringify(notSlack)).toMatch(/Slack only/);
+      const bareId = await run('groups-config-set-approvals-channel', { ...set, channel: 'C0QUEUE' });
+      expect(bareId.ok).toBe(false);
+      expect(JSON.stringify(bareId)).toMatch(/slack:<channel-id>/);
+
+      expect(await run('groups-config-set-approvals-channel', { workgroup: 'team', clear: true })).toMatchObject({
+        ok: true,
+      });
+      expect(await run('groups-config-get', { workgroup: 'team' })).toMatchObject({
+        data: { approvals_channel: null },
+      });
+    });
+
     it('grants a tool and an MCP server to every member, and names a member whose own entry shadows it', async () => {
       expect((await run('groups-config-add-tool', { workgroup: 'team', tool: 'flowctl' })).ok).toBe(true);
       const added = await run('groups-config-add-mcp-server', {

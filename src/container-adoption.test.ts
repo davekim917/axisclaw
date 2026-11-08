@@ -266,6 +266,7 @@ import {
   isAdoptedContainer,
   isContainerRunning,
   isContainerStopping,
+  isSessionContainerLive,
   wakeContainer,
   _markPendingAdoptionForTesting,
   _resetAdoptionStateForTesting,
@@ -385,6 +386,10 @@ describe('adoptRunningSessions', () => {
     expect(reconciled).toEqual({ adopted: 1, stopped: 0, pendingClaim: 0, fencedInbound: 0 });
     expect(isContainerRunning('sess-adopt')).toBe(true);
     expect(isAdoptedContainer('sess-adopt')).toBe(true);
+    // The registry answers live even when a session snapshot still reads 'stopped'.
+    expect(isSessionContainerLive({ id: 'sess-adopt', container_status: 'stopped' })).toBe(true);
+    expect(isSessionContainerLive({ id: 'sess-not-adopted', container_status: 'stopped' })).toBe(false);
+    expect(isSessionContainerLive({ id: 'sess-not-adopted', container_status: 'idle' })).toBe(true);
     // `markContainerRunning` landed, and the claim is held by THIS host with
     // the survivor's name as its container_ref.
     expect(await containerStatusOf('sess-adopt')).toBe('running');

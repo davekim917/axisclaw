@@ -713,6 +713,7 @@ describe('storage-manager.ts / storage-activity.ts contain no literal seam call'
   // honest boundary this test draws, not a gap it hides.
   it('storage-manager.ts imports exactly this complete relative-import manifest', () => {
     expect(collectRelativeImportManifest('src/storage-manager.ts')).toEqual({
+      'src/checkout-proof.ts': ['REGENERABLE_SWEEP_DIR_NAMES'],
       'src/config.ts': [
         'CONTAINER_IMAGE',
         'CONTAINER_IMAGE_BASE',
@@ -813,6 +814,8 @@ describe('worktree-cleanup.ts contains no literal seam call, and the only contai
       // #669: cleanup asks Git where a canonical's and its admin dirs' common
       // dir resolves before acting on them. That module imports only safe-git.
       'src/canonical-git-commondir.ts': ['gitCommonDirIs'],
+      'src/checkout-proof-worker.ts': ['openCheckoutProofs'],
+      'src/checkout-proof.ts': ['git', 'isWorktreeLocked', 'provenDisposable', 'safeDirectories'],
       'src/config.ts': ['DATA_DIR', 'GROUPS_DIR'],
       'src/container-mounts.ts': ['runningContainerMounts'],
       'src/container-runner.ts': ['isContainerRunning', 'isContainerSpawning'],
@@ -843,8 +846,8 @@ describe('worktree-cleanup.ts contains no literal seam call, and the only contai
         'withHostRepositoryLock',
         'withRepositoryLifecycleClaims',
       ],
-      'src/safe-git.ts': ['safeGitArgs', 'safeGitEnv', 'safeGitFilterNames'],
-      'src/storage-manager.ts': ['dirSizeBytes', 'REGENERABLE_SWEEP_DIR_NAMES', 'sessionWasReclaimed'],
+      'src/safe-git.ts': ['safeGitArgs', 'safeGitEnv'],
+      'src/storage-manager.ts': ['dirSizeBytes', 'sessionWasReclaimed'],
     });
   });
 });

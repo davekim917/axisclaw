@@ -10,6 +10,7 @@ import {
   createBlockGitCloneHook,
   createEmailGateHook,
 } from '../providers/claude.js';
+import { guardCorePaths } from '../guard-core-paths.js';
 import { createManagedGitMaintenanceHook } from '../managed-git-guard.js';
 import { hookFailureDenyReason } from './hook-failure.js';
 
@@ -89,9 +90,6 @@ type GuardCore = {
   IS_NANOCLAW: boolean;
 };
 
-const DEFAULT_GUARD_CORE_PATH =
-  '/workspace/plugins/bootstrap/plugins/workflow-agents/hooks/guards/block-destructive-core.ts';
-
 type GuardCoreLoad = { ok: true; core: GuardCore } | { ok: false; reason: string };
 
 /** A core missing or mis-typing any export is rejected, never used partially. */
@@ -105,7 +103,7 @@ function validateGuardCore(mod: Record<string, unknown>): string | null {
 }
 
 async function loadGuardCore(): Promise<GuardCoreLoad> {
-  const corePath = process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE || DEFAULT_GUARD_CORE_PATH;
+  const corePath = guardCorePaths().destructive;
   let mod: Record<string, unknown>;
   try {
     mod = (await import(corePath)) as Record<string, unknown>;
@@ -243,8 +241,7 @@ function validateFileProtectionCore(mod: Record<string, unknown>): string | null
 }
 
 async function loadFileProtectionCore(): Promise<FileProtectionLoad> {
-  const guardPath = process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE || DEFAULT_GUARD_CORE_PATH;
-  const fpPath = guardPath.replace(/[^/]+$/, 'file-protection-core.ts');
+  const fpPath = guardCorePaths().destructive.replace(/[^/]+$/, 'file-protection-core.ts');
   let mod: Record<string, unknown>;
   try {
     mod = (await import(fpPath)) as Record<string, unknown>;
@@ -267,13 +264,11 @@ async function runFileProtection(
   toolName: string,
   toolInput: Record<string, unknown>,
 ): Promise<ReturnType<typeof denyDecision> | null> {
-  if (process.env.SKIP_FILE_PROTECTION === '1') return null;
-
   const loaded = await loadFileProtectionCore();
   if (!loaded.ok) {
     if (!FALLBACK_EDIT_TOOLS.has(toolName)) return null;
     return denyDecision(
-      `file-protection unavailable (${loaded.reason}) — denying edit to '${(toolInput.file_path ?? toolInput.path ?? toolName) as string}' for safety. Set SKIP_FILE_PROTECTION=1 to bypass.`,
+      `file-protection unavailable (${loaded.reason}) — denying edit to '${(toolInput.file_path ?? toolInput.path ?? toolName) as string}' for safety.`,
     );
   }
 
@@ -285,18 +280,16 @@ async function runFileProtection(
     blocked = core.checkEditProtection(toolName, toolInput);
   } catch (err) {
     return denyDecision(
-      `file-protection check errored (${err instanceof Error ? err.message : String(err)}) — denying edit for safety. Set SKIP_FILE_PROTECTION=1 to bypass.`,
+      `file-protection check errored (${err instanceof Error ? err.message : String(err)}) — denying edit for safety.`,
     );
   }
   // Only null allows; anything other than a non-empty string is malformed and denies.
   if (blocked === null) return null;
   if (typeof blocked === 'string' && blocked.length > 0) {
-    return denyDecision(
-      `file-protection — '${blocked}' is protected from automated edits. Set SKIP_FILE_PROTECTION=1 to bypass.`,
-    );
+    return denyDecision(`file-protection — '${blocked}' is protected from automated edits.`);
   }
   return denyDecision(
-    `file-protection returned a malformed result (expected a protected-path string or null) — denying edit for safety. Set SKIP_FILE_PROTECTION=1 to bypass.`,
+    `file-protection returned a malformed result (expected a protected-path string or null) — denying edit for safety.`,
   );
 }
 

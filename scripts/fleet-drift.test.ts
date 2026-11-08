@@ -22,6 +22,7 @@ import {
   checkEffectiveStackSafety,
   checkInstructionStack,
   instructionStackBreachKind,
+  checkHostGlobalInstructions,
 } from './fleet-drift.js';
 
 /** Mirrors src/log.ts's `ts()` — local wall-clock, not UTC. Kept TZ-agnostic by building both the log
@@ -116,6 +117,11 @@ describe('isDuplicateBreach (dedup — stands in for a stubbed `gh issue list --
   });
   it('does not suppress a metric with no open issue', () => {
     expect(isDuplicateBreach(openTitles, 'paused_series')).toBe(false);
+  });
+  it('does not let an open issue suppress a metric its name merely starts with', () => {
+    expect(isDuplicateBreach(['fleet-drift: link:.codex-secondary out of band (2026-01-01)'], 'link:.codex')).toBe(
+      false,
+    );
   });
   it('matches on title prefix, not full equality (date suffix varies)', () => {
     expect(isDuplicateBreach(['fleet-drift: disk_growth_bytes out of band (2026-01-01)'], 'disk_growth_bytes')).toBe(
@@ -899,5 +905,62 @@ describe('checkEffectiveStackSafety', () => {
 
     const breaches = checkInstructionStack(containerPath, groupsRoot(), trunkPath);
     expect(breaches.some((b) => b.metric === 'effectiveStack')).toBe(true);
+  });
+});
+
+describe('checkHostGlobalInstructions', () => {
+  function hostHome(rules = '# Rules\n\nBe direct.\n'): string {
+    const home = globalThis.uniqueTmpRoot('fleet-drift-host-home');
+    fs.mkdirSync(path.join(home, '.claude'), { recursive: true });
+    fs.writeFileSync(path.join(home, '.claude', 'CLAUDE.md'), rules);
+    for (const dir of ['.codex', '.codex-secondary', '.codex-credential-only']) {
+      fs.mkdirSync(path.join(home, dir), { recursive: true });
+    }
+    fs.writeFileSync(path.join(home, '.codex.probe.err'), '');
+    fs.symlinkSync(path.join(home, '.claude', 'CLAUDE.md'), path.join(home, '.codex', 'AGENTS.md'));
+    fs.symlinkSync(path.join(home, '.codex', 'AGENTS.md'), path.join(home, '.codex-secondary', 'AGENTS.md'));
+    return home;
+  }
+  const metrics = (home: string) => checkHostGlobalInstructions(home).map((b) => b.metric);
+
+  it('passes when every Codex home that has an AGENTS.md reaches the Claude file, directly or through a chain', () => {
+    expect(checkHostGlobalInstructions(hostHome())).toEqual([]);
+  });
+
+  it('reports a generated copy in place of the link, even with identical bytes, and the home linked through it', () => {
+    const home = hostHome();
+    fs.rmSync(path.join(home, '.codex', 'AGENTS.md'));
+    fs.copyFileSync(path.join(home, '.claude', 'CLAUDE.md'), path.join(home, '.codex', 'AGENTS.md'));
+    expect(metrics(home)).toEqual([
+      'hostGlobalInstructions:codexLink:.codex',
+      'hostGlobalInstructions:codexLink:.codex-secondary',
+    ]);
+  });
+
+  it('reports a missing primary AGENTS.md and a dangling secondary one', () => {
+    const home = hostHome();
+    fs.rmSync(path.join(home, '.codex', 'AGENTS.md'));
+    const breaches = checkHostGlobalInstructions(home);
+    expect(breaches.map((b) => b.metric)).toEqual([
+      'hostGlobalInstructions:codexLink:.codex',
+      'hostGlobalInstructions:codexLink:.codex-secondary',
+    ]);
+    expect(breaches[0].ruleDescription).toContain('is missing');
+    expect(breaches[1].ruleDescription).toContain('nothing (dangling)');
+  });
+
+  it('reports an @-import with its line, and not a mention', () => {
+    const home = hostHome('# Rules\n\n@~/.claude/extra.md\n\nAsk @someone. Ping @first.last.\n');
+    fs.writeFileSync(path.join(home, '.claude', 'extra.md'), 'more\n');
+    const breaches = checkHostGlobalInstructions(home);
+    expect(breaches.map((b) => b.metric)).toEqual(['hostGlobalInstructions:atImport']);
+    expect(breaches[0].ruleDescription).toContain('@~/.claude/extra.md (line 3)');
+  });
+
+  it('reports a Codex AGENTS.md left behind when the Claude file is gone', () => {
+    const home = hostHome();
+    fs.rmSync(path.join(home, '.claude', 'CLAUDE.md'));
+    fs.rmSync(path.join(home, '.codex-secondary', 'AGENTS.md'));
+    expect(metrics(home)).toEqual(['hostGlobalInstructions:codexLink:.codex']);
   });
 });

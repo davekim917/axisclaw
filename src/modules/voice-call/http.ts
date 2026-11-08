@@ -3,6 +3,7 @@ import { timingSafeEqual } from 'crypto';
 
 import { log } from '../../log.js';
 import { VoiceServiceError } from './live.js';
+import { logMicReport } from './mic-report.js';
 import { callPageHtml } from './page.js';
 import { getVoiceCall, type CallPageEvent, type VoiceCall } from './registry.js';
 import {
@@ -25,22 +26,37 @@ const SECURITY_HEADERS = {
   'x-robots-tag': 'noindex',
 };
 
-export function send(res: ServerResponse, status: number, body: string, type = 'application/json'): void {
+/**
+ * Cloudflare answers an origin's 502 or 504 with its own error page, so the phone or browser behind it never gets this
+ * body; a status written here as a literal cannot be one of them.
+ */
+type ReachesClient<S extends number> = S extends 502 | 504 ? never : S;
+
+export function send<S extends number>(
+  res: ServerResponse,
+  status: ReachesClient<S>,
+  body: string,
+  type = 'application/json',
+): void {
   res.writeHead(status, { ...SECURITY_HEADERS, 'content-type': `${type}; charset=utf-8` });
   res.end(body);
 }
 
-export const json = (res: ServerResponse, status: number, body: unknown) => send(res, status, JSON.stringify(body));
+export const json = <S extends number>(res: ServerResponse, status: ReachesClient<S>, body: unknown) =>
+  send(res, status, JSON.stringify(body));
 
-function readBody(req: IncomingMessage): Promise<string> {
+export class BodyTooLarge extends Error {}
+
+/** An overrun is cut off where it stands, unless `answerOverrun`: then the caller answers, with `Connection: close`. */
+export function readBody(req: IncomingMessage, maxBytes = MAX_BODY_BYTES, answerOverrun = false): Promise<string> {
   return new Promise((resolve, reject) => {
     let size = 0;
     const chunks: Buffer[] = [];
     req.on('data', (chunk: Buffer) => {
       size += chunk.length;
-      if (size > MAX_BODY_BYTES) {
-        reject(new Error('too large'));
-        req.destroy();
+      if (size > maxBytes) {
+        reject(new BodyTooLarge('too large'));
+        if (!answerOverrun) req.destroy();
         return;
       }
       chunks.push(chunk);
@@ -136,8 +152,10 @@ export function handleVoiceCallRequest(id: string, req: IncomingMessage, res: Se
         json(res, 403, { error: 'Not this call.' });
         return;
       }
-      if (url.pathname === '/connected') connectVoiceAudio(call);
-      else {
+      if (url.pathname === '/connected') {
+        connectVoiceAudio(call);
+        logMicReport(call.id, body);
+      } else {
         const ended = JSON.parse(body || '{}') as { dropped?: unknown; stats?: unknown };
         logAudioReport(call, ended.stats);
         hangUpVoiceCall(call, ended.dropped === true);

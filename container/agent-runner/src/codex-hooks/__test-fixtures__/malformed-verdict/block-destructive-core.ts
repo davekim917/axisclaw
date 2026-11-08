@@ -7,7 +7,7 @@
  * time, exercising runDestructiveGuard's verdict-SHAPE validation. The runner
  * must DENY (fail-closed), never fall through to allow.
  *
- * Pointed at via NANOCLAW_DESTRUCTIVE_GUARD_CORE in runner.test.ts.
+ * Pointed at via setGuardCorePathsForTest({ destructive }) in runner.test.ts.
  */
 export const IS_NANOCLAW = false;
 

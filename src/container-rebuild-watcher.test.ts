@@ -36,6 +36,8 @@ vi.mock('./agent-runner-image-check.js', async (importOriginal) => ({
 }));
 
 import {
+  INSPECT_FAILURES_BEFORE_NOTICE,
+  INSPECT_NOTICE_REPEAT_MS,
   MIN_RETRY_INTERVAL_MS,
   requestContainerRebuild,
   startContainerRebuildWatcher,
@@ -57,6 +59,8 @@ interface World {
   originSha: string;
   headSha: string;
   imageLabel: string | null; // null => "no image / no label"
+  // `docker inspect` rejects with this message instead of answering.
+  inspectError: string | null;
   // merge-base --is-ancestor A B succeeds (A is ancestor of B) when B is in this set.
   ancestorTrueFor: Set<string>;
   // git diff --name-only X Y -- container/ , keyed "X|Y"
@@ -73,6 +77,7 @@ function freshWorld(): World {
     originSha: ORIGIN_SHA,
     headSha: HEAD_SHA,
     imageLabel: STALE_IMAGE_SHA,
+    inspectError: null,
     ancestorTrueFor: new Set(),
     // Default: container/ differs between the stale image and origin/main —
     // this is what makes checkStaleness() report stale so the default world
@@ -87,6 +92,7 @@ function installExecImpl(w: World): void {
   execState.impl = async (file: string, args: string[]) => {
     if (file === 'docker') {
       // imageCommitLabel(): inspect --format ... IMAGE_REF
+      if (w.inspectError) throw new Error(w.inspectError);
       return { stdout: w.imageLabel ?? '<no value>', stderr: '' };
     }
     if (file === 'bash') {
@@ -208,6 +214,86 @@ describe('requestContainerRebuild', () => {
     requestContainerRebuild('deps drift again');
     await _pendingRebuildForTest();
     expect(world.buildCalls).toBe(2);
+  });
+
+  it('does not build when docker inspect fails or times out, and leaves the next refusal free to retry', async () => {
+    world.inspectError = 'Command failed: docker inspect … (killed: SIGTERM, timeout 10000ms)';
+    requestContainerRebuild('deps drift');
+    await _pendingRebuildForTest();
+
+    expect(world.buildCalls).toBe(0);
+    expect(notified).toHaveLength(0);
+    world.inspectError = null;
+    requestContainerRebuild('deps drift');
+    await _pendingRebuildForTest();
+    expect(world.buildCalls).toBe(1);
+  });
+
+  describe('a run of docker inspect failures', () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+      world.inspectError = 'Cannot connect to the Docker daemon at unix:///var/run/docker.sock';
+    });
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    async function refusals(count: number, everyMs: number): Promise<void> {
+      for (let i = 0; i < count; i++) {
+        requestContainerRebuild('deps drift');
+        await _pendingRebuildForTest();
+        vi.advanceTimersByTime(everyMs);
+      }
+    }
+
+    it('notifies once on the third refusal in a run, not on the first timeout or each one after', async () => {
+      await refusals(INSPECT_FAILURES_BEFORE_NOTICE - 1, 60_000);
+      expect(notified).toHaveLength(0);
+
+      await refusals(5, 60_000);
+
+      expect(notified).toHaveLength(1);
+      expect(notified[0]).toContain('docker inspect');
+      expect(world.buildCalls).toBe(0);
+    });
+
+    it('hears a second wedge after the first one ended', async () => {
+      await refusals(INSPECT_FAILURES_BEFORE_NOTICE, 60_000);
+      vi.advanceTimersByTime(MIN_RETRY_INTERVAL_MS);
+      await refusals(INSPECT_FAILURES_BEFORE_NOTICE, 60_000);
+
+      expect(notified).toHaveLength(2);
+    });
+
+    it('ends the run when an inspect answers', async () => {
+      await refusals(INSPECT_FAILURES_BEFORE_NOTICE - 1, 60_000);
+      world.inspectError = null;
+      await refusals(1, 60_000);
+      world.inspectError = 'Cannot connect to the Docker daemon at unix:///var/run/docker.sock';
+      await refusals(INSPECT_FAILURES_BEFORE_NOTICE - 1, 60_000);
+
+      expect(notified.filter((m) => m.includes('docker inspect'))).toHaveLength(0);
+    });
+
+    it('does not add isolated timeouts far apart into a run', async () => {
+      await refusals(5, MIN_RETRY_INTERVAL_MS + 1);
+
+      expect(notified).toHaveLength(0);
+    });
+
+    it('reminds again while a run is still failing an hour later', async () => {
+      await refusals(INSPECT_NOTICE_REPEAT_MS / 60_000 + INSPECT_FAILURES_BEFORE_NOTICE, 60_000);
+
+      expect(notified).toHaveLength(2);
+    });
+  });
+
+  it('still builds when the image does not exist', async () => {
+    world.inspectError = 'Error response from daemon: No such object: nanoclaw-agent:latest';
+    requestContainerRebuild('deps drift');
+    await _pendingRebuildForTest();
+
+    expect(world.buildCalls).toBe(1);
   });
 
   it('does not rebuild, and says so, when the image already matches origin/main for container/', async () => {

@@ -24,3 +24,6 @@ What `ncl help` won't tell you:
   reasoning exceptions. `--script-host` is host-operator-only; agents and
   templates cannot opt in.
 - Flags are `--hyphen-case` and map to `underscore_case` columns.
+- **Asked to rename this thread, typed or on a call:** run
+  `ncl threads rename --title "<name>"`. It only reaches the thread you are in. Tell
+  the person what it returned, a refusal included.

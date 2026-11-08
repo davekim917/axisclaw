@@ -87,6 +87,15 @@ import { migration086 } from './086-thread-route-checks.js';
 import { migration087 } from './087-workgroup-access.js';
 import { migration088 } from './088-wiring-engage-senders.js';
 import { migration089 } from './089-previews.js';
+import { migration090 } from './090-open-ask-marks.js';
+import { migration091 } from './091-work-outcome-delivered-at.js';
+import { migration092 } from './092-mobile-devices.js';
+import { migration093 } from './093-approval-card-copies.js';
+import { migration094 } from './094-thread-title-source.js';
+import { migration095 } from './095-mcp-oauth-client-credentials.js';
+import { migration096 } from './096-mobile-send-keys.js';
+import { migration097 } from './097-discord-relay-posts.js';
+import { migration098 } from './098-workgroup-approvals-channel.js';
 import { migration014 as containerConfigs } from './014-container-configs.js';
 import { migration015 as cliScope } from './015-cli-scope.js';
 // Upstream's 016: an idempotent messaging_groups recreate that backfills instance = channel_type.
@@ -214,6 +223,15 @@ export const migrations: Migration[] = [
   migration087,
   migration088,
   migration089,
+  migration090,
+  migration091,
+  migration092,
+  migration093,
+  migration094,
+  migration095,
+  migration096,
+  migration097,
+  migration098,
   // Last on purpose: normalizes naive timestamps left by everything above (016's recreate copies created_at as-is).
   migration053,
 ];

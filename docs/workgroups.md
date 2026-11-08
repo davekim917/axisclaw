@@ -447,6 +447,26 @@ with the spawn's own resolvers that no member's effective access or opt-outs cha
 Access or opt-outs only some members hold are reported as drift, not lifted, since lifting would change what a member
 gets today; so are differing `credentialFolder` values (and one the spawn now refuses) and mounts.
 
+### Approvals channel
+
+A card posted in a thread also goes to whoever must answer it. When the person who asked can answer it, that is a copy
+in their DM. When they can't, or no person asked, the card goes once into the workgroup's approvals channel, if one is
+set, as a live card that names the thread it came from and who asked. Anyone the card allows can answer it there, and
+the copy is deleted when the card resolves, so the channel holds open cards. A click in the channel never counts as
+thread access, and "Reject with reason…" clicked there asks for the reason in the clicker's DM. If the post fails (the bot is not in the channel, or the channel is archived), the DM
+copy goes instead. Unset, the DM copy goes as before.
+
+```bash
+ncl groups config set-approvals-channel --workgroup <workgroup-id> --bot <channel-type> --channel <platform-id>
+ncl groups config set-approvals-channel --workgroup <workgroup-id> --clear
+```
+
+`--bot` is the adapter that posts and deletes there, and it must be a member of the channel. It needs only
+`chat:write`. Slack only: a card is posted there only when that bot and the card's bot are registered Slack bots of
+the same team (`approvalsChannelFor`, `src/modules/approvals/approvals-channel.ts`); any other platform keeps the DM
+copy, since one bot there can span tenants. The setting is the `approvals_channel` column
+on the `workgroups` row and takes effect for the next card.
+
 ---
 
 ## Staleness window
@@ -492,7 +512,7 @@ The migration path is well-understood (table rebuild with a new column for the o
 | Scoped credential ownership          | `src/credential-ownership.ts`, `data/credential-ownership.json`, `scripts/credential-ownership-dry-run.ts` |
 | FS reconciliation (startup)          | `src/modules/workgroup/fs-reconcile.ts` (`reconcileWorkgroupFsState`)                     |
 | Memory canon and compatibility views | `src/modules/workgroup/shared-dirs.ts` (`workgroupMemoryDir`, `reconcileWorkgroupMemory`) |
-| Operator CLI                         | `ncl groups config … --workgroup`, `ncl secrets grant --workgroups`, `scripts/set-workgroup-secrets.ts`, `scripts/lift-workgroup-access.ts` |
+| Operator CLI                         | `ncl groups config … --workgroup` (`set-approvals-channel` included), `ncl secrets grant --workgroups`, `scripts/set-workgroup-secrets.ts`, `scripts/lift-workgroup-access.ts` |
 | Google Drive mirror (host, one-way)  | `scripts/publish-workgroups-drive.sh` — [workgroups-drive-publish.md](workgroups-drive-publish.md) |
 | Structural assertion                 | `tests/structural/projection-chokepoint.test.ts`                                          |
 

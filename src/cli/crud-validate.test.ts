@@ -55,6 +55,23 @@ describe('validateArgs', () => {
     expect(() => validateArgs(defs, { target: 'x', count: 'many' })).toThrow('--count must be a number');
   });
 
+  it.each([
+    ['an object', { name: 'x' }],
+    ['a list', ['x']],
+    ['a false', false],
+  ])('rejects %s for a string flag, which would otherwise be stored as its text form', (_label, value) => {
+    expect(() => validateArgs(defs, { target: value })).toThrow('--target must be a string');
+  });
+
+  it('takes a null as no value: a required flag refuses it, an optional one keeps it to mean clear', () => {
+    expect(() => validateArgs(defs, { target: null })).toThrow('--target is required');
+    expect(validateArgs(defs, { target: 'x', size: null }).size).toBeNull();
+  });
+
+  it('keeps a number given for a string flag', () => {
+    expect(validateArgs(defs, { target: 2027 }).target).toBe('2027');
+  });
+
   it('rejects a value-less flag on a non-boolean (client sends true)', () => {
     expect(() => validateArgs(defs, { target: true })).toThrow('--target requires a value');
   });

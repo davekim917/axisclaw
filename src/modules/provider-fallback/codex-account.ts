@@ -26,10 +26,12 @@ export async function handleCodexAccountExhausted(content: Record<string, unknow
     });
     return;
   }
-  markCodexAccountExhausted(account.hostHome);
-  log.warn('Codex account at its quota — new containers start on the next account for an hour', {
+  const resetAt = typeof content.resetAt === 'string' ? content.resetAt : null;
+  const until = markCodexAccountExhausted(account.hostHome, Date.now(), resetAt);
+  log.warn('Codex account at its quota — new containers start on the next account until the mark ends', {
     sessionId: session.id,
     agentGroup: agentGroup.name,
     hostHome: account.hostHome,
+    until: new Date(until).toISOString(),
   });
 }

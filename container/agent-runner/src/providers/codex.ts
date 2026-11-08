@@ -40,7 +40,7 @@ import {
   readCodexSubagentThreads,
 } from './codex-app-server.js';
 // Hooks AND their trust entries: Codex >=0.154 never runs an untrusted hook.
-import { verifyCodexHookTrust, writeCodexHooksAndTrust } from '../codex-companion-setup.js';
+import { syncCodexHookTrust, verifyCodexHookTrust } from '../codex-companion-setup.js';
 import { CodexTurnLiveness, isCodexTerminalTurnItem, normalizeCodexThreadStatus } from './codex-liveness.js';
 import { CodexRateLimitTracker } from './codex-rate-limit-tracker.js';
 import type { CodexRateLimitPark } from './codex-rate-limits.js';
@@ -682,8 +682,11 @@ export class CodexProvider implements AgentProvider {
   /** The host's start hint, consumed by the first query; later queries keep whatever home the last one left. */
   private pendingStartHome: string | null;
   private readonly primaryHostCodexHome: string | undefined;
+  /** The installed guard chain every spawn is verified against; a test points it at a fixture. */
+  private readonly systemHooksPath: string | undefined;
 
-  constructor(options: ProviderOptions = {}) {
+  constructor(options: ProviderOptions = {}, internals: { systemHooksPath?: string } = {}) {
+    this.systemHooksPath = internals.systemHooksPath;
     // The stdio bridge for HTTP servers is an explicit compatibility fallback only; SSE is rejected.
     const mcpServers: Record<string, CodexMcpServer> = {};
     const useHttpBridgeFallback = process.env.NANOCLAW_CODEX_MCP_HTTP_BRIDGE_FALLBACK === '1';
@@ -695,6 +698,7 @@ export class CodexProvider implements AgentProvider {
           args: cfg.args,
           env: augmentWithProxyEnv(cfg.env ?? {}),
           ...(cfg.cwd ? { cwd: cfg.cwd } : {}),
+          ...(cfg.timeout !== undefined ? { timeout: cfg.timeout } : {}),
         };
       } else if (cfg?.type === 'http') {
         if (useHttpBridgeFallback) {
@@ -862,7 +866,7 @@ export class CodexProvider implements AgentProvider {
         self.pendingStartHome = null;
       }
       writeCodexMcpConfigToml(self.mcpServers);
-      writeCodexHooksAndTrust();
+      syncCodexHookTrust(resolveCodexConfigDir());
       const startAppServer = async (): Promise<AppServer> => {
         try {
           return await startCodexAppServer(
@@ -891,7 +895,7 @@ export class CodexProvider implements AgentProvider {
 
       try {
         // Fail closed on a guard chain that loaded but would never fire, on every spawn.
-        await verifyCodexHookTrust(server, currentCodexHome);
+        await verifyCodexHookTrust(server, { systemHooksPath: self.systemHooksPath, codexHome: currentCodexHome });
         await rateLimits.bind(server, currentCodexHome);
 
         // Base instructions survive Codex's native compaction, so the static memory guidance rides there.
@@ -961,15 +965,15 @@ export class CodexProvider implements AgentProvider {
               currentCodexHome = nextHome;
             }
 
-            // A new home needs config, the guard hooks (or the rotated server runs unguarded) and the agents/ roles,
-            // which are mounted only at the primary.
+            // A new home needs config, its plugin hook trust and the agents/ roles, which are mounted only at the
+            // primary.
             writeCodexMcpConfigToml(self.mcpServers);
-            writeCodexHooksAndTrust();
+            syncCodexHookTrust(resolveCodexConfigDir());
             if (nextHome) mirrorCodexAgentsToHome(self.primaryCodexHome, nextHome);
 
             server = await startAppServer();
             // The guard chain must be proven live in the (possibly new) home.
-            await verifyCodexHookTrust(server, currentCodexHome);
+            await verifyCodexHookTrust(server, { systemHooksPath: self.systemHooksPath, codexHome: currentCodexHome });
             await rateLimits.bind(server, currentCodexHome);
 
             // A fresh thread gets a new id: re-emit init so the poll-loop updates its continuation.
@@ -1098,7 +1102,9 @@ export class CodexProvider implements AgentProvider {
                     }
                   }
 
-                  if (ev.classification === 'quota') yield { type: 'codex_account_exhausted', home: currentCodexHome };
+                  if (ev.classification === 'quota') {
+                    yield { type: 'codex_account_exhausted', home: currentCodexHome, resetAt: ev.resetAt ?? null };
+                  }
                   yield {
                     type: 'progress',
                     message: formatBlockquoteLabel(

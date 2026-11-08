@@ -95,20 +95,23 @@ function inArchive(
   threadId: string | null = route.threadId,
   senderName?: string,
 ) {
-  archiveMessage({
-    id: `arch-${++archiveCount}`,
-    agentGroupId: location.agentGroupId,
-    messagingGroupId: route.messagingGroupId,
-    channelType: route.channelType,
-    channelName: null,
-    platformId: route.platformId,
-    threadId,
-    role,
-    senderId: null,
-    senderName: senderName ?? (role === 'assistant' ? 'assistant' : null),
-    text,
-    sentAt: new Date(Date.UTC(2026, 9, 26, 12, 0, archiveCount)).toISOString(),
-  });
+  archiveMessage(
+    {
+      id: `arch-${++archiveCount}`,
+      agentGroupId: location.agentGroupId,
+      messagingGroupId: route.messagingGroupId,
+      channelType: route.channelType,
+      channelName: null,
+      platformId: route.platformId,
+      threadId,
+      role,
+      senderId: null,
+      senderName: senderName ?? (role === 'assistant' ? 'assistant' : null),
+      text,
+      sentAt: new Date(Date.UTC(2026, 9, 26, 12, 0, archiveCount)).toISOString(),
+    },
+    { workgroupId: null },
+  );
 }
 
 const posted = (text: string, extra: { sessionId?: string; inReplyTo?: string; threadId?: string | null } = {}) =>
@@ -131,34 +134,40 @@ describe('followSessionFeed', () => {
     inArchive('user', 'earlier question', route.threadId, 'Sam Roe');
     inArchive('assistant', 'earlier answer');
     inArchive('user', 'a different thread', 'slack:C1:999.9', 'Sam Roe');
-    archiveMessage({
-      id: 'arch-sibling',
-      agentGroupId: 'ag-sibling',
-      messagingGroupId: route.messagingGroupId,
-      channelType: route.channelType,
-      channelName: null,
-      platformId: route.platformId,
-      threadId: route.threadId,
-      role: 'assistant',
-      senderId: null,
-      senderName: 'assistant',
-      text: 'a sibling agent’s own copy',
-      sentAt: new Date().toISOString(),
-    });
-    archiveMessage({
-      id: 'arch-elsewhere',
-      agentGroupId: location.agentGroupId,
-      messagingGroupId: route.messagingGroupId,
-      channelType: route.channelType,
-      channelName: null,
-      platformId: 'slack:C9',
-      threadId: route.threadId,
-      role: 'assistant',
-      senderId: null,
-      senderName: 'assistant',
-      text: 'posted to another channel from this conversation',
-      sentAt: new Date().toISOString(),
-    });
+    archiveMessage(
+      {
+        id: 'arch-sibling',
+        agentGroupId: 'ag-sibling',
+        messagingGroupId: route.messagingGroupId,
+        channelType: route.channelType,
+        channelName: null,
+        platformId: route.platformId,
+        threadId: route.threadId,
+        role: 'assistant',
+        senderId: null,
+        senderName: 'assistant',
+        text: 'a sibling agent’s own copy',
+        sentAt: new Date().toISOString(),
+      },
+      { workgroupId: null },
+    );
+    archiveMessage(
+      {
+        id: 'arch-elsewhere',
+        agentGroupId: location.agentGroupId,
+        messagingGroupId: route.messagingGroupId,
+        channelType: route.channelType,
+        channelName: null,
+        platformId: 'slack:C9',
+        threadId: route.threadId,
+        role: 'assistant',
+        senderId: null,
+        senderName: 'assistant',
+        text: 'posted to another channel from this conversation',
+        sentAt: new Date().toISOString(),
+      },
+      { workgroupId: null },
+    );
     sent('chat', { text: 'written but never posted' });
     const feed = followSessionFeed(location, route, 'voice-call1-', () => undefined);
     expect(feed.recent).toEqual([

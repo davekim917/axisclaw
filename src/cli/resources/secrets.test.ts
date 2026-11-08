@@ -16,7 +16,7 @@ describe('ncl secrets arguments', () => {
   });
 
   it('declares which args may arrive as a list, so dispatch refuses a list anywhere else', () => {
-    expect(lookup('secrets-intake')?.listArgs).toEqual(['field', 'groups', 'workgroups']);
+    expect(lookup('secrets-intake')?.listArgs).toEqual(['host_pattern', 'field', 'groups', 'workgroups']);
     expect(lookup('secrets-grant')?.listArgs).toEqual(['groups', 'workgroups']);
   });
 });

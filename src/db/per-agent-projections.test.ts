@@ -187,7 +187,7 @@ function makeArchiveSrc(label: string): string {
     );
   `);
   // The real archive's mutation counters, from the writer that owns them, so
-  // the fixture cannot drift from what `initSchema` actually creates.
+  // the fixture cannot drift from what `initArchiveSchema` actually creates.
   db.exec(ARCHIVE_MUTATION_MARKS_SQL);
   db.close();
   return p;

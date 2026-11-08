@@ -12,6 +12,7 @@ import {
   type QuietSessionMark,
 } from './db/sessions.js';
 import { getAgentGroup } from './db/agent-groups.js';
+import { yieldToEventLoop } from './event-loop-yield.js';
 import {
   SessionDbMissingError,
   SessionDbUnopenableError,
@@ -392,12 +393,11 @@ const DRIVER_OBSERVE_DUTY = 'driver:observe';
  * The per-session yield, injectable so a test can observe it. Removing it turns a batch of sessions back into one
  * contiguous event-loop freeze.
  */
-const defaultSweepYield = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
-let sweepYield: () => Promise<void> = defaultSweepYield;
+let sweepYield: () => Promise<void> = yieldToEventLoop;
 
 /** Test-only: wrap or replace the per-session yield. `null` restores it. */
 export function _setSweepYieldForTesting(next: (() => Promise<void>) | null): void {
-  sweepYield = next ?? defaultSweepYield;
+  sweepYield = next ?? yieldToEventLoop;
 }
 
 const SWEEP_DUTY_TAG = Symbol('sweepDutyTag');
@@ -562,7 +562,6 @@ export const SWEEP_DUTY_INVENTORY: Readonly<Record<string, string>> = {
   T13: 'storage-maintenance',
   T14: 'completed-task-auto-archive',
   T15: 'session-title-sweep',
-  T16: 'thread-title-retry',
   T17: 'dashboard-token-prune',
   T19: 'usage-rollup',
   T20: 'claims-reconcile',
@@ -579,6 +578,12 @@ export const SWEEP_DUTY_INVENTORY: Readonly<Record<string, string>> = {
   FORK6: 'provider-fallback-return',
   FORK7: 'orphan-containers',
   FORK8: 'gate-expiry',
+  FORK9: 'open-asks-backstop',
+  FORK10: 'approved-run-token-guard',
+  FORK11: 'oauth-slot-health',
+  FORK12: 'mobile-channel-visibility',
+  FORK13: 'codex-rollout-prune',
+  FORK14: 'email-signature-refresh',
   S2: 'processing-ack-sync',
   S3: 'stale-pending-expiry',
   S4: 'pre-wake-orphan-claim-reset',
@@ -822,7 +827,11 @@ async function sweepOnce(generation: number): Promise<void> {
   let skippedQuiet = 0;
   // Marks taken this tick, flushed once at the end, and only on the transition into quiet.
   const newQuietMarks: QuietSessionMark[] = [];
-  for (const session of sessions) {
+  // Running containers first: the idle reapers run in these sessions, and a reservation they have not freed queues
+  // every wake behind it for as long as the walk takes to arrive.
+  const liveIds = new Set(getActiveContainerSessionIds());
+  const walkOrder = [...sessions.filter((s) => liveIds.has(s.id)), ...sessions.filter((s) => !liveIds.has(s.id))];
+  for (const session of walkOrder) {
     if (generation !== tickGeneration) return; // abandoned: sweep no further
     if (sessionsRunning.has(session.id)) continue; // still inside an abandoned tick
     const mark = quietSessions.get(session.id);

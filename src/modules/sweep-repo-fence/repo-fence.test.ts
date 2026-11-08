@@ -386,7 +386,25 @@ describe('orphaned fences whose publication is gone are released and their sessi
     expect(fences.get(orphaned.id)?.state).toBe('released');
   });
 
-  it('yields to the event loop every 100 sessions so a 1600-session pass cannot freeze the host', async () => {
+  it('starts no second scan while one is running, however long that one has taken', async () => {
+    const orphaned = addSession('s1');
+    fence(orphaned.id);
+
+    const running = sweepOrphanedRepoIngressFences(sessions as never, 1_000);
+    expect(
+      await sweepOrphanedRepoIngressFences(sessions as never, 1_000 + ORPHANED_REPO_FENCE_SCAN_INTERVAL_MS),
+    ).toBeNull();
+    expect(await running).toMatchObject({ released: 1 });
+
+    fence(orphaned.id, PUBLISH_EPOCH, 'gen-second');
+    const later = await sweepOrphanedRepoIngressFences(
+      sessions as never,
+      1_000 + 2 * ORPHANED_REPO_FENCE_SCAN_INTERVAL_MS,
+    );
+    expect(later).toMatchObject({ released: 1 });
+  });
+
+  it('yields to the event loop after every session so a 3,000-session pass cannot freeze the host', async () => {
     for (let i = 0; i < 250; i += 1) addSession(`s${i}`);
     // A competing setImmediate chain, not a wall-clock timer: the pass yields
     // with setImmediate, so this counts queue turns it actually conceded and
@@ -401,8 +419,7 @@ describe('orphaned fences whose publication is gone are released and their sessi
     setImmediate(chain);
     try {
       await releaseOrphanedRepoIngressFences('test');
-      // 250 sessions → yields at index 100 and index 200.
-      expect(macrotasks).toBeGreaterThanOrEqual(2);
+      expect(macrotasks).toBeGreaterThanOrEqual(250);
     } finally {
       stop = true;
     }
@@ -447,6 +464,17 @@ function findRegisteredDuty(name: string) {
   return duty;
 }
 
+/** The duty does not wait for its scan, so a test that reads the scan's effects waits for the scan it started. */
+async function runDutyAndItsScan(t22: ReturnType<typeof findRegisteredDuty>, ctx: SweepTickContext): Promise<void> {
+  const scan = vi.spyOn(repoFenceRecoveryModule, 'sweepOrphanedRepoIngressFences');
+  try {
+    await t22.run(ctx as never);
+    await Promise.all(scan.mock.results.map((result) => result.value));
+  } finally {
+    scan.mockRestore();
+  }
+}
+
 function fakeTickCtx(tickSessions: TestSession[]): SweepTickContext {
   return {
     now: Date.now(),
@@ -473,7 +501,7 @@ describe('the T22 registered wrapper', () => {
     fs.writeFileSync(path.join(sessionsRoot, sentinel.agent_group_id, sentinel.id, 'inbound.db'), '');
     fence(sentinel.id);
 
-    await t22.run(fakeTickCtx([sentinel]) as never);
+    await runDutyAndItsScan(t22, fakeTickCtx([sentinel]));
 
     expect(getActiveSessionsCalls.count).toBe(0);
     expect(openedSessions).toEqual(['sentinel-1']);
@@ -485,7 +513,7 @@ describe('the T22 registered wrapper', () => {
     // clock argument, so this exercises the throttle against real wall time.
     openedSessions.length = 0;
     fence(sentinel.id, PUBLISH_EPOCH, 'gen-second');
-    await t22.run(fakeTickCtx([sentinel]) as never);
+    await runDutyAndItsScan(t22, fakeTickCtx([sentinel]));
 
     expect(openedSessions).toEqual([]);
     expect(fences.get(sentinel.id)?.state).toBe('active');
@@ -498,12 +526,31 @@ describe('the T22 registered wrapper', () => {
       .spyOn(repoFenceRecoveryModule, 'sweepOrphanedRepoIngressFences')
       .mockRejectedValueOnce(new Error('boom'));
     try {
-      await expect(t22.run(fakeTickCtx([]) as never)).resolves.toBeUndefined();
-      expect(log.warn).toHaveBeenCalledWith(
-        'Orphaned repository fence sweep step failed',
-        expect.objectContaining({ err: expect.any(Error) }),
+      expect(() => t22.run(fakeTickCtx([]) as never)).not.toThrow();
+      await vi.waitFor(() =>
+        expect(log.warn).toHaveBeenCalledWith(
+          'Orphaned repository fence sweep step failed',
+          expect.objectContaining({ err: expect.any(Error) }),
+        ),
       );
     } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('hands the tick back while its scan is still running', async () => {
+    const t22 = findRegisteredDuty(SWEEP_DUTY_INVENTORY.T22);
+    let finishScan = (_report: null): void => {};
+    const spy = vi
+      .spyOn(repoFenceRecoveryModule, 'sweepOrphanedRepoIngressFences')
+      .mockReturnValueOnce(new Promise((resolve) => (finishScan = resolve)));
+    try {
+      const returned = Promise.resolve(t22.run(fakeTickCtx([]) as never)).then(() => 'returned');
+      const held = new Promise((resolve) => setTimeout(() => resolve('held the tick'), 100));
+      expect(await Promise.race([returned, held])).toBe('returned');
+      expect(spy).toHaveBeenCalledOnce();
+    } finally {
+      finishScan(null);
       spy.mockRestore();
     }
   });

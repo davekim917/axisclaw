@@ -399,6 +399,45 @@ const SHARED_MATRIX: SharedCase[] = [
       fs.mkdirSync(path.join(groupsDir, 'wgx', 'dbt', '.git'), { recursive: true });
     },
   },
+  {
+    name: 'unproven-interrupted-move',
+    build: ({ groupsDir, dataDir }) => {
+      buildSettled({ groupsDir, dataDir });
+      fs.unlinkSync(path.join(groupsDir, 'wgx', 'dbt'));
+      fs.mkdirSync(path.join(groupsDir, 'wgx', 'dbt', '.git'), { recursive: true });
+      fs.writeFileSync(path.join(groupsDir, 'wgx', 'dbt', 'model.sql'), 'select 1');
+    },
+  },
+  {
+    name: 'shared-plain-dir-collision',
+    build: ({ groupsDir, dataDir }) => {
+      buildSettled({ groupsDir, dataDir });
+      fs.mkdirSync(path.join(groupsDir, 'wgx', 'sources'), { recursive: true });
+      fs.writeFileSync(path.join(groupsDir, 'wgx', 'sources', 'seed.md'), 'seed');
+      fs.mkdirSync(path.join(dataDir, 'workgroups', 'wgx', 'sources'), { recursive: true });
+      fs.writeFileSync(path.join(dataDir, 'workgroups', 'wgx', 'sources', 'agent.md'), 'agent');
+    },
+  },
+  {
+    name: 'source-removal-cut-short',
+    build: ({ groupsDir, dataDir }) => {
+      buildSettled({ groupsDir, dataDir });
+      fs.mkdirSync(path.join(dataDir, 'workgroups', 'wgx', 'workpad'), { recursive: true });
+      fs.writeFileSync(path.join(dataDir, 'workgroups', 'wgx', 'workpad', 'a.md'), 'a');
+      fs.writeFileSync(path.join(dataDir, 'workgroups', 'wgx', 'workpad', 'b.md'), 'b');
+      fs.mkdirSync(path.join(groupsDir, 'wgx', 'workpad'), { recursive: true });
+      fs.writeFileSync(path.join(groupsDir, 'wgx', 'workpad', 'b.md'), 'b');
+    },
+  },
+  {
+    name: 'private-seed-dir-shadowed-in-shared-mount',
+    build: ({ groupsDir, dataDir }) => {
+      buildSettled({ groupsDir, dataDir });
+      fs.mkdirSync(path.join(dataDir, 'workgroups', 'wgx', 'workpad', 'review'), { recursive: true });
+      fs.mkdirSync(path.join(groupsDir, 'wgx', 'workpad'), { recursive: true });
+      fs.writeFileSync(path.join(groupsDir, 'wgx', 'workpad', 'notes.md'), 'private');
+    },
+  },
   // A live agent created a top-level dir in the shared mount: canonical only,
   // no seed entry, no sibling entry. The reconcile owes it compat symlinks and
   // nothing a running container's mount resolves to changes.
@@ -528,6 +567,30 @@ describe('sharedDirsPendingChange', () => {
         invalidates: true,
         mutations: ['source-cleanup:dbt', 'compat-link:dbt'],
         treeChanged: true,
+      },
+      'unproven-interrupted-move': {
+        pending: 'merge:dbt',
+        invalidates: true,
+        mutations: ['merge:dbt', 'compat-link:dbt'],
+        treeChanged: true,
+      },
+      'shared-plain-dir-collision': {
+        pending: 'merge:sources',
+        invalidates: true,
+        mutations: ['merge:sources', 'compat-link:sources', 'sibling-link:wgx-codex/sources'],
+        treeChanged: true,
+      },
+      'source-removal-cut-short': {
+        pending: 'source-cleanup:workpad',
+        invalidates: true,
+        mutations: ['source-cleanup:workpad', 'compat-link:workpad', 'sibling-link:wgx-codex/workpad'],
+        treeChanged: true,
+      },
+      'private-seed-dir-shadowed-in-shared-mount': {
+        pending: null,
+        invalidates: false,
+        mutations: [],
+        treeChanged: false,
       },
       'agent-created-dir-in-shared-mount': {
         pending: 'compat-link:scratch',

@@ -50,17 +50,11 @@ function setupOnecliMock(): void {
 }
 
 function respondTo(bin: unknown, rawArgs: unknown): string {
-  {
-    const argv = (rawArgs ?? []) as string[];
-    // onecli-secrets now lists secrets via the gateway API (listViaApi: a curl
-    // to /api/secrets) to dodge the CLI's 20-row cap (919d3bce). Match that.
-    if (bin === 'curl' && argv.some((a) => String(a).includes('/api/secrets'))) {
-      return JSON.stringify(SECRET_FIXTURE);
-    }
-    // Back-compat with the old `onecli secrets list` call shape.
-    if (argv[0] === 'secrets' && argv[1] === 'list') return JSON.stringify(SECRET_FIXTURE);
-    return '';
+  const argv = (rawArgs ?? []) as string[];
+  if (bin === 'curl' && argv.some((a) => String(a).includes('/v1/secrets'))) {
+    return JSON.stringify(SECRET_FIXTURE);
   }
+  return '';
 }
 
 // ── DB helpers ────────────────────────────────────────────────────────────────
@@ -153,6 +147,7 @@ describe('set-workgroup-secrets CLI', async () => {
   it('test_rejects_unresolvable_secret', async () => {
     setupOnecliMock();
     insertWorkgroup(db, 'example-labs', '[]');
+    const stderr = vi.spyOn(console, 'error').mockImplementation(() => undefined);
 
     const code = await setWorkgroupSecrets({
       workgroupId: 'example-labs',
@@ -161,6 +156,7 @@ describe('set-workgroup-secrets CLI', async () => {
     });
 
     expect(code).toBe(1);
+    expect(stderr).toHaveBeenCalledWith(expect.stringContaining('not found in vault: NotInVault'));
     // DB should NOT have been written (fail before write)
     const stored = getWorkgroupSecrets(db, 'example-labs');
     expect(stored).toEqual([]);
@@ -229,6 +225,7 @@ describe('set-workgroup-secrets CLI', async () => {
   it('validates ALL secrets before writing — partial failure writes nothing', async () => {
     setupOnecliMock();
     insertWorkgroup(db, 'example-labs', JSON.stringify(['OldSecret']));
+    const stderr = vi.spyOn(console, 'error').mockImplementation(() => undefined);
 
     const code = await setWorkgroupSecrets({
       workgroupId: 'example-labs',
@@ -237,6 +234,7 @@ describe('set-workgroup-secrets CLI', async () => {
     });
 
     expect(code).toBe(1);
+    expect(stderr).toHaveBeenCalledWith(expect.stringContaining('not found in vault: DefinitelyNotReal'));
     // DB must still have the original value
     const stored = getWorkgroupSecrets(db, 'example-labs');
     expect(stored).toEqual(['OldSecret']);
@@ -256,10 +254,6 @@ describe('set-workgroup-secrets CLI', async () => {
 
     await setWorkgroupSecrets({ workgroupId: 'example-labs', secrets: [], dbPath });
 
-    // secrets list is empty → no `onecli secrets list` call
-    const secretsListCalls = mockedExec.mock.calls.filter(
-      (c) => (c[1] as string[])[0] === 'secrets' && (c[1] as string[])[1] === 'list',
-    );
-    expect(secretsListCalls).toHaveLength(0);
+    expect(mockedExec).not.toHaveBeenCalled();
   });
 });

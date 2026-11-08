@@ -95,11 +95,7 @@ vi.mock('../modules/approvals/index.js', async (importOriginal) => ({
 const startGroupCall = vi.hoisted(() =>
   vi.fn(async () => ({ joined: false, sentTo: 'Someone', expiresAt: '2026-01-01T00:00:00.000Z' })),
 );
-vi.mock('../modules/voice-call/group/service.js', () => ({
-  groupCallLive: () => false,
-  startOrJoinGroupCall: startGroupCall,
-}));
-vi.mock('../modules/voice-call/service.js', () => ({ mintVoiceCall: vi.fn() }));
+vi.mock('../modules/voice-call/group/service.js', () => ({ startCall: startGroupCall }));
 import './resources/voice.js';
 
 // Register a test command so dispatch has something to find
@@ -378,7 +374,7 @@ describe('CLI scope enforcement', () => {
     const resp = await dispatch({ id: '1', command: 'voice-call', args: { 'group-call': true } }, agentCtx());
 
     expect(resp.ok).toBe(true);
-    expect(startGroupCall).toHaveBeenCalledWith({ sessionId: 's1', agentGroupId: 'g1' });
+    expect(startGroupCall).toHaveBeenCalledWith({ sessionId: 's1', agentGroupId: 'g1' }, { group: true });
   });
 
   it('group: rejects cross-group access', async () => {

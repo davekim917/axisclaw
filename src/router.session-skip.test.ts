@@ -7,8 +7,8 @@
  * tests for this feature mocked `resolveSession`, which meant the continuity
  * case asserted transcript formatting and proved nothing about whether a
  * skipped message actually comes back. The only mocks here are the things
- * that leave the process: the container runner, the archive writer (which is
- * also the seam the archive-failure case needs), and the Haiku thread titler.
+ * that leave the process: the container runner and the archive writer (which
+ * is also the seam the archive-failure case needs).
  *
  * All identifiers are synthetic.
  */
@@ -44,11 +44,6 @@ vi.mock('./message-archive.js', async (importOriginal) => ({
   archiveMessage: vi.fn(),
 }));
 
-vi.mock('./topic-title.js', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('./topic-title.js')>()),
-  maybeRenameNewThread: vi.fn(),
-}));
-
 import {
   closeDb,
   getRawDb,
@@ -57,6 +52,7 @@ import {
   createMessagingGroupAgent,
   initMigratedTestDb,
 } from './db/index.js';
+import { getDb } from './db/connection.js';
 import { findSessionForAgent, createSession } from './db/sessions.js';
 import { inboundDbPath } from './mailbox/sqlite/paths.js';
 import { archiveMessage } from './message-archive.js';
@@ -79,6 +75,7 @@ let threadHistory: Array<{ sender: string; text: string; timestamp: string; isAn
 let historyCalls: Array<{ threadId: string; opts?: { limit?: number; excludeMessageId?: string } }> = [];
 let historyThrows = false;
 let supportsFetchThreadHistory = true;
+let renameThread: ChannelAdapter['renameThread'];
 
 function makeAdapter(): ChannelAdapter {
   const adapter: ChannelAdapter = {
@@ -92,6 +89,7 @@ function makeAdapter(): ChannelAdapter {
       return undefined;
     },
   };
+  adapter.renameThread = renameThread;
   if (supportsFetchThreadHistory) {
     adapter.fetchThreadHistory = async (threadId, opts) => {
       historyCalls.push({ threadId, opts });
@@ -175,9 +173,11 @@ function event(opts: {
   kind?: 'chat' | 'chat-sdk';
   attachments?: unknown[];
   timestamp?: string;
+  author?: { isBot: boolean };
 }): InboundEvent {
   const content: Record<string, unknown> = { sender: opts.sender ?? 'Sender One', text: opts.text };
   if (opts.attachments) content.attachments = opts.attachments;
+  if (opts.author) content.author = opts.author;
   return {
     channelType: CHANNEL,
     platformId: PLATFORM_ID,
@@ -226,6 +226,7 @@ beforeEach(async () => {
   historyCalls = [];
   historyThrows = false;
   supportsFetchThreadHistory = true;
+  renameThread = undefined;
   vi.mocked(archiveMessage).mockReset();
 });
 
@@ -267,6 +268,19 @@ describe('non-engaged session skip', () => {
       expect(texts[0]).toContain('deploy finished, all green');
       expect(texts[0]).toContain('nice, did staging pick it up?');
       expect(texts[0]).toContain('[Latest message]\n@agent what happened here?');
+    });
+  });
+
+  it.each([
+    [{ isBot: true }, true],
+    [{ isBot: false }, false],
+    [undefined, undefined],
+  ])('archives the adapter flag author=%j as senderIsBot=%j', async (author, senderIsBot) => {
+    await wire();
+    await withAdapter(async () => {
+      const { routeInbound } = await import('./router.js');
+      await routeInbound(event({ id: 'm-1', text: 'build 41 passed', author }));
+      expect(vi.mocked(archiveMessage).mock.calls[0]![0].senderIsBot).toBe(senderIsBot);
     });
   });
 
@@ -425,6 +439,45 @@ describe('non-engaged session skip', () => {
       expect(text).toContain('chatter 70');
       expect(text).toContain('chatter 119');
     });
+  });
+});
+
+describe('the title row of a new thread', () => {
+  const rowOf = (threadId: string) =>
+    getDb().get<{ title_source: string | null }>('SELECT * FROM thread_titles WHERE thread_id = ?', threadId);
+
+  async function routeWithRenamableAdapter(message: Parameters<typeof event>[0]): Promise<void> {
+    renameThread = vi.fn();
+    await withAdapter(async () => {
+      const { routeInbound } = await import('./router.js');
+      await routeInbound(event(message));
+    });
+  }
+
+  it('is written when the message that wakes the agent opened the thread', async () => {
+    await wire();
+    await routeWithRenamableAdapter({ id: THREAD.split(':').pop()!, text: '@agent the rollout', isMention: true });
+
+    expect(await rowOf(THREAD)).toMatchObject({ title_source: 'auto' });
+  });
+
+  it('is not written for a message in a thread someone else opened', async () => {
+    await wire();
+    await routeWithRenamableAdapter({ id: 'm-reply', text: '@agent the rollout', isMention: true });
+
+    expect(await rowOf(THREAD)).toBeUndefined();
+  });
+
+  it('is not written for an opener that makes a session without waking the agent', async () => {
+    await wire();
+    await routeWithRenamableAdapter({
+      id: THREAD.split(':').pop()!,
+      text: 'a screenshot, no mention',
+      attachments: [{ filename: 'report.pdf', data: '' }],
+    });
+
+    expect(await findSessionForAgent(AG, MG, THREAD)).toBeDefined();
+    expect(await rowOf(THREAD)).toBeUndefined();
   });
 });
 

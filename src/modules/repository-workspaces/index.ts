@@ -1,6 +1,7 @@
-import { execFileSync } from 'child_process';
+import { execFile, execFileSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
+import { promisify } from 'util';
 
 import {
   quiesceSessionsForRepositoryMounts,
@@ -15,17 +16,13 @@ import { MANAGED_GIT_HOOKS_SCAN_DIR, isScanPolicyRepositoryName } from '../../ma
 import { getAgentGroup } from '../../db/agent-groups.js';
 import { getDb } from '../../db/connection.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
-import {
-  DEPENDENCY_CACHE_DIRNAME,
-  linkPackageDir,
-  startDependencyCachePass,
-  type DependencyCacheMode,
-} from '../../dependency-cache.js';
+import { DEPENDENCY_CACHE_DIRNAME, type DependencyCacheMode } from '../../dependency-cache.js';
 import { registerDeliveryAction, type DeliveryActionResult } from '../../delivery.js';
 import { containerRunsAsHostUser } from '../../github-token-file.js';
 import { unguarded } from '../../guard/index.js';
 import { log } from '../../log.js';
 import { resolveStoragePolicy } from '../../storage-manager.js';
+import { linkFarmsOffThread } from './farm-link-worker.js';
 import { REPOSITORY_REQUEST_ID_PATTERN, runRepositoryActionDetached } from './job-runner.js';
 import {
   assertRepositoryName,
@@ -123,6 +120,21 @@ function git(cwd: string, args: string[], timeout = 120_000): string {
     stdio: ['ignore', 'pipe', 'pipe'],
     timeout,
   }).trim();
+}
+
+const execFileAsync = promisify(execFile);
+
+/** For a git that can run for seconds or minutes: `git` holds the host's whole event loop until the child exits. */
+async function gitOffLoop(cwd: string, args: string[], timeout: number): Promise<string> {
+  const config = path.join(cwd, '.git', 'config');
+  const run = execFileAsync('git', safeGitArgs(args, fs.existsSync(config) ? config : undefined), {
+    cwd,
+    env: safeGitEnv(),
+    encoding: 'utf8',
+    timeout,
+  });
+  run.child.stdin?.end();
+  return (await run).stdout.trim();
 }
 
 function tryGit(cwd: string, args: string[], timeout = 120_000): string | null {
@@ -879,15 +891,15 @@ function objectsAreLinked(clonePath: string): boolean {
 }
 
 /** Under the repository flock because it reads the canonical. */
-function stageClone(input: { canonical: string; staging: string; branch: string; pin: OriginPin }): {
+async function stageClone(input: { canonical: string; staging: string; branch: string; pin: OriginPin }): Promise<{
   startedFrom: CheckoutStartedFrom;
   startCommit: string;
   objectsLinked: boolean;
-} {
+}> {
   const { canonical, staging, branch, pin } = input;
   // Hardlinks the canonical's objects without writing alternates (no
   // --shared), so canonical GC cannot break the clone.
-  git(path.dirname(staging), ['clone', '--no-checkout', '--quiet', canonical, staging], 600_000);
+  await gitOffLoop(path.dirname(staging), ['clone', '--no-checkout', '--quiet', canonical, staging], 600_000);
   const objectsLinked = objectsAreLinked(staging);
 
   // Neither the refs clone maps into refs/remotes nor its guessed local branch
@@ -905,7 +917,11 @@ function stageClone(input: { canonical: string; staging: string; branch: string;
     git(staging, ['remote', 'remove', 'origin'], 10_000);
   } else {
     git(staging, ['config', 'remote.origin.url', pin.origin], 10_000);
-    git(staging, ['fetch', '--quiet', '--no-tags', canonical, '+refs/remotes/origin/*:refs/remotes/origin/*'], 600_000);
+    await gitOffLoop(
+      staging,
+      ['fetch', '--quiet', '--no-tags', canonical, '+refs/remotes/origin/*:refs/remotes/origin/*'],
+      600_000,
+    );
     // The glob copies origin/HEAD as a plain ref; the canonical's is symbolic.
     deleteRefs(staging, ['refs/remotes/origin/HEAD']);
     const originHead = tryGit(canonical, ['symbolic-ref', '--quiet', 'refs/remotes/origin/HEAD'], 10_000);
@@ -950,8 +966,12 @@ function stageClone(input: { canonical: string; staging: string; branch: string;
 }
 
 /** Only ever called on a staging clone, which no container can reach. */
-function checkoutPackageDirs(checkoutPath: string): string[] {
-  const listed = git(checkoutPath, ['ls-files', '-z', '--', 'package-lock.json', '*/package-lock.json'], 60_000);
+async function checkoutPackageDirs(checkoutPath: string): Promise<string[]> {
+  const listed = await gitOffLoop(
+    checkoutPath,
+    ['ls-files', '-z', '--', 'package-lock.json', '*/package-lock.json'],
+    60_000,
+  );
   const dirs = new Set<string>();
   for (const rel of listed.split('\0').filter(Boolean)) {
     if (rel.split('/').includes('node_modules')) continue;
@@ -961,32 +981,23 @@ function checkoutPackageDirs(checkoutPath: string): string[] {
 }
 
 /** Returns how many farms it linked; `linkPackageDir` decides and WARNs. */
-function linkCheckoutFarms(
+async function linkCheckoutFarms(
   checkoutPath: string,
   workgroupId: string,
   farms: CheckoutFarmPolicy,
   dataDir: string,
-): number {
+): Promise<number> {
   if (farms.mode === 'off') return 0;
-  const pkgDirs = checkoutPackageDirs(checkoutPath);
+  const pkgDirs = await checkoutPackageDirs(checkoutPath);
   if (pkgDirs.length === 0) return 0;
-  const pass = startDependencyCachePass({
+  return linkFarmsOffThread({
     mode: farms.mode === 'apply' ? 'apply' : 'report',
     // Beside v2-topics, so every link stays on one mount.
     cacheRoot: path.join(path.resolve(dataDir), DEPENDENCY_CACHE_DIRNAME),
-    now: Date.now(),
-    reclaimableBytes: () => 0,
-    fingerprint: farms.fingerprint,
+    workgroupId,
+    pkgDirs,
+    fingerprint: farms.fingerprint?.(),
   });
-  let linked = 0;
-  for (const pkgDir of pkgDirs) {
-    try {
-      if (linkPackageDir(pass, workgroupId, pkgDir) === 'linked' && pass.mode === 'apply') linked += 1;
-    } catch (err) {
-      log.warn('Repository checkout could not link a dependency farm', { path: pkgDir, err });
-    }
-  }
-  return linked;
 }
 
 function checkoutFarmPolicyFromEnvironment(): CheckoutFarmPolicy {
@@ -1027,7 +1038,7 @@ async function createCheckout(input: {
         canonical: input.canonical,
       });
     }
-    git(staging, ['checkout', '--quiet', '--force', target.branch], 600_000);
+    await gitOffLoop(staging, ['checkout', '--quiet', '--force', target.branch], 600_000);
     git(staging, ['config', 'gc.auto', '0'], 10_000);
     writeCheckoutMetadata(staging, {
       version: 1,
@@ -1037,9 +1048,13 @@ async function createCheckout(input: {
       startedFrom: staged.startedFrom,
     });
     await checkoutHooks.afterStagingPopulated?.(staging);
-    farmsLinked = linkCheckoutFarms(staging, input.workgroupId, input.farms, input.dataDir);
+    farmsLinked = await linkCheckoutFarms(staging, input.workgroupId, input.farms, input.dataDir);
     // Inherited tags; the disposability proof skips them while unchanged.
-    const inheritedTags = git(staging, ['for-each-ref', '--format=%(objectname) %(refname)', 'refs/tags'], 60_000);
+    const inheritedTags = await gitOffLoop(
+      staging,
+      ['for-each-ref', '--format=%(objectname) %(refname)', 'refs/tags'],
+      60_000,
+    );
     const identity = cloneIdentity(staging);
     if (identity === null) throw new RepositoryCheckoutError(`${target.dirName} staging has no .git directory`);
     // rename(2) would replace an empty directory, so anything at the target refuses.

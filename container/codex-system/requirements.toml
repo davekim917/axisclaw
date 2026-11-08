@@ -1,0 +1,4 @@
+# Installed root-owned at /etc/codex/requirements.toml. Codex enforces this layer over every user, project and
+# command-line setting, so `--disable hooks` or `-c features.hooks=false` cannot switch off /etc/codex/hooks.json.
+[features]
+hooks = true

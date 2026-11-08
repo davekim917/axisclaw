@@ -6,6 +6,7 @@ import fsSync from 'fs';
 import cpSync from 'child_process';
 
 import {
+  BASE_IMAGE_ID_LABEL,
   checkAgentRunnerDepsDrift,
   classifyLabels,
   computeAgentRunnerDepsHash,
@@ -485,6 +486,67 @@ describe('checkAgentRunnerDepsDrift result cache', () => {
     } finally {
       await utimes(pkgPath, original.atime, original.mtime);
     }
+  });
+});
+
+describe('checkAgentRunnerDepsDrift on a per-agent image derived from the base', () => {
+  const imageRef = 'nanoclaw-agent-derived-test:ag-fixture';
+  const derivedLabels = (deps: string, base?: string): string =>
+    JSON.stringify({
+      'nanoclaw.agentRunnerDepsHash': deps,
+      ...(base ? { [BASE_IMAGE_ID_LABEL]: base } : {}),
+    });
+
+  it('refuses as an inspect failure, not as drift, when the base cannot be inspected', async () => {
+    const expected = await computeAgentRunnerDepsHash();
+    const r = await checkAgentRunnerDepsDrift(imageRef, {
+      derivedFromBase: true,
+      inspect: async () => derivedLabels(expected, 'sha256:base-fixture-a'),
+      inspectId: async () => {
+        throw new Error('Cannot connect to the Docker daemon at unix:///var/run/docker.sock');
+      },
+      retryDelayMs: 0,
+    });
+
+    expect(r.ok).toBe(false);
+    expect(r.lookup.kind).toBe('inspect-error');
+    expect(r.message).toMatch(/NOT drift/);
+  });
+
+  it('reports a missing base as no-image, so the rebuild path asks for the base first', async () => {
+    const expected = await computeAgentRunnerDepsHash();
+    const r = await checkAgentRunnerDepsDrift(imageRef, {
+      derivedFromBase: true,
+      inspect: async () => derivedLabels(expected, 'sha256:base-fixture-a'),
+      inspectId: async () => {
+        throw new Error(`Error: No such image: ${CONTAINER_IMAGE}`);
+      },
+      retryDelayMs: 0,
+    });
+
+    expect(r.ok).toBe(false);
+    expect(r.lookup.kind).toBe('no-image');
+  });
+
+  it('does not serve a cached pass once the base has been rebuilt', async () => {
+    const expected = await computeAgentRunnerDepsHash();
+    const inspect = async (): Promise<string> => derivedLabels(expected, 'sha256:base-fixture-a');
+
+    const before = await checkAgentRunnerDepsDrift(imageRef, {
+      derivedFromBase: true,
+      inspect,
+      inspectId: async () => 'sha256:base-fixture-a\n',
+      retryDelayMs: 0,
+    });
+    const after = await checkAgentRunnerDepsDrift(imageRef, {
+      derivedFromBase: true,
+      inspect,
+      inspectId: async () => 'sha256:base-fixture-b\n',
+      retryDelayMs: 0,
+    });
+
+    expect(before.ok).toBe(true);
+    expect(after).toMatchObject({ ok: false, expected: 'sha256:base-fixture-b', actual: 'sha256:base-fixture-a' });
   });
 });
 

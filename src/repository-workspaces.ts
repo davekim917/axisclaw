@@ -123,16 +123,50 @@ export function ensureRepositoryLock(workgroupId: string, repo: string, dataDir:
   return ensureLockFile(repositoryLockPath(workgroupId, repo, dataDir));
 }
 
-/** Exclusive, 120s wait, lock identity verified after acquisition (mechanism in `file-lock.ts`). */
+/**
+ * `flock`'s timeout runs from when a waiter starts it, so in a burst every clock starts together and the fourth waiter
+ * behind 50 s holders times out. Queued here, a waiter's clock starts at the head of the line. 600 s bounds the line:
+ * the worst burst seen is 5 starts on one repository, and the slowest checkout took 105 s.
+ */
+export const REPOSITORY_LOCK_QUEUE_WAIT_MS = 600_000;
+
+const repositoryLockQueues = new Map<string, Promise<void>>();
+
+async function waitForRepositoryLockTurn(ahead: Promise<void>, label: string): Promise<void> {
+  let deadline: ReturnType<typeof setTimeout> | undefined;
+  const expired = new Promise<never>((_, reject) => {
+    deadline = setTimeout(() => reject(new Error(`timed out queueing for ${label}`)), REPOSITORY_LOCK_QUEUE_WAIT_MS);
+  });
+  try {
+    await Promise.race([ahead, expired]);
+  } finally {
+    clearTimeout(deadline);
+  }
+}
+
+/** Exclusive, in arrival order within this process, lock identity verified after acquisition (`file-lock.ts`). */
 export async function withHostRepositoryLock<T>(
   workgroupId: string,
   repo: string,
   fn: () => Promise<T> | T,
   dataDir: string = DATA_DIR,
 ): Promise<T> {
-  return withFileLock(ensureRepositoryLock(workgroupId, repo, dataDir), fn, {
-    label: `repository lock for ${workgroupId}/${repo}`,
+  const lockFile = ensureRepositoryLock(workgroupId, repo, dataDir);
+  const label = `repository lock for ${workgroupId}/${repo}`;
+  const ahead = repositoryLockQueues.get(lockFile) ?? Promise.resolve();
+  let finish!: () => void;
+  const finished = new Promise<void>((resolve) => {
+    finish = resolve;
   });
+  const tail = ahead.then(() => finished);
+  repositoryLockQueues.set(lockFile, tail);
+  try {
+    await waitForRepositoryLockTurn(ahead, label);
+    return await withFileLock(lockFile, fn, { label });
+  } finally {
+    finish();
+    if (repositoryLockQueues.get(lockFile) === tail) repositoryLockQueues.delete(lockFile);
+  }
 }
 
 export async function withRepositoryLifecycleClaims<T>(

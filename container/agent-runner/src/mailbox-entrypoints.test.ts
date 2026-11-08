@@ -28,6 +28,8 @@ const ENTRYPOINT_MARKERS = [/^#!/, /import\.meta\.main/, /^main\(\)\.(?:catch|th
 const NO_BOOT_REQUIRED: Record<string, string> = {
   'mcp-tools/memory-write-process-helper.ts':
     'imports mcp-tools/memory-write.ts for writeMemoryFile; the mailbox arrives via that module’s registerTools import and no mailbox op is ever called',
+  'codex-plugin-registration.ts':
+    'reaches the mailbox only through codex-app-server -> codex-rate-limits, which the registration path never calls; it registers Codex plugins and writes CODEX_HOME config from an agent shell, and booting there would make that shell a second writer of outbound.db',
   'scheduling/wiki-lint-gate.ts':
     'calls exactly one op, readSeriesLastCompletedRun, which opens its own read-only inbound and outbound handles and closes them; the gate runs as a pre-task subprocess alongside the runner that owns outbound.db, so booting would make a read-only gate a second writer of the fork schema',
 };

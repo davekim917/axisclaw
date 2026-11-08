@@ -234,6 +234,14 @@ function touchesManagedGitHooksRoot(realPath: string): ProtectedTreeHit {
 }
 
 /**
+ * Approved-run: an operator runs whatever `run.sh` there says, and the tree holds database admin strings and the
+ * render mask key; containers run as the host uid, so file modes are no barrier and no mount may reach it.
+ */
+function touchesApprovedRunRoot(realPath: string): ProtectedTreeHit {
+  return touchesDataDirLeaf('approved-run', realPath);
+}
+
+/**
  * The blocked pattern only inspects the selected path, never its descendants,
  * so this closes the ancestor case (a mount of `data/` or `$HOME`). Unlike the
  * git-hooks check it refuses READ-ONLY mounts too: reading a bundle is the harm.
@@ -388,7 +396,14 @@ export function validateMount(mount: AdditionalMount): MountValidationResult {
     };
   }
 
-  // Fail closed; both checks share `touchesDataDirLeaf`, so this branch covers git-hooks too.
+  if (touchesApprovedRunRoot(realPath) === 'touches') {
+    return {
+      allowed: false,
+      reason: `Path "${realPath}" reaches the approved-run handoff tree — refused unconditionally, read-only included`,
+    };
+  }
+
+  // Fail closed; every check shares `touchesDataDirLeaf`, so this branch covers the others too.
   if (oauthHit === 'unverifiable') {
     return {
       allowed: false,

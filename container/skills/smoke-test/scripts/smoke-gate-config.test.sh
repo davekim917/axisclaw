@@ -120,6 +120,28 @@ OUT="$(run_config "$GATE" SMOKE_PREVIEW_PROVIDER=static SMOKE_GATE_FRONTEND_SERV
 OUT="$(run_config "$GATE" SMOKE_PREVIEW_PROVIDER=static SMOKE_GATE_FRONTEND_SERVICE='https://web-pr-{pr}.acme.example' SMOKE_GATE_BACKEND_SERVICE='https://{branch}.api.acme.example')"; RC=$?
 [ "$RC" -eq 0 ] && ok "static provider with templates ok" || fail "static ok: rc=$RC $OUT"
 
+# The PR gate's `liveness` answers with the lease TTL and liveness window it
+# applies, side-effect-free; a value num_env refuses answers as its default.
+liveness() { env -i "${BASE_ENV[@]}" "$@" bash "$GATE" liveness 2>/dev/null; }
+fixture; BEFORE="$(snapshot)"; rm -f "$T/remote-calls"
+[ "$(liveness | jq -c .)" = '{"ok":true,"leaseTtlSeconds":900,"progressStaleSeconds":1800}' ] \
+  && ok "liveness: defaults" || fail "liveness defaults: $(liveness)"
+[ "$(snapshot)" = "$BEFORE" ] && [ ! -e "$T/remote-calls" ] && ok "liveness touches nothing" \
+  || fail "liveness changed state or called out"
+[ "$(liveness SMOKE_GATE_LEASE_TTL_SECONDS=3600 SMOKE_GATE_PROGRESS_STALE_SECONDS=3601 \
+  | jq -c '[.leaseTtlSeconds,.progressStaleSeconds]')" = '[3600,3601]' ] \
+  && ok "liveness: set values" || fail "liveness set values"
+for raw in 03600 $'3600\n' $'3600\r' $'3600\f' 3600s ''; do
+  [ "$(liveness SMOKE_GATE_LEASE_TTL_SECONDS="$raw" | jq -c .leaseTtlSeconds)" = 900 ] \
+    || fail "liveness: $(printf %q "$raw") must read as the default"
+done
+ok "liveness: refused values read as the default"
+# Through a wrapper that sources a CRLF env file, as an install's does.
+printf 'export SMOKE_GATE_LEASE_TTL_SECONDS=3600\r\n' >"$T/crlf-env.sh"
+printf '. "%s"\nexec bash "%s" "$@"\n' "$T/crlf-env.sh" "$GATE" >"$T/wrap-crlf.sh"
+[ "$(env -i "${BASE_ENV[@]}" bash "$T/wrap-crlf.sh" liveness 2>/dev/null | jq -c .leaseTtlSeconds)" = 900 ] \
+  && ok "liveness: a CRLF env file's value is not in force" || fail "liveness through a CRLF wrapper"
+
 # The develop gate's config also enforces agreement with the PR gate's env file,
 # and dropping that comparison is caught.
 GATE="$SCRIPT_DIR/smoke-develop-gate.sh"

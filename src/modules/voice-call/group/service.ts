@@ -1,29 +1,30 @@
 import { randomBytes } from 'crypto';
 
-import { botTokenKeyForChannelType, slackRead } from '../../../channels/slack-lib.js';
-import { extractSlackChannelId } from '../../../channels/slack.js';
+import { neutralizeMentions } from '../../../channels/neutralize-mentions.js';
 import { PREVIEW_ORIGIN_SUFFIX, TIMEZONE, VOICE_CALL_CODEX_BIN } from '../../../config.js';
 import { deriveHumanRequest, type HumanRequest } from '../../../caller-identity.js';
 import { withCentralSync } from '../../../db/central-lease.js';
 import { getAgentGroup } from '../../../db/agent-groups.js';
 import { getMessagingGroup } from '../../../db/messaging-groups.js';
 import { getSession } from '../../../db/sessions.js';
-import { readEnvFile } from '../../../env.js';
 import { onHostShutdown, onHostStart } from '../../../host-lifecycle.js';
 import { log } from '../../../log.js';
 import { requestWake } from '../../../request-wake.js';
 import { writeSessionMessage } from '../../../session-manager.js';
 import { formatLocalTime } from '../../../timezone.js';
-import { isChannelVariant } from '../../../types.js';
+import type { MessagingGroup, Session } from '../../../types.js';
 import { getUser } from '../../permissions/db/users.js';
 import { ensureUserDm } from '../../permissions/user-dm.js';
 import { VoiceCallBridge, type AdmittedRequest, type CallPorts } from '../call.js';
+import { DiscordBusy, type CallPlace, placeOf, platformOf, rawUserId, whoCanSee } from './place.js';
 import { openLiveCall, readCodexLogin } from '../live.js';
-import { groupRequestText } from '../prompts.js';
+import { groupRequestText, platformName, voiceMirror } from '../prompts.js';
 import { groupCallSessions, type CallPageEvent, type CallRoute } from '../registry.js';
 import {
   deliverText,
+  dmRoute,
   mayCall,
+  mintVoiceCall,
   RING_MS,
   spokenName,
   voiceCallsEnabledFor,
@@ -66,10 +67,11 @@ const KEEP_ACTIVITY_SECONDS = 120;
 const REMOVE_ATTEMPTS = 3;
 const MEMBERSHIP_ATTEMPTS = 3;
 const MEMBERSHIP_RETRY_MS = 2000;
-const MAX_MEMBER_PAGES = 200;
 /** How long a link opened before the room is up waits for it, rather than failing. */
 const ROOM_START_WAIT_MS = 60_000;
 const MAX_POLL_FAILURES = 5;
+/** How long a published voice waits to hear that someone has its track before it greets anyway. */
+const HEARD_WAIT_MS = 5000;
 const LINK_ID_RE = /^[0-9a-f]{32}$/;
 
 export type GroupPageEvent = CallPageEvent | { type: 'request'; speaker: string; text: string };
@@ -88,19 +90,30 @@ interface Participant {
   listeners: Set<(event: GroupPageEvent) => void>;
 }
 
+/** A call in a person's own one-to-one DM: it hears only that DM, so only that person may be on it. */
+interface DmPlace {
+  platform: CallPlace['platform'];
+  dm: true;
+  ownerId: string;
+}
+
 interface GroupCall {
   id: string;
   sessionId: string;
   agentGroupId: string;
   agentName: string;
   route: CallRoute;
-  channelId: string;
+  place: CallPlace | DmPlace;
   state: 'starting' | 'live' | 'ended';
   startedAt: number;
   people: Map<string, Participant>;
   browser: BridgeBrowser | null;
   voice: VoiceCallBridge | null;
   voiceStarting: boolean;
+  /** When the bridge first reported the voice's track in the room. */
+  voicePublishedAt: number | null;
+  /** Steps of the voice coming up already logged, so each logs once. */
+  logged: Set<string>;
   everJoined: boolean;
   /** Identities in the room at the last poll. */
   present: Set<string>;
@@ -149,6 +162,22 @@ export function groupCallLive(sessionId: string): boolean {
   return liveCallFor(sessionId) !== null;
 }
 
+const peoplePresent = (call: GroupCall) =>
+  [...call.present]
+    .map((id) => [...call.people.values()].find((p) => p.identity === id)?.name)
+    .filter((name): name is string => Boolean(name));
+
+/** Who is in the room of the call live in this session, or null when there is no live call. */
+export function groupCallPeople(sessionId: string): string[] | null {
+  const call = liveCallFor(sessionId);
+  return call && peoplePresent(call);
+}
+
+export const occupiedCallSessions = () =>
+  [...groupCalls.values()]
+    .filter((call) => call.state !== 'ended' && peoplePresent(call).length > 0)
+    .map((call) => call.sessionId);
+
 export function linkFor(linkId: string): { call: GroupCall; person: Participant } | null {
   if (!LINK_ID_RE.test(linkId)) return null;
   const found = links.get(linkId);
@@ -179,39 +208,17 @@ function closeStreams(person: Participant, text: string): void {
   person.listeners.clear();
 }
 
-/**
- * Which of these Slack users are in the conversation the call came from: the call hears that thread, so only they may
- * join. Pages the whole member list until every one is found, however large the channel.
- */
-async function inChannel(call: Pick<GroupCall, 'route' | 'channelId'>, userIds: string[]): Promise<Set<string>> {
-  const key = botTokenKeyForChannelType(call.route.channelType);
-  const token = readEnvFile([key])[key];
-  if (!token) throw new VoiceCallRefused('Group calls cannot check who is in this channel.');
-  const wanted = new Set(userIds.map(rawSlackId));
-  const found = new Set<string>();
-  if (wanted.size === 0) return found;
-  let cursor: string | undefined;
-  let pages = 0;
-  do {
-    if (++pages > MAX_MEMBER_PAGES) throw new VoiceCallRefused('Group calls could not check who is in this channel.');
-    const page = await slackRead(
-      token,
-      'conversations.members',
-      { channel: call.channelId, limit: 1000, ...(cursor ? { cursor } : {}) },
-      'group-call',
-    );
-    for (const member of (page.members as unknown[] | undefined) ?? [])
-      if (typeof member === 'string' && wanted.has(member)) found.add(member);
-    cursor = (page.response_metadata as { next_cursor?: string } | undefined)?.next_cursor || undefined;
-  } while (cursor && found.size < wanted.size);
-  return found;
+/** Of these people, the raw ids of those who can see the conversation the call hears. */
+async function viewers(call: Pick<GroupCall, 'route' | 'place'>, userIds: string[]): Promise<Set<string>> {
+  const { place } = call;
+  if ('dm' in place) return new Set(userIds.filter((id) => id === place.ownerId).map(rawUserId));
+  return whoCanSee(place, call.route.channelType, userIds);
 }
 
-const rawSlackId = (userId: string) => userId.slice(userId.indexOf(':') + 1);
-
-async function mayJoin(call: Pick<GroupCall, 'route' | 'channelId' | 'agentGroupId'>, userId: string) {
+/** The call hears its thread, so only people who can see that conversation may join it. */
+async function mayJoin(call: Pick<GroupCall, 'route' | 'place' | 'agentGroupId'>, userId: string) {
   if (!(await withCentralSync(() => mayCall(userId, call.agentGroupId), 'group-call caller check'))) return false;
-  return (await inChannel(call, [userId])).has(rawSlackId(userId));
+  return (await viewers(call, [userId])).has(rawUserId(userId));
 }
 
 async function admitSignal(linkId: string, claims: SignalClaims): Promise<boolean> {
@@ -225,7 +232,46 @@ async function admitSignal(linkId: string, claims: SignalClaims): Promise<boolea
   return allowed && !person.removed && !hasEnded(call);
 }
 
-async function sendLink(call: GroupCall, userId: string): Promise<{ sentTo: string; expiresAt: string }> {
+interface LinkSent {
+  sentTo: string;
+  expiresAt: string;
+}
+
+/**
+ * Gets a person their link. It runs before the link exists, so someone who cannot be reached leaves nothing on the
+ * call, and returns what hands the link over once it does. What that returns is all the requester learns.
+ */
+type LinkDelivery<R extends LinkSent> = (
+  call: GroupCall,
+  userId: string,
+) => Promise<(person: Participant) => Promise<R>>;
+
+const linkSent = (person: Participant): LinkSent => ({
+  sentTo: person.name,
+  expiresAt: new Date(person.linkExpiresAt).toISOString(),
+});
+
+/** The requester is the agent, so what it gets back never carries the link. */
+const byDm: LinkDelivery<LinkSent> = async (call, userId) => {
+  const dm = await stillOn(call, ensureUserDm(userId, { instance: call.route.instance, privacySafeLogs: true }));
+  if (!dm) throw new VoiceCallRefused('Could not open a DM to send the call link.');
+  return async (person) => {
+    await deliverText(
+      dmRoute(dm),
+      `📞 Tap to join the call with ${call.agentName}: ${groupCallUrl(person.linkId)}\nIt works once and expires at ${formatLocalTime(new Date(person.linkExpiresAt).toISOString(), TIMEZONE)}. Anyone with this link joins as you, so don't forward it.`,
+    );
+    return linkSent(person);
+  };
+};
+
+/** The requester is the person themselves, on a request their own device key authenticated. */
+const inResponse: LinkDelivery<LinkSent & { url: string; agentName: string }> = async (call) => async (person) => ({
+  ...linkSent(person),
+  url: groupCallUrl(person.linkId),
+  agentName: call.agentName,
+});
+
+async function mintLink<R extends LinkSent>(call: GroupCall, userId: string, deliver: LinkDelivery<R>): Promise<R> {
   const user = await stillOn(call, getUser(userId));
   const previous = call.people.get(userId);
   if (previous) {
@@ -234,8 +280,7 @@ async function sendLink(call: GroupCall, userId: string): Promise<{ sentTo: stri
   }
   if (!previous && [...call.people.values()].filter((p) => !p.removed).length >= MAX_PEOPLE)
     throw new VoiceCallRefused(`This group call is full (${MAX_PEOPLE} people).`);
-  const dm = await stillOn(call, ensureUserDm(userId, { instance: call.route.instance, privacySafeLogs: true }));
-  if (!dm) throw new VoiceCallRefused('Could not open a DM to send the call link.');
+  const handOver = await deliver(call, userId);
   const person: Participant = {
     userId,
     name: user?.display_name || 'Someone',
@@ -249,85 +294,215 @@ async function sendLink(call: GroupCall, userId: string): Promise<{ sentTo: stri
   };
   call.people.set(userId, person);
   links.set(person.linkId, { callId: call.id, userId });
-  await stillOn(
-    call,
-    deliverText(
-      {
-        channelType: dm.channel_type,
-        instance: dm.instance ?? dm.channel_type,
-        platformId: dm.platform_id,
-        threadId: null,
-      },
-      `📞 Tap to join the group call with ${call.agentName}: ${groupCallUrl(person.linkId)}\nIt works once and expires at ${formatLocalTime(new Date(person.linkExpiresAt).toISOString(), TIMEZONE)}. Anyone with this link joins as you, so don't forward it.`,
-    ),
-  );
-  return { sentTo: person.name, expiresAt: new Date(person.linkExpiresAt).toISOString() };
+  return stillOn(call, handOver(person));
+}
+
+export async function startCall(
+  input: { sessionId: string; agentGroupId: string },
+  opts: { group: boolean; invite?: string; direct?: boolean },
+): Promise<{ group: boolean; sentTo: string; expiresAt: string; joined?: boolean }> {
+  if (opts.invite !== undefined) return { group: true, joined: true, ...(await inviteToGroupCall(input, opts.invite)) };
+  if (
+    opts.group ||
+    (groupCallLive(input.sessionId) && (await inChannelThread(input.sessionId))) ||
+    (groupCallsConfigured() && !groupCallsFull() && (await inChannelThread(input.sessionId)))
+  )
+    return { group: true, ...(await startOrJoinGroupCall(input)) };
+  if (!opts.direct) {
+    const joined = await joinFromDm(input);
+    if (joined) return { group: true, joined: true, ...joined };
+  }
+  return { group: false, ...(await mintVoiceCall(input)) };
+}
+
+async function addToCall<R extends LinkSent>(call: GroupCall, userId: string, deliver: LinkDelivery<R>): Promise<R> {
+  const already = call.people.get(userId);
+  if (already && already.claimed && !already.removed && call.present.has(already.identity))
+    throw new VoiceCallRefused(`${already.name} is already on this call.`);
+  try {
+    if (!(await stillOn(call, mayJoin(call, userId))))
+      throw new VoiceCallRefused(
+        'dm' in call.place
+          ? 'Only the person whose DM this is can join this call.'
+          : 'Only people in this channel who can talk to this agent can join its group call.',
+      );
+    return await mintLink(call, userId, deliver);
+  } catch (err) {
+    if (err instanceof CallEnded) throw new VoiceCallRefused('That group call just ended; ask for a new one.');
+    throw err;
+  }
 }
 
 /**
- * `ncl voice call --group` starts a group call in this conversation, or adds the person who asked to the one already
- * live here. The host picks that person from the thread's latest human message, never from the agent.
+ * The agent names whom to invite, which `ncl voice call` otherwise never lets it do: the link still speaks only as
+ * that person and goes only to their DM, and they must be on the call's channel and allowed to talk to the agent.
  */
-export async function startOrJoinGroupCall(input: { sessionId: string; agentGroupId: string }): Promise<{
-  joined: boolean;
-  sentTo: string;
-  expiresAt: string;
-}> {
-  if (!voiceCallsEnabledFor(input.agentGroupId) || !groupCallsConfigured())
+async function inviteToGroupCall(input: { sessionId: string; agentGroupId: string }, who: string): Promise<LinkSent> {
+  const call = liveCallFor(input.sessionId);
+  if (!call || call.agentGroupId !== input.agentGroupId)
+    throw new VoiceCallRefused('No call is live in this conversation to invite someone to; start one first.');
+  const mention = /^<@([A-Z0-9]+)>$/i.exec(who.trim());
+  const raw = mention ? mention[1] : who.trim().slice(who.trim().indexOf(':') + 1);
+  if (!/^[A-Z0-9]+$/i.test(raw))
+    throw new VoiceCallRefused('Invite someone by their user id or mention, not their name.');
+  return addToCall(call, `${call.route.channelType}:${raw}`, byDm);
+}
+
+async function joinFromDm(input: { sessionId: string; agentGroupId: string }): Promise<LinkSent | null> {
+  if (!voiceCallsEnabledFor(input.agentGroupId) || !groupCallsConfigured()) return null;
+  const session = await getSession(input.sessionId);
+  if (!session || session.agent_group_id !== input.agentGroupId || !session.messaging_group_id) return null;
+  const mg = await getMessagingGroup(session.messaging_group_id);
+  if (!mg || placeOf(mg, null) !== 'dm') return null;
+  const request = await deriveHumanRequest(session);
+  if (!request) return null;
+  const live = [...groupCalls.values()]
+    .filter((c) => c.state !== 'ended' && c.agentGroupId === input.agentGroupId)
+    .filter((c) => c.route.channelType === request.route.channelType)
+    .sort((a, b) => Number(b.people.has(request.userId)) - Number(a.people.has(request.userId)));
+  for (const call of live) {
+    const allowed = await mayJoin(call, request.userId).catch(() => false);
+    if (allowed && !hasEnded(call)) return addToCall(call, request.userId, byDm);
+  }
+  return null;
+}
+
+const groupCallsFull = () => [...groupCalls.values()].filter((c) => c.state !== 'ended').length >= MAX_GROUP_CALLS;
+
+function refuseIfFull(): void {
+  if (groupCallsFull()) throw new VoiceCallRefused('Too many group calls are live on this host right now.');
+}
+
+function refuseIfDisabled(agentGroupId: string): void {
+  if (!voiceCallsEnabledFor(agentGroupId) || !groupCallsConfigured())
     throw new VoiceCallRefused('Group calls are not enabled for this agent.');
+}
+
+/** For a caller about to post a thread for a call: refused afterwards, that thread is stranded with no call in it. */
+export function refuseIfCallCannotOpen(agentGroupId: string): void {
+  refuseIfDisabled(agentGroupId);
+  refuseIfFull();
+}
+
+async function inChannelThread(sessionId: string): Promise<boolean> {
+  const session = await getSession(sessionId);
+  const mg = session?.messaging_group_id ? await getMessagingGroup(session.messaging_group_id) : null;
+  return !!mg && typeof placeOf(mg, null) === 'object';
+}
+
+async function threadFor(input: { sessionId: string; agentGroupId: string }) {
+  refuseIfDisabled(input.agentGroupId);
   const session = await getSession(input.sessionId);
   if (!session || session.agent_group_id !== input.agentGroupId || !session.messaging_group_id)
     throw new VoiceCallRefused('Group calls start from a conversation thread.');
-  const mg = await getMessagingGroup(session.messaging_group_id);
-  if (!mg || !(mg.channel_type === 'slack' || isChannelVariant(mg.channel_type, 'slack')))
-    throw new VoiceCallRefused('Group calls start from Slack only for now.');
-  const channelId = extractSlackChannelId(mg.platform_id);
-  if (channelId.startsWith('D'))
-    throw new VoiceCallRefused('Group calls start from a channel; in a DM, ask for a call.');
-  const request: HumanRequest | null = await deriveHumanRequest(session);
+  return { session, mg: await getMessagingGroup(session.messaging_group_id) };
+}
+
+function callPlaceOf(
+  mg: MessagingGroup | undefined,
+  threadId: string | null,
+): { mg: MessagingGroup; place: CallPlace } {
+  const place = mg ? placeOf(mg, threadId) : null;
+  if (!mg || !place) throw new VoiceCallRefused('Group calls start from Slack or Discord.');
+  if (place === 'dm') throw new VoiceCallRefused('Group calls start from a channel; in a DM, ask for a call.');
+  return { mg, place };
+}
+
+/** The host picks the person to add from the thread's latest human message, never from the agent. */
+export async function startOrJoinGroupCall(input: {
+  sessionId: string;
+  agentGroupId: string;
+}): Promise<LinkSent & { joined: boolean }> {
+  const { session, mg: found } = await threadFor(input);
+  const request: HumanRequest | null = found ? await deriveHumanRequest(session) : null;
+  const { mg, place } = callPlaceOf(found, request?.route.threadId ?? null);
   if (!request) throw new VoiceCallRefused('No person has asked in this thread, so there is no one to call.');
   const route: CallRoute = { ...request.route, instance: mg.instance ?? mg.channel_type, messagingGroupId: mg.id };
+  return openOrFindCall({ session, mg, route, place, userId: request.userId }, byDm);
+}
 
-  const existing = liveCallFor(session.id);
-  if (existing) {
-    const already = existing.people.get(request.userId);
-    // The asker is the latest person who typed in the thread, so a request spoken on the call would otherwise pull
-    // someone already on it out to re-send their link.
-    if (already && already.claimed && !already.removed && existing.present.has(already.identity))
-      throw new VoiceCallRefused(
-        `${already.name} is already on this call. Anyone else who wants to join asks in Slack to be added.`,
-      );
-    try {
-      if (!(await stillOn(existing, mayJoin(existing, request.userId))))
-        throw new VoiceCallRefused('Only people in this channel who can talk to this agent can join its group call.');
-      return { joined: true, ...(await sendLink(existing, request.userId)) };
-    } catch (err) {
-      if (err instanceof CallEnded) throw new VoiceCallRefused('That group call just ended; ask for a new one.');
-      throw err;
-    }
-  }
-  if ([...groupCalls.values()].filter((c) => c.state !== 'ended').length >= MAX_GROUP_CALLS)
-    throw new VoiceCallRefused('Too many group calls are live on this host right now.');
-  const pending = { route, channelId, agentGroupId: input.agentGroupId };
-  if (!(await mayJoin(pending, request.userId)))
-    throw new VoiceCallRefused('Only people in this channel who can talk to this agent can start a group call.');
+/** For a person the app authenticated, who asks for themselves: no thread message names them, so the session routes. */
+export async function startOrJoinGroupCallAs(input: { sessionId: string; agentGroupId: string }, userId: string) {
+  const { session, mg: found } = await threadFor(input);
+  const { mg, place } = callPlaceOf(found, session.thread_id);
+  const route: CallRoute = {
+    channelType: mg.channel_type,
+    instance: mg.instance ?? mg.channel_type,
+    platformId: mg.platform_id,
+    threadId: session.thread_id,
+    messagingGroupId: mg.id,
+  };
+  return openOrFindCall({ session, mg, route, place, userId }, inResponse);
+}
 
-  const agentGroup = await getAgentGroup(input.agentGroupId);
+export async function startOrJoinDmCallAs(input: { sessionId: string; agentGroupId: string }, userId: string) {
+  const { session, mg } = await threadFor(input);
+  const platform = mg ? platformOf(mg.channel_type) : null;
+  if (!mg || !platform || placeOf(mg, session.thread_id) !== 'dm')
+    throw new VoiceCallRefused('A DM call starts from your own DM.');
+  const route: CallRoute = {
+    channelType: mg.channel_type,
+    instance: mg.instance ?? mg.channel_type,
+    platformId: mg.platform_id,
+    threadId: session.thread_id,
+    messagingGroupId: mg.id,
+  };
+  return openOrFindCall({ session, mg, route, place: { platform, dm: true, ownerId: userId }, userId }, inResponse);
+}
+
+function ownDmRoom(agentGroupId: string, ownerId: string): GroupCall | null {
+  for (const c of groupCalls.values())
+    if (c.state !== 'ended' && c.agentGroupId === agentGroupId && 'dm' in c.place && c.place.ownerId === ownerId)
+      return c;
+  return null;
+}
+
+/** The one path that finds the call live in a thread, or opens one, and mints this person's link to it. */
+async function openOrFindCall<R extends LinkSent>(
+  opening: { session: Session; mg: MessagingGroup; route: CallRoute; place: CallPlace | DmPlace; userId: string },
+  deliver: LinkDelivery<R>,
+): Promise<R & { joined: boolean }> {
+  const { session, mg, route, place, userId } = opening;
+  const agentGroupId = session.agent_group_id;
+  // A request spoken on the call names someone already on it, who must not be pulled out to re-send their link;
+  // addToCall refuses that.
+  const join = async (call: GroupCall) => ({ ...(await addToCall(call, userId, deliver)), joined: true });
+  const live = () => liveCallFor(session.id) ?? ('dm' in place ? ownDmRoom(agentGroupId, place.ownerId) : null);
+
+  const existing = live();
+  if (existing) return join(existing);
+  refuseIfFull();
+  if (!(await mayJoin({ route, place, agentGroupId }, userId)))
+    throw new VoiceCallRefused(
+      'dm' in place
+        ? 'Only people who can talk to this agent can call it from their DM.'
+        : 'Only people in this channel who can talk to this agent can start a group call.',
+    );
+  const agentGroup = await getAgentGroup(agentGroupId);
+  const agentName = agentGroup ? await spokenName(agentGroup, mg.id) : 'your agent';
+
+  // Those checks awaited, so another request can have opened this thread's call, or taken the host's last one.
+  const opened = live();
+  if (opened) return join(opened);
+  refuseIfFull();
+
   let settle!: () => void;
   const settled = new Promise<void>((resolve) => (settle = resolve));
   const call: GroupCall = {
     id: randomBytes(16).toString('hex'),
     sessionId: session.id,
-    agentGroupId: input.agentGroupId,
-    agentName: agentGroup ? await spokenName(agentGroup, mg.id) : 'your agent',
+    agentGroupId,
+    agentName,
     route,
-    channelId,
+    place,
     state: 'starting',
     startedAt: Date.now(),
     people: new Map(),
     browser: null,
     voice: null,
     voiceStarting: false,
+    voicePublishedAt: null,
+    logged: new Set(),
     everJoined: false,
     present: new Set(),
     emptySince: null,
@@ -346,21 +521,22 @@ export async function startOrJoinGroupCall(input: { sessionId: string; agentGrou
   };
   groupCalls.set(call.id, call);
   groupCallSessions.set(call.sessionId, call.startedAt + GROUP_CALL_MAX_MS);
-  let sent: { sentTo: string; expiresAt: string };
+  let sent: R;
   try {
-    sent = await sendLink(call, request.userId);
+    sent = await mintLink(call, userId, deliver);
   } catch (err) {
     if (err instanceof CallEnded) throw new VoiceCallRefused('The group call ended before it started.');
     await endGroupCall(call, 'The call link could not be sent.');
     throw err;
   }
-  void deliverText(
-    route,
-    `📞 ${sent.sentTo} started a group call with ${call.agentName}. To join, ask ${call.agentName} to add you to the call; the link comes to your DM.`,
-  ).catch((err: unknown) => log.warn('Group call: thread post failed', { callId: call.id.slice(0, 8), err }));
+  if (!('dm' in place))
+    void deliverText(
+      route,
+      `📞 ${neutralizeMentions(sent.sentTo)} started a call with ${call.agentName}. Anyone in this channel can join: ask ${call.agentName} to add you, and the link comes to your DM.`,
+    ).catch((err: unknown) => log.warn('Group call: thread post failed', { callId: call.id.slice(0, 8), err }));
   void setUpRoom(call);
   log.info('Group call started', { callId: call.id.slice(0, 8), sessionId: session.id });
-  return { joined: false, ...sent };
+  return { ...sent, joined: false };
 }
 
 /** Read through a call so a check after an await is not narrowed away by one before it. */
@@ -488,25 +664,44 @@ async function pollOnce(call: GroupCall, browser: BridgeBrowser): Promise<void> 
     else if (!call.everJoined && now - call.startedAt > NOBODY_CAME_MS)
       await endGroupCall(call, 'Nobody joined the call.');
   }
-  if (call.voice && snapshot.live === 'connected') call.voice.audioConnected();
+  call.voice?.peopleOnCall(peoplePresent(call));
+  if (snapshot.live === 'connected') logOnce(call, 'voice connected');
+  if (snapshot.voice) {
+    call.voicePublishedAt ??= now;
+    logOnce(call, 'voice track published');
+  }
+  if (snapshot.voice === 'heard') logOnce(call, 'voice track heard');
+  // The voice's link to the service connects before anyone in the room can hear it, so a greeting sent then is lost.
+  const heard =
+    snapshot.voice === 'heard' || (call.voicePublishedAt !== null && now - call.voicePublishedAt >= HEARD_WAIT_MS);
+  if (call.voice && snapshot.live === 'connected' && heard) call.voice.audioConnected();
   if (snapshot.live === 'failed' || snapshot.live === 'closed')
     await endGroupCall(call, 'The voice connection dropped.');
+}
+
+function logOnce(call: GroupCall, step: string, fields: Record<string, unknown> = {}): void {
+  if (call.logged.has(step)) return;
+  call.logged.add(step);
+  log.info(`Group call: ${step}`, { callId: call.id.slice(0, 8), afterMs: Date.now() - call.startedAt, ...fields });
 }
 
 async function recheck(call: GroupCall): Promise<void> {
   if (call.state === 'ended') return;
   const onCall = [...call.people.values()].filter((p) => p.claimed && !p.removed).map((p) => p.userId);
   let members: Set<string> | null = null;
-  for (let attempt = 1; attempt <= MEMBERSHIP_ATTEMPTS && !members; attempt++) {
+  let rateLimited = false;
+  for (let attempt = 1; attempt <= MEMBERSHIP_ATTEMPTS && !members && !rateLimited; attempt++) {
     try {
-      members = await stillOn(call, inChannel(call, onCall));
+      members = await stillOn(call, viewers(call, onCall));
     } catch (err) {
       if (hasEnded(call)) return;
       log.warn('Group call: membership check failed', { callId: call.id.slice(0, 8), attempt, err });
-      if (attempt < MEMBERSHIP_ATTEMPTS) await new Promise((resolve) => setTimeout(resolve, MEMBERSHIP_RETRY_MS));
+      rateLimited = err instanceof DiscordBusy;
+      if (!rateLimited && attempt < MEMBERSHIP_ATTEMPTS)
+        await new Promise((resolve) => setTimeout(resolve, MEMBERSHIP_RETRY_MS));
     }
   }
-  if (!members) {
+  if (!members && !rateLimited) {
     await endGroupCall(call, 'The call ended because who may join it could not be checked.');
     return;
   }
@@ -520,10 +715,11 @@ async function recheck(call: GroupCall): Promise<void> {
       }
       continue;
     }
-    // Claimed while this check was asking Slack; their own claim checked them.
+    // Claimed while this check was asking the platform; their own claim checked them.
     if (!checked.has(person.userId)) continue;
+    // A rate limit says nothing about who can see the channel, so that half waits a round; this DB half does not.
     const allowed =
-      members.has(rawSlackId(person.userId)) &&
+      (!members || members.has(rawUserId(person.userId))) &&
       (await stillOn(
         call,
         withCentralSync(() => mayCall(person.userId, call.agentGroupId), 'group-call caller check'),
@@ -619,7 +815,12 @@ async function startVoice(call: GroupCall): Promise<void> {
   call.voiceStarting = true;
   try {
     const voice = new VoiceCallBridge(
-      { agentName: call.agentName, callerName: 'the group', group: true },
+      {
+        agentName: call.agentName,
+        callerName: 'dm' in call.place ? (call.people.get(call.place.ownerId)?.name ?? 'the caller') : 'the group',
+        group: true,
+        platform: platformName(call.route.channelType),
+      },
       portsFor(call),
     );
     call.voice = voice;
@@ -635,25 +836,24 @@ async function startVoice(call: GroupCall): Promise<void> {
   }
 }
 
-async function admit(
-  call: GroupCall,
-  turn: string,
-  now: number,
-): Promise<AdmittedRequest | 'not-addressed' | 'duplicate'> {
+async function admit(call: GroupCall, turn: string, now: number): Promise<AdmittedRequest | 'empty' | 'duplicate'> {
   const isName = nameMatcher(call.agentName);
-  const request = requestFromTurn(turn, isName, call.previous, now);
-  if (!request) return 'not-addressed';
+  const solo = call.present.size === 1;
+  const request = requestFromTurn(turn, isName, call.previous, now, solo);
+  if (!request) return 'empty';
   if (request === 'duplicate') return 'duplicate';
   call.previous = { turn, atMs: now };
   await poll(call).catch(() => undefined);
-  const identity = speakerOf({ pieces: call.pieces, frames: call.frames, slots: call.slots, isName });
+  const identity = solo
+    ? [...call.present][0]
+    : speakerOf({ pieces: call.pieces, frames: call.frames, slots: call.slots, isName });
   const speaker = identity ? ([...call.people.values()].find((p) => p.identity === identity)?.name ?? null) : null;
   const first = call.requests === 0;
   emit(call, { type: 'request', speaker: speaker ?? 'Someone', text: request.shown });
   return {
-    text: groupRequestText({ speaker, request: request.text, first }),
+    text: groupRequestText({ speaker, request: request.text, first, solo, dm: 'dm' in call.place }),
     sender: `${speaker ?? 'Someone on the call'} (voice)`,
-    mirror: `🎙️ *${speaker ?? 'Someone on the call'}* (voice): ${request.shown}`,
+    mirror: voiceMirror(speaker ?? 'Someone on the call', request.shown),
   };
 }
 
@@ -699,13 +899,16 @@ function portsFor(call: GroupCall): CallPorts {
       return { id, written };
     },
     mirror: (text) =>
-      void deliverText(call.route, text).catch((err: unknown) =>
+      void deliverText(call.route, neutralizeMentions(text)).catch((err: unknown) =>
         log.warn('Group call: thread post failed', { callId: call.id.slice(0, 8), err }),
       ),
     status: (text) => emit(call, { type: 'status', text }),
     caption: (role, text, done) => {
-      if (role === 'voice') emit(call, { type: 'caption', role, text, done });
+      if (role !== 'voice') return;
+      if (text) logOnce(call, 'voice first spoke');
+      emit(call, { type: 'caption', role, text, done });
     },
+    greeted: () => logOnce(call, 'greeting sent', { heardFirst: call.logged.has('voice track heard') }),
     ended: (text) => void endGroupCall(call, text),
   };
 }
@@ -715,7 +918,7 @@ async function endGroupCall(call: GroupCall, reason: string): Promise<void> {
   call.state = 'ended';
   call.settle();
   call.voice?.end({ dropped: false, reason });
-  void deliverText(call.route, `📞 Group call ended: ${reason}`).catch((err: unknown) =>
+  void deliverText(call.route, `📞 Call with ${call.agentName} ended: ${reason}`).catch((err: unknown) =>
     log.warn('Group call: thread post failed', { callId: call.id.slice(0, 8), err }),
   );
   for (const person of call.people.values()) {

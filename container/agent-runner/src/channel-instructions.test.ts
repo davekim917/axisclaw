@@ -91,13 +91,13 @@ describe('profile name safety', () => {
   });
 });
 
-describe('injection wiring in index.ts', () => {
+describe('injection wiring in runner-main.ts', () => {
   // The block is assembled inside main(), which boots a provider and a poll
   // loop and cannot be called from a unit test. These pin the two properties
   // that would fail silently: the ordering against tone, and the fact that
   // the block rides systemContext.instructions, which is the only path every
   // provider reads.
-  const source = fs.readFileSync(path.join(import.meta.dir, 'index.ts'), 'utf8');
+  const source = fs.readFileSync(path.join(import.meta.dir, 'runner-main.ts'), 'utf8');
 
   it('injects operating rules BEFORE the voice block', () => {
     // Rules the agent reads after being told how to sound are rules it has

@@ -25,6 +25,7 @@ import { getMessagingGroup } from '../../db/messaging-groups.js';
 import {
   createPendingApproval,
   deletePendingApproval,
+  getPendingApproval,
   getSession,
   updatePendingApprovalMessageId,
 } from '../../db/sessions.js';
@@ -34,8 +35,9 @@ import { log } from '../../log.js';
 import { writeSessionMessage } from '../../session-manager.js';
 import type { MessagingGroup, PendingApproval, Session } from '../../types.js';
 import { getAdminsOfAgentGroup, getGlobalAdmins, getOwners } from '../permissions/db/user-roles.js';
-import { getUser } from '../permissions/db/users.js';
+import { displayNameAcrossBots } from '../../slack-user-identity.js';
 import { ensureUserDm, resolveUserChannelType } from '../permissions/user-dm.js';
+import { cardCopies, closeCardPlace, copyPlace, type CardPlace } from './card-copies.js';
 
 /**
  * Card value for the "Reject with reason…" button. Selecting it doesn't
@@ -83,12 +85,28 @@ export interface ApprovalDeclined {
 export type ApprovalHandler = (ctx: ApprovalHandlerContext) => Promise<void | ApprovalDeclined>;
 
 const approvalHandlers = new Map<string, ApprovalHandler>();
+const adminClickActions = new Set<string>();
 
-export function registerApprovalHandler(action: string, handler: ApprovalHandler): void {
+export interface ApprovalHandlerOptions {
+  /** Only an owner or admin of the agent group may answer, even on a card posted in the requesting thread. */
+  adminClickOnly?: boolean;
+}
+
+export function registerApprovalHandler(
+  action: string,
+  handler: ApprovalHandler,
+  options: ApprovalHandlerOptions = {},
+): void {
   if (approvalHandlers.has(action)) {
     log.warn('Approval handler re-registered (overwriting)', { action });
   }
   approvalHandlers.set(action, handler);
+  if (options.adminClickOnly) adminClickActions.add(action);
+  else adminClickActions.delete(action);
+}
+
+export function requiresAdminClick(action: string): boolean {
+  return adminClickActions.has(action);
 }
 
 export function getApprovalHandler(action: string): ApprovalHandler | undefined {
@@ -359,6 +377,7 @@ export async function requestApprovalOutcome(opts: RequestApprovalOptions): Prom
       channelType: mg.channel_type,
       platformId: mg.platform_id,
       threadId: session.thread_id,
+      instance: mg.instance,
       label: `thread ${mg.channel_type}/${mg.platform_id}${session.thread_id ? ':' + session.thread_id : ''}`,
     };
   } else {
@@ -382,6 +401,7 @@ export async function requestApprovalOutcome(opts: RequestApprovalOptions): Prom
       channelType: target.messagingGroup.channel_type,
       platformId: target.messagingGroup.platform_id,
       threadId: null,
+      instance: target.messagingGroup.instance,
       label: `admin DM ${target.userId}`,
     };
   }
@@ -481,29 +501,48 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<boo
   return (await requestApprovalOutcome(opts)) === 'posted';
 }
 
-/** Skips silently when the row lacks a routing column, including a platform message id the adapter never returned. */
+/** Every place this card is shown: the card itself, and each recorded copy, including one recorded after `approval` was read. */
+async function cardLocations(approval: PendingApproval): Promise<CardPlace[]> {
+  const places: CardPlace[] = [];
+  // Skips the card itself when the row lacks a routing column, including a platform message id the adapter never returned.
+  if (approval.channel_type && approval.platform_id && approval.platform_message_id) {
+    places.push({
+      channelType: approval.channel_type,
+      platformId: approval.platform_id,
+      threadId: approval.thread_id,
+      messageId: approval.platform_message_id,
+      // Dispatch is exact-key: a bare channel type finds no adapter when every bot is a named instance.
+      instance: approval.instance ?? approval.channel_type,
+    });
+  }
+  let fresh: PendingApproval | undefined;
+  try {
+    fresh = await getPendingApproval(approval.approval_id);
+    // eslint-disable-next-line no-catch-all/no-catch-all -- an edit never throws to its caller; the copies already held still get it
+  } catch (err) {
+    log.warn('Could not re-read an approval for its card copies', { approvalId: approval.approval_id, err });
+  }
+  const copies = [...cardCopies(approval), ...(fresh ? cardCopies(fresh) : [])];
+  const seen = new Set<string>();
+  for (const copy of copies) {
+    const key = `${copy.platform_id}\n${copy.platform_message_id}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    places.push(copyPlace(copy));
+  }
+  return places;
+}
+
+/** Edits the card and every copy of it, so answering any one of them closes them all. */
 export async function editApprovalCard(approval: PendingApproval, newBody: string): Promise<void> {
-  if (!approval.channel_type || !approval.platform_id || !approval.platform_message_id) return;
   const adapter = getDeliveryAdapter();
   if (!adapter) return;
-  try {
-    await adapter.deliver(
-      approval.channel_type,
-      approval.platform_id,
-      approval.thread_id,
-      'chat-sdk',
-      JSON.stringify({
-        operation: 'edit',
-        messageId: approval.platform_message_id,
-        text: newBody,
-        clearActions: true,
-      }),
-      undefined,
-      // Dispatch is exact-key: a bare channel type finds no adapter when every bot is a named instance.
-      approval.instance ?? approval.channel_type,
-    );
-  } catch (err) {
-    log.warn('Failed to edit approval card', { approvalId: approval.approval_id, err });
+  for (const place of await cardLocations(approval)) {
+    try {
+      await closeCardPlace(adapter, approval.approval_id, place, newBody);
+    } catch (err) {
+      log.warn('Failed to edit approval card', { approvalId: approval.approval_id, messageId: place.messageId, err });
+    }
   }
 }
 
@@ -515,6 +554,12 @@ export function headUnits(text: string, units: number): string {
   let end = Math.max(0, units);
   if (end > 0 && /[\uD800-\uDBFF]/.test(text[end - 1])) end--;
   return text.slice(0, end);
+}
+
+export function fitResolutionLine(line: string): string {
+  return line.length <= APPROVAL_RESOLUTION_MAX_UNITS
+    ? line
+    : headUnits(line, APPROVAL_RESOLUTION_MAX_UNITS - 1).trimEnd() + '…';
 }
 
 /** An empty `userId` (the sweep finalizing an unanswered hold) drops the byline. */
@@ -534,11 +579,8 @@ export async function approvalResolutionLine(
   } catch {
     /* fall through to the raw value */
   }
-  const name = userId ? (await getUser(userId))?.display_name || userId : '';
-  const line = name ? `${selectedLabel} — ${name}` : selectedLabel;
-  return line.length <= APPROVAL_RESOLUTION_MAX_UNITS
-    ? line
-    : headUnits(line, APPROVAL_RESOLUTION_MAX_UNITS - 1).trimEnd() + '…';
+  const name = userId ? (await displayNameAcrossBots(userId)) || userId : '';
+  return fitResolutionLine(name ? `${selectedLabel} — ${name}` : selectedLabel);
 }
 
 /**

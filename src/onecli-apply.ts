@@ -8,9 +8,10 @@
  * Exactly one retry, only for the measured class: a fast per-request transport fault against a control API that
  * is up. A non-retryable 4xx (bad key, unregistered identity) still fails on the first attempt.
  */
-import { ONECLI_API_KEY, ONECLI_URL } from './config.js';
+import { ONECLI_API_BASE, ONECLI_API_KEY, ONECLI_URL } from './config.js';
 import { log } from './log.js';
 import { httpStatusOf, isRetryableStatus } from './onecli-preflight.js';
+import { assertNotReservedIdentity } from './onecli-secrets.js';
 
 /** Short: the fault resolves as soon as the pool hands out a different socket. */
 const APPLY_RETRY_DELAY_MS = 250;
@@ -66,8 +67,9 @@ export async function diagnoseControlApi(agent: string | undefined): Promise<{
   causeCode?: string;
   statusCode?: number;
 }> {
-  const base = (ONECLI_URL || 'http://127.0.0.1:10254').replace(/\/+$/, '');
-  const url = agent ? `${base}/v1/container-config?agent=${encodeURIComponent(agent)}` : `${base}/v1/container-config`;
+  const url = agent
+    ? `${ONECLI_API_BASE}/v1/container-config?agent=${encodeURIComponent(agent)}`
+    : `${ONECLI_API_BASE}/v1/container-config`;
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
   if (ONECLI_API_KEY) headers.Authorization = `Bearer ${ONECLI_API_KEY}`;
   try {
@@ -168,6 +170,7 @@ export async function applyOnecliContainerConfig(
   options: { addHostMapping: boolean; agent?: string },
   overrides: Partial<ApplyDeps> & Pick<ApplyDeps, 'applyContainerConfig'>,
 ): Promise<ApplyResult> {
+  assertNotReservedIdentity(options.agent);
   const deps: ApplyDeps = { ...realDeps, ...overrides };
   const result = await runApplyWithRetry(args, options, deps);
 

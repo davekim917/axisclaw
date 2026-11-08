@@ -1,5 +1,10 @@
 import { log } from '../../log.js';
-import { applyOnecliSecrets, ensureOnecliAgent, sharedHostSecrets } from '../../onecli-secrets.js';
+import {
+  applyOnecliSecrets,
+  assertNotReservedIdentity,
+  ensureOnecliAgent,
+  sharedHostSecrets,
+} from '../../onecli-secrets.js';
 
 const PREVIEW_PROXY_ENV = 'PREVIEW_HTTPS_PROXY';
 
@@ -24,6 +29,7 @@ export async function previewProxyEnv(input: {
       log.warn('Preview secrets not granted: two of them inject on the same host', { identity, conflicts });
       return [];
     }
+    assertNotReservedIdentity(identity);
     await ensureOnecliAgent({ name: `${input.groupName} (live preview backend)`, identifier: identity });
     await applyOnecliSecrets(identity, declarations);
     const proxy = (await input.getContainerConfig({ agent: identity })).env.HTTPS_PROXY;

@@ -710,6 +710,34 @@ class FindingIssue(unittest.TestCase):
         self.assertIn("Could not test honestly", text.splitlines()[0])
         self.assertNotIn("Safe to ship", text)
 
+    def test_the_verdict_states_its_data_date(self):
+        run = Path(self.c.args.run_root) / RUN
+        self.fx.cfg["repo"] = "acme/widget"
+        hint = {"runId": RUN, "slot": "verdict", "hint": {"verdict": "GO"}}
+        claim = {"sha": "a" * 40}
+
+        self.assertIn("- Data: date not recorded\n", self.fx._render(hint)[0], "lanes can finish with no synthesis")
+        self.assertIn("- Data: date not recorded\n", self.fx._run_record(RUN, claim, {"verdict": "GO"}))
+
+        (run / "synthesis.json").write_text(json.dumps({"verdict": "GO", "findings": []}))
+        self.assertIn("- Data: date not recorded\n", self.fx._render(hint)[0])
+
+        (run / "synthesis.json").write_text(json.dumps(
+            {"verdict": "GO", "findings": [], "dataDate": "Client A sales\n through 11 Sep 2026"}))
+        self.assertIn("- Data: Client A sales through 11 Sep 2026\n", self.fx._render(hint)[0])
+        self.assertIn("- Data: Client A sales through 11 Sep 2026\n",
+                      self.fx._run_record(RUN, claim, {"verdict": "GO"}))
+
+        (run / "synthesis.json").write_text(json.dumps(
+            {"verdict": "GO", "findings": [], "dataDate": "alpha " * 50}))
+        self.assertIn("- Data: {}…\n".format(" ".join(["alpha"] * 33)), self.fx._render(hint)[0],
+                      "an over-long stamp is cut at a word and marked, never mid-word")
+
+        (run / "synthesis.json").write_text(json.dumps(
+            {"verdict": "GO", "findings": [], "dataDate": "w" * 100 + " " + "v" * 98 + " u"}))
+        self.assertIn("- Data: {} {}…\n".format("w" * 100, "v" * 98), self.fx._render(hint)[0],
+                      "a word that fits with the mark is kept")
+
     def test_the_gh_allowlist_admits_the_comment_calls_and_nothing_broader(self):
         allowed = ctl.EffectLayer._gh_call_allowed
         self.assertTrue(allowed(["issue", "comment", "3191", "-R", "acme/widget", "--body-file", "x"]))

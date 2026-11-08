@@ -35,6 +35,14 @@ vi.mock('child_process', async (importOriginal) => {
   };
 });
 
+const baseImage = vi.hoisted(() => ({
+  id: null as import('./agent-runner-image-check.js').LabelLookup | null,
+}));
+vi.mock('./agent-runner-image-check.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./agent-runner-image-check.js')>()),
+  readBaseImageId: async () => baseImage.id,
+}));
+
 import { CONTAINER_IMAGE_BASE } from './config.js';
 import { readContainerConfig, writeContainerConfig } from './container-config.js';
 import { buildAgentGroupImage } from './container-runner.js';
@@ -47,6 +55,7 @@ beforeEach(async () => {
   built.dockerfiles = [];
   built.hold = false;
   built.pending = [];
+  baseImage.id = { kind: 'found', value: 'sha256:base-fixture' };
   fs.rmSync(TEST_DIR, { recursive: true, force: true });
   fs.mkdirSync(`${TEST_DIR}/groups/agent`, { recursive: true });
   await initMigratedTestDb();
@@ -111,6 +120,15 @@ describe('buildAgentGroupImage', () => {
 
     expect(built.dockerfiles.at(-1)).toContain('apt-get install -y curl jq');
     expect(JSON.parse((await getContainerConfig('ag-1'))!.packages_apt)).toEqual(['curl']);
+  });
+
+  it('records the base it builds on, and builds nothing when that base cannot be read', async () => {
+    await buildAgentGroupImage('ag-1');
+    expect(built.dockerfiles.at(-1)).toContain('LABEL nanoclaw.baseImageId="sha256:base-fixture"');
+
+    baseImage.id = { kind: 'inspect-error', reason: 'context deadline exceeded' };
+    await expect(buildAgentGroupImage('ag-1')).rejects.toThrow('context deadline exceeded');
+    expect(built.commands).toHaveLength(1);
   });
 
   it('lets the next queued build run after one fails', async () => {

@@ -2,13 +2,14 @@ import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { allowSubprocess, enforceHermeticity } from '../../src/test-hermeticity.js';
 import { scaledTimeout } from '../../src/test-timeout-scale.js';
 import { createHash } from 'node:crypto';
 
 import {
+  atImportFindings,
   commentFindings,
   commentGrowth,
   exemptFiles,
@@ -33,6 +34,20 @@ function project(name: string, files: Record<string, string>): string {
     fs.writeFileSync(path.join(root, file), text);
   }
   return root;
+}
+
+function git(root: string, ...args: string[]): string {
+  const result = spawnSync(
+    'git',
+    ['-c', 'user.name=fixture', '-c', 'user.email=fixture@example.com', '-c', 'commit.gpgsign=false', ...args],
+    {
+      cwd: root,
+      encoding: 'utf8',
+      env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' },
+    },
+  );
+  if (result.status !== 0) throw new Error(`git ${args.join(' ')}: ${result.error?.message ?? result.stderr}`);
+  return result.stdout.trim();
 }
 
 const summary = (findings: { kind: string; location: string; message: string }[]) =>
@@ -265,6 +280,7 @@ describe('exempt files', () => {
         ...workspace(''),
         ...workspace('container/agent-runner/'),
       });
+      git(root, 'init', '-q');
       const exempt = {
         upstream: new Set(['src/upstream.ts']),
         vendored: new Set(['container/agent-runner/src/upstream.ts']),
@@ -414,22 +430,57 @@ describe('absolute paths in test imports', () => {
   });
 });
 
+describe('at-import', () => {
+  const NO_EXEMPT = { upstream: new Set<string>(), vendored: new Set<string>() };
+  const IMPORT = 'Read @docs/rules.md first.\n';
+
+  function tracked(files: Record<string, string>, untracked: Record<string, string> = {}): string {
+    const root = project('at-import', { 'docs/rules.md': 'rules\n', ...files });
+    git(root, 'init', '-q');
+    git(root, 'add', '-A');
+    for (const [file, text] of Object.entries(untracked)) {
+      fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true });
+      fs.writeFileSync(path.join(root, file), text);
+    }
+    return root;
+  }
+
+  it('reports an import in every tracked instruction file, once per real file, and skips untracked ones', () => {
+    const root = tracked(
+      {
+        'CLAUDE.md': `# Root\n\n${IMPORT}`,
+        'container/CLAUDE.md': 'Read @../docs/rules.md first.\n',
+        'docs/CLAUDE.local.md': 'Read @rules.md first.\n',
+      },
+      { 'groups/main/CLAUDE.md': IMPORT },
+    );
+    fs.symlinkSync('CLAUDE.md', path.join(root, 'AGENTS.md'));
+    git(root, 'add', 'AGENTS.md');
+    expect(summary(atImportFindings(root, NO_EXEMPT))).toEqual([
+      'at-import CLAUDE.md:3 @docs/rules.md is expanded by Claude only; link the doc in prose instead',
+      'at-import container/CLAUDE.md:1 @../docs/rules.md is expanded by Claude only; link the doc in prose instead',
+      'at-import docs/CLAUDE.local.md:1 @rules.md is expanded by Claude only; link the doc in prose instead',
+    ]);
+  });
+
+  it('skips an exempt file and a file that is not an instruction file', () => {
+    const root = tracked({ 'CLAUDE.md': IMPORT, 'docs/guide.md': IMPORT });
+    expect(atImportFindings(root, { upstream: new Set(['CLAUDE.md']), vendored: new Set() })).toEqual([]);
+  });
+
+  it('fails closed outside a git work tree', () => {
+    const root = project('at-import-nogit', { 'CLAUDE.md': IMPORT });
+    vi.stubEnv('GIT_CEILING_DIRECTORIES', path.dirname(root));
+    try {
+      expect(() => atImportFindings(root, NO_EXEMPT)).toThrow(/git ls-files failed/);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+});
+
 describe('comment growth', () => {
   const NO_EXEMPT = { upstream: new Set<string>(), vendored: new Set<string>() };
-
-  function git(root: string, ...args: string[]): string {
-    const result = spawnSync(
-      'git',
-      ['-c', 'user.name=fixture', '-c', 'user.email=fixture@example.com', '-c', 'commit.gpgsign=false', ...args],
-      {
-        cwd: root,
-        encoding: 'utf8',
-        env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' },
-      },
-    );
-    if (result.status !== 0) throw new Error(`git ${args.join(' ')}: ${result.error?.message ?? result.stderr}`);
-    return result.stdout.trim();
-  }
 
   function write(root: string, files: Record<string, string | null>): void {
     for (const [file, text] of Object.entries(files)) {

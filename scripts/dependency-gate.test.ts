@@ -85,6 +85,8 @@ const files = (overrides: Partial<DependencyFiles> = {}): DependencyFiles => ({
   bunLock: BUN_LOCK,
   remotionPackageJson: null,
   remotionLock: null,
+  mobilePackageJson: null,
+  mobileLock: null,
   dockerfile: 'FROM node:22-slim\nARG CLAUDE_CODE_VERSION="2.1.290" # pinned\nARG BUN_VERSION=1.4.2\n',
   updateSources: JSON.stringify({
     dockerfile: [
@@ -150,7 +152,7 @@ const reach = runtimeReach(registry, head.dependsOn);
 const ledgerOf = (text: string) => parseLedgers([{ file: 'docs/dependency-changes/2026-10-07-x.md', text }]);
 /** A synthetic change to a live package moves that package's own closure. */
 const selfMoves = (changes: PackageChange[], within: Registry) => {
-  const moves = new Map<'host' | 'runner' | 'remotion' | 'docker', Map<string, Set<string>>>();
+  const moves = new Map<'host' | 'runner' | 'remotion' | 'mobile' | 'docker', Map<string, Set<string>>>();
   for (const change of changes) {
     if (within.packages[change.name]?.kind !== 'live') continue;
     for (const source of change.sources) {
@@ -272,6 +274,107 @@ describe('runtime reach and live paths', () => {
       expect.objectContaining({ name: 'ws', sources: ['remotion'], added: ['8.21.0'], removed: ['8.20.0'] }),
     ]);
     expect(changeProblems(registry, reach, changes, ledgerOf(''), exists, new Map()).problems).toEqual([]);
+  });
+
+  describe('the phone app tree', () => {
+    const npmLock = (nested: string, root = '1.0.0') =>
+      JSON.stringify({
+        lockfileVersion: 3,
+        packages: {
+          '': { dependencies: { chat: '1.0.0' }, devDependencies: { typescript: '6.0.0' } },
+          'node_modules/chat': { version: '1.0.0', dependencies: { engine: '^2' } },
+          'node_modules/chat/node_modules/engine': { version: nested },
+          'node_modules/engine': { version: root },
+          'node_modules/typescript': { version: '6.0.0', dev: true },
+        },
+      });
+    const mobile = (lock: string) => lockedVersions(files({ mobileLock: lock }));
+
+    it('resolves a dependency to the nearest install path, so a nested copy counts beneath its parent', () => {
+      const { changes, moves } = movesBetween(mobile(npmLock('2.0.0')), mobile(npmLock('2.1.0')));
+      expect(moves.get('mobile')?.get('engine')).toEqual(new Set(['chat']));
+      expect(changes).toEqual([expect.objectContaining({ name: 'engine', sources: ['mobile'], added: ['2.1.0'] })]);
+    });
+
+    it('leaves a live package alone when only a copy it does not load moves', () => {
+      const { moves } = movesBetween(mobile(npmLock('2.0.0')), mobile(npmLock('2.0.0', '1.1.0')));
+      expect(moves.get('mobile')?.get('engine')).toBeUndefined();
+    });
+
+    it('needs a ledger for a runtime package in the app, as it does in any other tree', () => {
+      const base = mobile(npmLock('2.0.0'));
+      const after = mobile(npmLock('2.1.0'));
+      const changes = packageChanges(base, after);
+      const engine: Registry = { ...registry, packages: { ...registry.packages, engine: { kind: 'runtime' } } };
+      const result = changeProblems(
+        engine,
+        runtimeReach(engine, after.dependsOn),
+        changes,
+        ledgerOf(''),
+        exists,
+        new Map(),
+      );
+      expect(result.problems).toEqual([
+        expect.stringContaining('engine 1.0.0,2.0.0 → 1.0.0,2.1.0 changes runtime behaviour'),
+      ]);
+    });
+
+    it('needs a ledger for a transitive package that leaves its range beneath a registered app package', () => {
+      const after = mobile(npmLock('3.0.0'));
+      const changes = packageChanges(mobile(npmLock('2.0.0')), after);
+      const result = changeProblems(
+        registry,
+        runtimeReach(registry, after.dependsOn),
+        changes,
+        ledgerOf(''),
+        exists,
+        new Map(),
+      );
+      expect(result.problems).toEqual([
+        expect.stringContaining('engine 1.0.0,2.0.0 → 1.0.0,3.0.0 changes runtime behaviour'),
+      ]);
+    });
+
+    it('sees the app itself switch to a copy already locked, where the version set stays the same', () => {
+      const repoints = consumerMoves(mobile(npmLock('2.0.0', '1.0.0')), mobile(npmLock('1.0.0', '2.0.0')));
+      expect(repoints.get('mobile')?.get('engine')).toEqual(
+        expect.arrayContaining([expect.objectContaining({ consumer: 'chat@1.0.0', from: '2.0.0', to: '1.0.0' })]),
+      );
+    });
+
+    it('sees two copies of one version swap what they load, where the versions and merged edges stay the same', () => {
+      const twoCopies = (first: string, second: string) =>
+        JSON.stringify({
+          lockfileVersion: 3,
+          packages: {
+            '': { dependencies: { chat: '1.0.0', other: '1.0.0' } },
+            'node_modules/chat': { version: '1.0.0', dependencies: { shared: '^1' } },
+            'node_modules/chat/node_modules/shared': { version: '1.0.0', dependencies: { engine: '*' } },
+            'node_modules/chat/node_modules/engine': { version: first },
+            'node_modules/other': { version: '1.0.0', dependencies: { shared: '^1' } },
+            'node_modules/other/node_modules/shared': { version: '1.0.0', dependencies: { engine: '*' } },
+            'node_modules/other/node_modules/engine': { version: second },
+            'node_modules/shared': { version: '2.0.0' },
+          },
+        });
+      const before = mobile(twoCopies('2.0.0', '3.0.0'));
+      const after = mobile(twoCopies('3.0.0', '2.0.0'));
+      const repoints = consumerMoves(before, after);
+      const changes = withRepoints(packageChanges(before, after), repoints, new Map(), after);
+      const reachAfter = runtimeReach(registry, after.dependsOn);
+      expect(changeProblems(registry, reachAfter, changes, ledgerOf(''), exists, new Map()).problems).toEqual([
+        expect.stringContaining('engine 2.0.0,3.0.0 → 2.0.0,3.0.0 changes runtime behaviour'),
+      ]);
+    });
+
+    it('requires a classification for a direct dependency of the app', () => {
+      const direct = directDependencies(
+        files({ mobilePackageJson: JSON.stringify({ dependencies: { 'new-lib': '1.0.0' } }) }),
+      );
+      expect(registryProblems(registry, direct, () => null)).toEqual(
+        expect.arrayContaining([expect.stringContaining('new-lib is a direct dependency with no entry')]),
+      );
+    });
   });
 
   it('blocks an exact-version move beneath a live package whose path has no test', () => {

@@ -122,6 +122,23 @@ describe('sends from a shared session thread into the conversation being answere
     return out[out.length - 1].thread_id;
   }
 
+  // The host's claim nudges tell a task session its post lands in this thread.
+  it('a task session post named to the task chat lands in the task thread', async () => {
+    bindSession(null);
+    getInboundDb()
+      .prepare(
+        "UPDATE session_routing SET channel_type = NULL, platform_id = NULL, thread_id = 'system:tasks:push-seam' WHERE id = 1",
+      )
+      .run();
+    publishReplyRoute({ inReplyTo: 'push-seam', platformId: CHAT, threadId: THREAD });
+
+    await sendMessage.handler({ to: 'team', text: 'the claim is blocked on you' });
+    expect(lastThread()).toBe(THREAD);
+
+    await sendMessage.handler({ to: 'other', text: 'somewhere else' });
+    expect(lastThread()).toBeNull();
+  });
+
   it('replies in the thread the answered message came from, not the null bound thread', async () => {
     bindSession(null);
     publishReplyRoute({ inReplyTo: 'inbound-1', platformId: CHAT, threadId: THREAD });

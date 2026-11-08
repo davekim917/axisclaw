@@ -10,6 +10,7 @@
 import { TIMEZONE } from '../../config.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
 import {
+  addClientCredentialsIntegration,
   completeLogin,
   refreshExpiringMcpOAuthIntegrations,
   removeIntegration,
@@ -339,6 +340,84 @@ registerResource({
           );
         }
         return lines.join('\n');
+      },
+    },
+
+    'add-client': {
+      access: 'open',
+      hostOnly: true,
+      description:
+        "Connect an API that issues tokens for a client id and secret (OAuth client_credentials, e.g. Looker's /api/4.0/login). The host reads the pair from two of its own env vars, named here, never typed: the values go to the 0600 host bundle store, a token is minted to prove them before anything is stored, and the sweep keeps a short-lived token in a OneCLI secret on the API host, declared on the group's workgroup. --replace gives an existing integration new credentials.",
+      args: [
+        { name: 'name', type: 'string', description: 'Integration handle.', required: true },
+        {
+          name: 'group',
+          type: 'string',
+          description: 'Agent group id whose workgroup gets the token.',
+          required: true,
+        },
+        {
+          name: 'api_url',
+          type: 'string',
+          description: 'API origin, e.g. https://example.cloud.looker.com.',
+          required: true,
+        },
+        {
+          name: 'token_url',
+          type: 'string',
+          description: 'Token endpoint, e.g. https://example.cloud.looker.com/api/4.0/login.',
+          required: true,
+        },
+        {
+          name: 'client_id_env',
+          type: 'string',
+          description: 'Name of the host env var holding the client id.',
+          required: true,
+        },
+        {
+          name: 'client_secret_env',
+          type: 'string',
+          description: 'Name of the host env var holding the client secret.',
+          required: true,
+        },
+        { name: 'secret', type: 'string', description: 'OneCLI secret name (default <Name>-MCP-<Group>).' },
+        { name: 'scopes', type: 'string', description: 'Space-delimited scopes, when the token endpoint takes them.' },
+        {
+          name: 'replace',
+          type: 'boolean',
+          description: 'Give an existing client-credentials integration new credentials.',
+        },
+      ],
+      handler: async (args) => {
+        const fromEnv = (flagName: string, raw: unknown): string => {
+          const envName = String(raw);
+          if (!/^[A-Z][A-Z0-9_]*$/.test(envName))
+            throw new Error(`--${flagName} must be an env var name, not a value.`);
+          const value = process.env[envName];
+          if (!value) throw new Error(`Host env var ${envName} is not set.`);
+          return value;
+        };
+        return addClientCredentialsIntegration({
+          name: String(args.name),
+          agentGroupId: String(args.group),
+          apiUrl: String(args.api_url),
+          tokenUrl: String(args.token_url),
+          clientId: fromEnv('client-id-env', args.client_id_env),
+          clientSecret: fromEnv('client-secret-env', args.client_secret_env),
+          secretName: args.secret === undefined ? undefined : String(args.secret),
+          scopes: args.scopes === undefined ? undefined : String(args.scopes),
+          replace: flag(args.replace),
+        });
+      },
+      formatHuman: (data) => {
+        const d = data as Awaited<ReturnType<typeof addClientCredentialsIntegration>>;
+        return [
+          `integration: ${d.name}`,
+          `status: ${d.status}${d.statusDetail ? ` — ${d.statusDetail}` : ''}`,
+          `token secret: ${d.bearerSecretName} on ${d.hostPattern}`,
+          `token expires: ${d.expiresAt ? formatLocalTime(d.expiresAt, TIMEZONE) : 'unknown'}`,
+          'Restart the group to pick up a new declaration: ncl groups restart --id <agent-group-id>',
+        ].join('\n');
       },
     },
 

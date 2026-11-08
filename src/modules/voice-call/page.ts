@@ -1,3 +1,5 @@
+import { micReportPageScript } from './mic-report.js';
+
 const escapeHtml = (text: string) =>
   text.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;');
 
@@ -45,12 +47,13 @@ export function callPageHtml(agentName: string): string {
   <div id="caption" aria-live="polite"></div>
   <audio id="out" autoplay playsinline></audio>
 <script>
+${micReportPageScript()}
 (() => {
   const $ = (id) => document.getElementById(id);
   const status = (text) => { $('status').textContent = text; };
   const TAP_TO_HEAR = 'Tap "Tap to hear" to hear the voice.';
   let pc, mic, wake, events, connecting, sampler, connectedAt = 0, token = '', ended = false, leaving = false, silent = false;
-  let playback = 'none', report = null;
+  let playback = 'none', report = null, micReported = false;
   const withToken = (path) => path + '?t=' + encodeURIComponent(token);
   const post = (path, body) => fetch(withToken(path), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
   const finish = (text) => {
@@ -127,6 +130,9 @@ export function callPageHtml(agentName: string): string {
       if (shown) $('caption').textContent = NAMES[role] + ': ' + (shown.length > 240 ? '…' + shown.slice(-240) : shown);
     };
   })();
+  const micNote = () => {
+    try { return pageMicReport(mic.getAudioTracks()[0], navigator.userAgent, MIC_SETTINGS); } catch { return {}; }
+  };
   const keepAwake = async () => { try { wake = await navigator.wakeLock.request('screen'); } catch {} };
   document.addEventListener('visibilitychange', () => { if (!ended && document.visibilityState === 'visible') keepAwake(); });
   $('start').onclick = async () => {
@@ -145,7 +151,8 @@ export function callPageHtml(agentName: string): string {
           connectedAt = Date.now();
           $('orb').classList.add('live');
           status(playback === 'blocked' ? TAP_TO_HEAR : 'Live');
-          post('connected');
+          post('connected', micReported ? {} : micNote());
+          micReported = true;
         }
         if (pc.connectionState === 'failed') drop('The call dropped.');
       };

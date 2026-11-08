@@ -1,12 +1,14 @@
 import Database from 'better-sqlite3';
 import { describe, it, expect } from 'vitest';
 import { migration083 } from '../src/db/migrations/083-work-outcome-receipts.js';
+import { migration091 } from '../src/db/migrations/091-work-outcome-delivered-at.js';
 import { reconcileOutcome } from './outcome-receipts.js';
 
 describe('operator outcome reconciliation', () => {
   it('requires exact current evidence, records correction, and never blindly deletes a receipt', () => {
     const db = new Database(':memory:');
     migration083.up(db);
+    migration091.up(db);
     db.prepare(
       `INSERT INTO work_outcome_receipts
       (workgroup_id,work_item,message_id,session_id,state,channel_type,platform_id,content,created_at,updated_at)
@@ -40,6 +42,31 @@ describe('operator outcome reconciliation', () => {
     expect(db.prepare('SELECT work_item,platform_message_id FROM work_outcome_receipts').get()).toEqual({
       work_item: 'github:org/repo:pull:8',
       platform_message_id: 'platform-id',
+    });
+    db.close();
+  });
+
+  it('dates a confirmed delivery from the attempt it confirms, not the first one', () => {
+    const db = new Database(':memory:');
+    migration083.up(db);
+    migration091.up(db);
+    db.prepare(
+      `INSERT INTO work_outcome_receipts
+      (workgroup_id,work_item,message_id,session_id,state,channel_type,platform_id,content,created_at,updated_at)
+      VALUES ('wg','github:org/repo:pull:7','message','session','uncertain','slack','channel','{}',
+        '2026-06-01T00:00:00.000Z','2026-06-01T03:00:00.000Z')`,
+    ).run();
+    reconcileOutcome(db, {
+      action: 'confirm-delivered',
+      workgroup: 'wg',
+      workItem: 'https://github.com/org/repo/pull/7',
+      expectedUpdatedAt: '2026-06-01T03:00:00.000Z',
+      value: 'platform-id',
+      reason: 'Platform readback found the retried post.',
+    });
+    expect(db.prepare('SELECT state, delivered_at FROM work_outcome_receipts').get()).toEqual({
+      state: 'delivered',
+      delivered_at: '2026-06-01T03:00:00.000Z',
     });
     db.close();
   });

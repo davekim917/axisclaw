@@ -18,6 +18,7 @@ import { requestWake } from './request-wake.js';
 import { randomUUID } from 'crypto';
 import { listInstallContainersWithScope, stopContainer, type InstallContainerScope } from './container-runtime.js';
 import { getSessionsByAgentGroup } from './db/sessions.js';
+import { yieldToEventLoop } from './event-loop-yield.js';
 import { log } from './log.js';
 import { SessionDbMissingError, sessionMailboxPath, type NanoclawMailboxSession } from './modules/mailbox/index.js';
 import { repoIngressFenceAckToken } from './modules/mailbox/ops/fence.js';
@@ -165,14 +166,6 @@ function barrierSessionError(err: unknown, session: Session, phase: string): Err
   );
 }
 
-/**
- * Each fence commit costs ~9ms of synchronous fsync, so thousands of sessions would stall the host event loop for
- * a minute. Yielding is safe: the mount claim, not this loop, holds admission closed.
- */
-async function yieldEventLoop(index: number): Promise<void> {
-  if (index > 0 && index % 100 === 0) await new Promise((resolve) => setImmediate(resolve));
-}
-
 async function activateRepositoryMountBarriers(
   sessions: Session[],
   epoch: string,
@@ -184,8 +177,8 @@ async function activateRepositoryMountBarriers(
   const barrierAcks: Record<string, string> = {};
   const barrierGenerations: Record<string, string> = {};
   try {
-    for (const [index, session] of sessions.entries()) {
-      await yieldEventLoop(index);
+    for (const session of sessions) {
+      await yieldToEventLoop();
       const outcome = await inSessionMailbox(session, 'activation', (mailbox) => {
         const prior = mailbox.readRepoIngressFence();
         const active = mailbox.activateRepoIngressFence(epoch);
@@ -277,8 +270,8 @@ async function sessionReachedRepositoryBarrier(session: Session, expectedAck: st
  */
 export async function releaseRepositoryMountQuiescence(quiescence: RepositoryMountQuiescence): Promise<Session[]> {
   const wakeRequired: Session[] = [];
-  for (const [index, session] of quiescence.barrierSessions.entries()) {
-    await yieldEventLoop(index);
+  for (const session of quiescence.barrierSessions) {
+    await yieldToEventLoop();
     const generation = quiescence.barrierGenerations[session.id];
     if (!generation) throw new Error(`repository mount barrier generation missing for session ${session.id}`);
     // A reclaimed session has no fence row to release and no due rows to wake for; dropping it strands nothing.

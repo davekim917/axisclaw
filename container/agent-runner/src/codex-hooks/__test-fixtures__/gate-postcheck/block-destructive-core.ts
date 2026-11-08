@@ -9,7 +9,7 @@
  *    post-check returns a well-formed `gate` AGAIN (stale core ignoring skipGate).
  *    Only an explicit `allow` may pass; the repeated gate must DENY. (N2)
  *
- * Pointed at via NANOCLAW_DESTRUCTIVE_GUARD_CORE in runner.test.ts.
+ * Pointed at via setGuardCorePathsForTest({ destructive }) in runner.test.ts.
  */
 export const IS_NANOCLAW = true;
 

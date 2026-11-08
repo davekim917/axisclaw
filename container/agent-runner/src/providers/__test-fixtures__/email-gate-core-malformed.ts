@@ -3,7 +3,7 @@
  * a verdict with an UNKNOWN action ('bogus') for a real send. claude.ts's
  * createEmailGateHook must treat this as untrusted and fall back to the inline
  * fail-CLOSED evaluator (which gates an interactive send) — NOT let it slip
- * through the non-'gate' branch as an allow. Pointed at via NANOCLAW_EMAIL_GATE_CORE.
+ * through the non-'gate' branch as an allow. Pointed at via setGuardCorePathsForTest({ emailGate }).
  * Regression fixture for codex #126 F2.
  */
 export function evaluateEmailSend(

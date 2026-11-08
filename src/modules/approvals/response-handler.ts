@@ -32,19 +32,21 @@ import { log } from '../../log.js';
 import type { PendingApproval, Session } from '../../types.js';
 import { hasAdminPrivilege, isGlobalAdmin, isOwner } from '../permissions/db/user-roles.js';
 import { getUser } from '../permissions/db/users.js';
+import { equivalentSlackUserIds } from '../../slack-user-identity.js';
 import { choiceApprovers, choiceClickAllowed, getChoiceHandler, resolveChoice } from './choices.js';
 import { finalizeReject, resolveClaimed, writeApprovalNote } from './finalize.js';
 import { ONECLI_ACTION, resolveOneCLIApproval } from './onecli-approvals.js';
 import {
-  APPROVAL_RESOLUTION_MAX_UNITS,
-  type ApprovalDeclined,
   editApprovalCard,
   editApprovalCardResolution,
+  fitResolutionLine,
   getApprovalHandler,
-  headUnits,
   notifyApprovalResolved,
   REJECT_WITH_REASON_VALUE,
+  requiresAdminClick,
+  type ApprovalDeclined,
 } from './primitive.js';
+import { clickedCopy, type ApprovalCardCopy } from './card-copies.js';
 import { armReasonCapture, claimReasonHold } from './reason-capture.js';
 
 /** Thread-target cards live in the originating chat, where thread access IS the approval authority. */
@@ -56,13 +58,15 @@ async function isThreadDelivery(approval: PendingApproval, session: Session): Pr
 }
 
 /**
- * The clicked message must be the card the host posted. With no stored id a
- * choice card refuses (its id is backfilled just after delivery); any other
- * kind resolves.
+ * The clicked message must be a card the host posted: the card itself, or a copy the host recorded, matched on its
+ * channel, conversation and message together. With no stored id a choice card refuses (its id is backfilled just after
+ * delivery); any other kind resolves.
  */
-function isClickOnApprovalCard(approval: PendingApproval, payload: ResponsePayload): boolean {
-  if (!approval.platform_message_id) return !getChoiceHandler(approval.action);
-  return payload.messageId === approval.platform_message_id;
+function clickedCard(approval: PendingApproval, payload: ResponsePayload): 'card' | ApprovalCardCopy | null {
+  const copy = clickedCopy(approval, payload);
+  if (copy) return copy;
+  if (!approval.platform_message_id) return getChoiceHandler(approval.action) ? null : 'card';
+  return payload.messageId === approval.platform_message_id ? 'card' : null;
 }
 
 export async function handleApprovalsResponse(payload: ResponsePayload): Promise<boolean> {
@@ -72,7 +76,8 @@ export async function handleApprovalsResponse(payload: ResponsePayload): Promise
   // Every approval resolves only from its own card: an agent can post a raw
   // ask_question card carrying the same approval id. Claimed, so no later
   // handler takes the id either.
-  if (!isClickOnApprovalCard(approval, payload)) {
+  const clicked = clickedCard(approval, payload);
+  if (!clicked) {
     log.warn('Ignoring a click that was not made on the approval card', {
       approvalId: approval.approval_id,
       action: approval.action,
@@ -99,7 +104,7 @@ export async function handleApprovalsResponse(payload: ResponsePayload): Promise
     return true;
   }
 
-  const refusal = await clickRefusal(approval, payload);
+  const refusal = await clickRefusal(approval, payload, clicked !== 'card' && clicked.queue === true);
   if (refusal) {
     log.warn('Ignoring unauthorized approval response', {
       approvalId: approval.approval_id,
@@ -125,7 +130,8 @@ export async function handleApprovalsResponse(payload: ResponsePayload): Promise
     return true;
   }
 
-  if (!(await handleRegisteredApproval(approval, payload.value, namespacedUserId(payload) ?? '')).claimed) {
+  const copy = clicked === 'card' ? undefined : clicked;
+  if (!(await handleRegisteredApproval(approval, payload.value, namespacedUserId(payload) ?? '', copy)).claimed) {
     await tellClicker(payload, 'Someone already answered this card. Your click did not count.');
   }
   return true;
@@ -171,6 +177,7 @@ async function handleRegisteredApproval(
   approval: PendingApproval,
   selectedOption: string,
   userId: string,
+  onCopy?: ApprovalCardCopy,
 ): Promise<{ claimed: boolean; declined?: string }> {
   if (!approval.session_id) {
     await deletePendingApproval(approval.approval_id);
@@ -201,7 +208,7 @@ async function handleRegisteredApproval(
         ? claimReasonHold(approval)
         : transitionPendingApprovalStatus(approval.approval_id, 'pending', claimedStatus),
     async () => {
-      declined = await applyResponse(approval, session, selectedOption, userId);
+      declined = await applyResponse(approval, session, selectedOption, userId, onCopy);
     },
   );
   if (!claimed) {
@@ -219,6 +226,7 @@ async function applyResponse(
   session: Session,
   selectedOption: string,
   userId: string,
+  onCopy?: ApprovalCardCopy,
 ): Promise<string | undefined> {
   // "Reject with reason…" — hold the row and capture the clicker's reply
   // instead of finalizing now. The agent is notified exactly once: after the
@@ -226,7 +234,7 @@ async function applyResponse(
   if (selectedOption === REJECT_WITH_REASON_VALUE) {
     // Decided at the click: a gated command waiting in its container stands down now, not after a reason arrives.
     await notifyApprovalResolved({ approval, session, outcome: 'reject', userId });
-    await armReasonCapture(approval, session, userId);
+    await armReasonCapture(approval, session, userId, onCopy);
     return;
   }
 
@@ -283,25 +291,38 @@ function namespacedUserId(payload: ResponsePayload): string | null {
   return payload.userId.includes(':') ? payload.userId : `${payload.channelType}:${payload.userId}`;
 }
 
-async function clickRefusal(approval: PendingApproval, payload: ResponsePayload): Promise<string | null> {
+/** A click in the approvals channel is not thread access, so it never takes the thread-member shortcut. */
+async function clickRefusal(
+  approval: PendingApproval,
+  payload: ResponsePayload,
+  inApprovalsChannel: boolean,
+): Promise<string | null> {
   const userId = namespacedUserId(payload);
   if (!userId) return 'Your click could not be matched to a user, so it did not count.';
-  return answerRefusal(approval, userId);
+  return answerRefusal(approval, userId, !inApprovalsChannel);
 }
 
 export async function canAnswerApproval(approval: PendingApproval, userId: string): Promise<boolean> {
   return (await answerRefusal(approval, userId)) === null;
 }
 
-async function answerRefusal(approval: PendingApproval, userId: string): Promise<string | null> {
-  // An approval may name a specific approver; only that exact user may resolve it.
+async function answerRefusal(approval: PendingApproval, userId: string, threadShortcut = true): Promise<string | null> {
+  // An approval may name a specific approver; only that user may resolve it, from any of their same-workspace bots.
   if (approval.approver_user_id) {
-    return userId === approval.approver_user_id ? null : await onlyNamed([approval.approver_user_id]);
+    return equivalentSlackUserIds(userId).includes(approval.approver_user_id)
+      ? null
+      : await onlyNamed([approval.approver_user_id]);
   }
 
   // Any thread member may resolve a thread-delivered card. Choice cards never
-  // take this shortcut: an answer is a decision the agent acts on.
-  if (approval.session_id && !getChoiceHandler(approval.action)) {
+  // take this shortcut (an answer is a decision the agent acts on), nor do
+  // actions registered adminClickOnly.
+  if (
+    threadShortcut &&
+    approval.session_id &&
+    !getChoiceHandler(approval.action) &&
+    !requiresAdminClick(approval.action)
+  ) {
     const session = await getSession(approval.session_id);
     if (session && (await isThreadDelivery(approval, session))) return null;
   }
@@ -333,11 +354,7 @@ async function onlyNamed(approvers: readonly string[]): Promise<string> {
     return 'Only the people this card names can answer it. Your click did not count.';
   }
   const all = names.length === 1 ? names[0] : `${names.slice(0, -1).join(', ')} or ${names[names.length - 1]}`;
-  const who =
-    all.length <= APPROVAL_RESOLUTION_MAX_UNITS
-      ? all
-      : headUnits(all, APPROVAL_RESOLUTION_MAX_UNITS - 1).trimEnd() + '…';
-  return `Only ${who} can answer this card. Your click did not count.`;
+  return `Only ${fitResolutionLine(all)} can answer this card. Your click did not count.`;
 }
 
 async function tellClicker(payload: ResponsePayload, text: string): Promise<void> {

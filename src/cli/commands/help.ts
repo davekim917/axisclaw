@@ -5,7 +5,7 @@
  *   ncl groups help         — show group resource details (verbs, columns, enums)
  */
 import { getContainerConfig } from '../../db/container-configs.js';
-import { getResources } from '../crud.js';
+import { getResources, type ResourceDef } from '../crud.js';
 import { renderVerbHelp, summaryLine } from '../help-render.js';
 import type { CallerContext } from '../frame.js';
 import { GROUP_SCOPE_RESOURCES, listCommands, register } from '../registry.js';
@@ -23,8 +23,11 @@ register({
   handler: async (_args, ctx) => {
     const cliScope = await getCliScope(ctx);
     let resources = getResources();
+    const scopedVerbs = (r: ResourceDef) =>
+      Object.entries(r.customOperations ?? {}).flatMap(([verb, op]) => (op.groupScopeVerb ? [verb] : []));
+    const oneVerbOnly = (r: ResourceDef) => cliScope === 'group' && !GROUP_SCOPE_RESOURCES.has(r.plural);
     if (cliScope === 'group') {
-      resources = resources.filter((r) => GROUP_SCOPE_RESOURCES.has(r.plural));
+      resources = resources.filter((r) => GROUP_SCOPE_RESOURCES.has(r.plural) || scopedVerbs(r).length > 0);
     }
     const commands = listCommands().filter((c) => !c.resource);
 
@@ -39,12 +42,16 @@ register({
       lines.push('Resources:');
       for (const r of resources) {
         const ops: string[] = [];
-        if (r.operations.list) ops.push('list');
-        if (r.operations.get) ops.push('get');
-        if (r.operations.create) ops.push('create');
-        if (r.operations.update) ops.push('update');
-        if (r.operations.delete) ops.push('delete');
-        if (r.customOperations) ops.push(...Object.keys(r.customOperations));
+        if (oneVerbOnly(r)) {
+          ops.push(...scopedVerbs(r));
+        } else {
+          if (r.operations.list) ops.push('list');
+          if (r.operations.get) ops.push('get');
+          if (r.operations.create) ops.push('create');
+          if (r.operations.update) ops.push('update');
+          if (r.operations.delete) ops.push('delete');
+          if (r.customOperations) ops.push(...Object.keys(r.customOperations));
+        }
         lines.push(`  ${r.plural.padEnd(20)} ${r.description}`);
         lines.push(`  ${''.padEnd(20)} verbs: ${ops.join(', ')}`);
       }

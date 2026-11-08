@@ -287,6 +287,18 @@ describe('runApplyWithRetry', () => {
 });
 
 describe('applyOnecliContainerConfig logging shape', () => {
+  it('refuses to start a container as a lane agent, which a reserved token belongs to', async () => {
+    const applyContainerConfig = vi.fn(async () => true);
+    await expect(
+      applyOnecliContainerConfig(
+        [],
+        { addHostMapping: false, agent: 'approved-run-acme' },
+        { ...deps(), applyContainerConfig },
+      ),
+    ).rejects.toThrow('reserved to the approved-run lane');
+    expect(applyContainerConfig).not.toHaveBeenCalled();
+  });
+
   it('logs nothing extra when the first attempt applies', async () => {
     const warn = vi.spyOn(log, 'warn').mockImplementation(() => {});
 

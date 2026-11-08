@@ -60,6 +60,21 @@ case "$1" in
 esac
 `;
 
+const FAKE_CLAUDE = `#!/bin/sh
+state="$FAKE_CLAUDE_STATE"
+echo "$*" >> "$state/calls"
+case "$1 $2" in
+  "plugin list")
+    [ -e "$state/list-fails" ] && { cat "$state/list-fails" >&2; exit 1; }
+    cat "$state/list.json" ;;
+  "plugin update")
+    [ -e "$state/update-refused" ] && { cat "$state/update-refused"; exit 1; }
+    [ -e "$state/update-unknown" ] && { cat "$state/update-unknown"; exit 0; }
+    echo '{"command":"update","outcome":"ok","updateOutcome":"updated","message":"Restart to apply changes."}' ;;
+  *) exit 2 ;;
+esac
+`;
+
 const REGISTRY_LOCK = JSON.stringify({
   lockfileVersion: 3,
   packages: {
@@ -259,6 +274,111 @@ describe('with fake git: failures stay inside their plugin', () => {
 
   beforeEach(() => {
     writeExecutable(path.join(tmp, 'bin', 'git'), FAKE_GIT);
+  });
+
+  describe('host installs', () => {
+    let claudeState: string;
+    const listInstalled = (rows: unknown[]) => write(path.join(claudeState, 'list.json'), JSON.stringify(rows));
+    const behindCheckout = (id: string) => ({
+      id,
+      scope: 'user',
+      version: '3.3.1',
+      readFromFolder: path.join(home, 'plugins/bootstrap/plugins', id),
+      folderVersion: '3.5.0',
+    });
+    const claudeCalls = () => fs.readFileSync(path.join(claudeState, 'calls'), 'utf-8').trim().split('\n');
+
+    beforeEach(() => {
+      claudeState = path.join(tmp, 'claude-state');
+      fs.mkdirSync(claudeState);
+      process.env.FAKE_CLAUDE_STATE = claudeState;
+      writeExecutable(path.join(tmp, 'bin', 'claude'), FAKE_CLAUDE);
+      fakePlugin('bootstrap', { unchanged: '' });
+    });
+
+    afterEach(() => {
+      delete process.env.FAKE_CLAUDE_STATE;
+    });
+
+    it('updates an install behind its checkout even when no pull moved, and nothing it does not own', async () => {
+      listInstalled([
+        behindCheckout('orchestrate'),
+        { ...behindCheckout('current'), folderVersion: '3.3.1' },
+        { id: 'third-party', scope: 'user', version: '1.0.0' },
+        { ...behindCheckout('project-install'), scope: 'project' },
+        { ...behindCheckout('elsewhere'), readFromFolder: path.join(tmp, 'elsewhere') },
+      ]);
+
+      const results = await runPluginUpdates();
+
+      expect(claudeCalls()).toEqual(['plugin list --json', 'plugin update orchestrate --scope user --json']);
+      expect(results).toEqual([
+        { plugin: 'bootstrap', changed: false },
+        { plugin: 'orchestrate', changed: true },
+        { plugin: 'current', changed: false },
+      ]);
+    });
+
+    it.each([
+      ['the CLI fails', () => write(path.join(claudeState, 'list-fails'), 'boom\n')],
+      ['the output is not JSON', () => write(path.join(claudeState, 'list.json'), 'Plugins:\n')],
+      ['the output is not a list', () => write(path.join(claudeState, 'list.json'), '{"plugins":[]}')],
+    ])('reports an unreadable plugin list when %s, not an empty one', async (_name, breakList) => {
+      breakList();
+
+      expect(await runPluginUpdates()).toEqual([
+        { plugin: 'bootstrap', changed: false },
+        { plugin: 'claude plugin list', changed: false, error: expect.any(String) },
+      ]);
+    });
+
+    it('reports an update that exits 0 without saying it updated', async () => {
+      listInstalled([behindCheckout('orchestrate')]);
+      write(path.join(claudeState, 'update-unknown'), '{"updateOutcome":"pending","message":"Confirm the command"}');
+
+      expect(await runPluginUpdates()).toContainEqual({
+        plugin: 'orchestrate',
+        changed: false,
+        error: 'Confirm the command',
+      });
+    });
+
+    it('reports a refused update by the reason on stdout, once, and its recovery when the install catches up', async () => {
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] });
+      process.env.PLUGIN_UPDATE_NOTIFY_JID = 'slack:C123';
+      listInstalled([behindCheckout('orchestrate')]);
+      write(
+        path.join(claudeState, 'update-refused'),
+        '{"command":"update","outcome":"failed","message":"Plugin \\"orchestrate\\" not found","failureCode":"not_found"}',
+      );
+      const runs = () =>
+        vi.mocked(log.info).mock.calls.filter(([msg]) => msg === 'Plugin updater: run complete').length;
+      const nextRun = async (after: number) => {
+        const before = runs();
+        await vi.advanceTimersByTimeAsync(after);
+        await vi.waitFor(() => expect(runs()).toBe(before + 1));
+      };
+      const notify = vi.fn(async () => {});
+
+      try {
+        startPluginUpdater({ notify });
+        await nextRun(5 * 60 * 1000);
+        await nextRun(60 * 60 * 1000);
+        listInstalled([{ ...behindCheckout('orchestrate'), version: '3.5.0' }]);
+        await nextRun(60 * 60 * 1000);
+      } finally {
+        stopPluginUpdater();
+        vi.useRealTimers();
+      }
+
+      expect(notify.mock.calls).toEqual([
+        [
+          'slack:C123',
+          'Plugin update failing (it will not auto-update until fixed):\n- orchestrate: Plugin "orchestrate" not found',
+        ],
+        ['slack:C123', 'Plugin update recovered: orchestrate'],
+      ]);
+    });
   });
 
   it('a failing npm ci warns and does not stop other plugins or their installs', async () => {

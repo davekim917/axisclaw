@@ -1,12 +1,10 @@
-# Anderton Agent
+# AxisClaw
 
-A personal fleet of AI agents, run from chat. Each agent lives in its own container with its own identity, instructions, tools and secrets. One person runs many of them at once, from Slack or Discord.
-
-The name comes from John Anderton, the man at the wall who sees everything coming in and directs it.
+An AI workforce you run yourself. AxisClaw is a fork of [NanoClaw](https://github.com/nanocoai/nanoclaw), customized for agents that do real work in production: one agent handling many conversations at once, or many agents with their own roles. Agents run in isolated containers with their own identity, instructions and tools, and work from Slack or Discord.
 
 ## Status
 
-Early. Anderton Agent is built and used daily by one operator, on one Linux host, and it is published as it is developed. It is not a packaged product yet:
+Early. AxisClaw is built and used daily by one operator, on one Linux host, and it is published as it is developed. It is not a packaged product yet:
 
 - It is built on [NanoClaw](https://github.com/nanocoai/nanoclaw) and still uses NanoClaw's internal names: the `ncl` CLI, `nanoclaw.sh`, the `nanoclaw-v2-<slug>` service and the `nanoclaw-agent-v2-<slug>` container image.
 - It runs on Linux. The setup scripts also carry NanoClaw's macOS path, which is not exercised here.
@@ -26,7 +24,7 @@ Early. Anderton Agent is built and used daily by one operator, on one Linux host
 | Work that survives restarts    | `continue_work` lets an agent promise follow-up that a fresh container must account for after a kill.                                                 | [docs/agent-runner-details.md](docs/agent-runner-details.md)     |
 | Keyed task dispatch            | Admits one-shot tasks under idempotent keys, so a repeated event never runs twice.                                                                    | [docs/keyed-task-dispatch.md](docs/keyed-task-dispatch.md)       |
 | Slack and Discord in the tree  | Both adapters ship with the code, including hot-attaching a new Slack bot without a restart.                                                          | `src/channels/`                                                  |
-| Observatory                    | A web dashboard over the fleet: decisions, agents, threads and schedules.                                                                             | [dashboard/PRODUCT.md](dashboard/PRODUCT.md)                     |
+| Observatory                    | A web dashboard over your agents: decisions, agents, threads and schedules.                                                                           | [dashboard/PRODUCT.md](dashboard/PRODUCT.md)                     |
 
 ## Quick start
 
@@ -38,7 +36,8 @@ Before setup, install two things it does not handle:
 Clone this repository, then run setup from its root:
 
 ```bash
-cd anderton-agent
+git clone https://github.com/davekim917/axisclaw.git
+cd axisclaw
 bash nanoclaw.sh
 ```
 
@@ -56,4 +55,4 @@ Issues and pull requests are welcome here. Development happens in a private repo
 
 ## Credits
 
-Anderton Agent is built on [NanoClaw](https://github.com/nanocoai/nanoclaw) by nanoco, released under the MIT License. NanoClaw's copyright notice is kept in [LICENSE](LICENSE). This project is independent: it is not affiliated with or supported by nanoco, so please send issues about this code here, not to them.
+AxisClaw is built on [NanoClaw](https://github.com/nanocoai/nanoclaw) by nanoco, released under the MIT License. NanoClaw's copyright notice is kept in [LICENSE](LICENSE). This project is independent: it is not affiliated with or supported by nanoco, so please send issues about this code here, not to them.

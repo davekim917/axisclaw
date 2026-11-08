@@ -7,8 +7,9 @@
  */
 import { execFile } from 'child_process';
 
-import { ONECLI_URL } from './config.js';
+import { ONECLI_API_BASE } from './config.js';
 import { log } from './log.js';
+import { isReservedAgent, reservedOwner, reservedTokenName } from './reserved-secrets.js';
 import { onecliAuthConfigLine, sanitizeCurlFailure } from './onecli-curl.js';
 
 interface OnecliAgent {
@@ -133,9 +134,8 @@ async function withIdentityLock<T>(identity: string, fn: () => Promise<T>): Prom
 
 /** Full agents/secrets list from the gateway API (the CLI silently truncates at 20 rows, failing lookups closed). */
 async function listViaApi(resource: 'agents' | 'secrets'): Promise<unknown[]> {
-  const base = (ONECLI_URL || 'http://127.0.0.1:10254').replace(/\/$/, '');
-  const args = ['-fsS', ...CURL_TIMEOUT_ARGS, `${base}/api/${resource}?limit=10000`];
-  const out = await curl(args, `GET /api/${resource}`);
+  const args = ['-fsS', ...CURL_TIMEOUT_ARGS, `${ONECLI_API_BASE}/v1/${resource}?limit=10000`];
+  const out = await curl(args, `GET /v1/${resource}`);
   const parsed = JSON.parse(out) as unknown;
   if (Array.isArray(parsed)) return parsed;
   const data = (parsed as { data?: unknown }).data;
@@ -144,18 +144,16 @@ async function listViaApi(resource: 'agents' | 'secrets'): Promise<unknown[]> {
 
 /** `curl -f`: every non-2xx rejects. Only UUIDs travel in URLs, never secret values. */
 async function requestViaApi(method: 'GET' | 'PUT' | 'DELETE', path: string): Promise<unknown> {
-  const base = (ONECLI_URL || 'http://127.0.0.1:10254').replace(/\/$/, '');
   const args = ['-fsS', ...CURL_TIMEOUT_ARGS, '-X', method];
-  args.push(`${base}/api/${path.replace(/^\//, '')}`);
-  const out = await curl(args, `${method} /api/${path.replace(/^\//, '')}`);
+  args.push(`${ONECLI_API_BASE}/v1/${path.replace(/^\//, '')}`);
+  const out = await curl(args, `${method} /v1/${path.replace(/^\//, '')}`);
   return out.trim() ? (JSON.parse(out) as unknown) : undefined;
 }
 
 /** Keeps the HTTP status so callers can tell a create-race 409 from every other failure. */
 async function createAgentViaApi(input: EnsureOnecliAgentInput): Promise<{ status: number; body: unknown }> {
-  const base = (ONECLI_URL || 'http://127.0.0.1:10254').replace(/\/$/, '');
   const args = ['-sS', ...CURL_TIMEOUT_ARGS, '-X', 'POST', '-H', 'Content-Type: application/json'];
-  args.push('--data-binary', JSON.stringify(input), '-w', '\n%{http_code}', `${base}/v1/agents`);
+  args.push('--data-binary', JSON.stringify(input), '-w', '\n%{http_code}', `${ONECLI_API_BASE}/v1/agents`);
 
   const out = await curl(args, 'POST /v1/agents');
   const statusSeparator = out.lastIndexOf('\n');
@@ -294,6 +292,78 @@ async function ensureOnecliAgentLocked(input: EnsureOnecliAgentInput): Promise<E
   return { ...input, created: true };
 }
 
+/**
+ * Identifiers of every agent the gateway would inject this secret for, read fresh. Throws (fail-closed) when the
+ * secret is absent or any agent's grants are unreadable or in a mode other than explicit grants.
+ */
+export async function agentsHoldingSecret(secretName: string): Promise<string[]> {
+  const ids = await secretIdsNamed(secretName);
+  const holders: string[] = [];
+  for (const agent of await listedAgents()) {
+    if ((await effectiveSecrets(agent.id)).some((e) => ids.has(e.id))) holders.push(agent.identifier);
+  }
+  return holders;
+}
+
+/**
+ * Every secret the gateway would inject for this agent, with the host it injects on, read fresh. One the vault no
+ * longer lists comes back with no host; an agent OneCLI does not know holds nothing. Throws when the vault is unreadable.
+ */
+export async function secretsHeldBy(
+  identifier: string,
+): Promise<Array<{ id: string; name: string; hostPattern: string | null }>> {
+  const agent = (await listedAgents()).find((a) => a.identifier === identifier);
+  if (!agent) return [];
+  const rows = (await loadSecrets(true)).secrets.filter((row) => typeof row === 'object' && row !== null);
+  const ids = new Set((await effectiveSecrets(agent.id)).map((e) => e.id));
+  return [...ids].map((id) => {
+    const row = rows.find((r) => r.id === id);
+    return { id, name: row?.name ?? '', hostPattern: typeof row?.hostPattern === 'string' ? row.hostPattern : null };
+  });
+}
+
+/** Every vault UUID carrying `name`: a duplicate name must not leave one copy unwatched. Throws when there is none. */
+async function secretIdsNamed(name: string): Promise<Set<string>> {
+  const ids = new Set((await loadSecrets(true)).secrets.filter((s) => s.name === name).map((s) => s.id));
+  if (ids.size === 0) throw new Error(`OneCLI secret(s) not found in vault: ${name}`);
+  return ids;
+}
+
+async function listedAgents(): Promise<OnecliAgent[]> {
+  const agents = await listAgents(true);
+  for (const agent of agents) {
+    if (!agent || typeof agent.identifier !== 'string' || typeof agent.id !== 'string' || !isUuid(agent.id)) {
+      throw new Error('Malformed OneCLI agents list response');
+    }
+  }
+  return agents;
+}
+
+/**
+ * The secrets the gateway would inject for this agent, from the rule reflection that mirrors injection: every
+ * enabled allow rule naming the agent, whatever its source, with pool rules expanded. `/grants` lists only one kind
+ * of rule, so it cannot answer who holds a secret. Each entry carries the rules granting it.
+ */
+async function effectiveSecrets(agentUuid: string): Promise<Array<{ id: string; via: string }>> {
+  const parsed = await requestViaApi('GET', `agents/${encodeURIComponent(agentUuid)}/effective-credentials`);
+  const secrets = (parsed as { secrets?: unknown } | undefined)?.secrets;
+  if (!Array.isArray(secrets))
+    throw new Error(`Malformed OneCLI effective-credentials response for agent ${agentUuid}`);
+  return secrets.map((raw) => {
+    const e = raw as { id?: unknown; provenance?: unknown };
+    if (typeof e?.id !== 'string') {
+      throw new Error(`Malformed OneCLI effective-credentials response for agent ${agentUuid}`);
+    }
+    const rules = Array.isArray(e.provenance)
+      ? e.provenance.map((p) => {
+          const name = (p as { rule?: { name?: unknown } })?.rule?.name;
+          return typeof name === 'string' ? `rule "${name}"` : 'an organization rule';
+        })
+      : [];
+    return { id: e.id, via: rules.length ? rules.join(', ') : 'an unnamed rule' };
+  });
+}
+
 /** Names (case-sensitive) or UUIDs (presence-checked) → UUIDs. Any unresolved declaration throws. */
 export async function resolveSecretUuids(declarations: string[]): Promise<string[]> {
   if (declarations.length === 0) return [];
@@ -356,9 +426,115 @@ export function applyOnecliSecrets(agentIdentifier: string, declarations: string
   return withIdentityLock(agentIdentifier, () => applyOnecliSecretsLocked(agentIdentifier, declarations));
 }
 
+/** Adds one secret grant to an agent and leaves every grant it already holds; a reserved token goes only to its agent. */
+export function grantOnecliSecretToAgent(agentIdentifier: string, secret: { id: string; name: string }): Promise<void> {
+  return withIdentityLock(agentIdentifier, async () => {
+    assertSecretNotReserved(secret.name, agentIdentifier);
+    const agentUuid = await resolveAgentUuid(agentIdentifier);
+    const grants = await getAgentGrants(agentUuid);
+    if (grants.secrets.some((granted) => granted.secretId === secret.id)) return;
+    await requestViaApi(
+      'PUT',
+      `agents/${encodeURIComponent(agentUuid)}/grants/secrets/${encodeURIComponent(secret.id)}`,
+    );
+  });
+}
+
+/** Every vault UUID whose name reserves it, to the one agent it belongs to. */
+async function reservedSecretOwners(): Promise<Map<string, { secret: string; owner: string }>> {
+  const { secrets } = await loadSecrets(false);
+  return new Map(
+    secrets.flatMap((s) => {
+      const owner = reservedOwner(s.name);
+      return owner ? [[s.id, { secret: s.name, owner }] as const] : [];
+    }),
+  );
+}
+
+/** Throws when `secretName` is a reserved token and `agentIdentifier` is not its agent. */
+export function assertSecretNotReserved(secretName: string, agentIdentifier: string | null): void {
+  const owner = reservedOwner(secretName);
+  if (owner && owner !== agentIdentifier) {
+    throw new Error(`"${secretName}" is reserved to OneCLI agent ${owner} and cannot be granted elsewhere`);
+  }
+}
+
+/** Throws when a container would run as a reserved agent, and so be injected its token. */
+export function assertNotReservedIdentity(identifier: string | undefined): void {
+  if (identifier && isReservedAgent(identifier)) {
+    throw new Error(`OneCLI agent ${identifier} is reserved to the approved-run lane; no container may run as it`);
+  }
+}
+
+/** Every reserved token in the vault, with its agent, read fresh. */
+export async function reservedVaultSecrets(): Promise<Array<{ secret: string; owner: string }>> {
+  const names = new Set((await loadSecrets(true)).secrets.map((s) => s.name));
+  return [...names].flatMap((secret) => {
+    const owner = reservedOwner(secret);
+    return owner ? [{ secret, owner }] : [];
+  });
+}
+
+/**
+ * Secrets a reserved agent can be injected other than its own token, by name. Its token renamed out of the rule
+ * shows up here, since the agent still holds it under a name the rule no longer covers.
+ */
+export async function reservedAgentStrays(): Promise<Array<{ agent: string; secret: string }>> {
+  const byId = new Map((await loadSecrets(true)).secrets.map((s) => [s.id, s.name] as const));
+  const strays: Array<{ agent: string; secret: string }> = [];
+  for (const agent of await listedAgents()) {
+    if (!isReservedAgent(agent.identifier)) continue;
+    for (const e of await effectiveSecrets(agent.id)) {
+      const name = byId.get(e.id) ?? e.id;
+      if (name !== reservedTokenName(agent.identifier)) strays.push({ agent: agent.identifier, secret: name });
+    }
+  }
+  return strays;
+}
+
+/**
+ * Removes every grant of a reserved token but its owner's, then re-reads what the gateway would inject: a rule that
+ * is not a single-secret grant (an equipment or custom rule, a whole-pool rule) cannot be removed here, so an agent
+ * still holding it comes back as `unremovable`, with the rules that grant it. `beforeRevoke` hears each other holder
+ * before its grant is deleted, and a throw from it leaves the grant in place, so an exposure is never removed without
+ * first being recorded. Throws (fail-closed) when the vault cannot be read.
+ */
+export async function enforceReservedSecret(
+  secretName: string,
+  owner: string,
+  beforeRevoke: (identifier: string) => void,
+): Promise<{ removed: string[]; unremovable: Array<{ identifier: string; via: string }> }> {
+  const ids = await secretIdsNamed(secretName);
+  const removed: string[] = [];
+  const unremovable: Array<{ identifier: string; via: string }> = [];
+  for (const agent of await listedAgents()) {
+    if (agent.identifier === owner) continue;
+    if (!(await effectiveSecrets(agent.id)).some((e) => ids.has(e.id))) continue;
+    const held = (await getAgentGrants(agent.id)).secrets.map((g) => g.secretId).filter((id) => ids.has(id));
+    if (held.length) beforeRevoke(agent.identifier);
+    for (const id of held) {
+      await requestViaApi('DELETE', `agents/${encodeURIComponent(agent.id)}/grants/secrets/${encodeURIComponent(id)}`);
+    }
+    if (held.length) removed.push(agent.identifier);
+    const still = (await effectiveSecrets(agent.id)).filter((e) => ids.has(e.id));
+    if (still.length)
+      unremovable.push({ identifier: agent.identifier, via: [...new Set(still.map((e) => e.via))].join(', ') });
+  }
+  return { removed, unremovable };
+}
+
 async function applyOnecliSecretsLocked(agentIdentifier: string, declarations: string[]): Promise<void> {
   const agentUuid = await resolveAgentUuid(agentIdentifier);
   const secretUuids = await resolveSecretUuids(declarations);
+  const reserved = await reservedSecretOwners();
+  for (const uuid of secretUuids) {
+    const r = reserved.get(uuid);
+    if (r && r.owner !== agentIdentifier) {
+      throw new Error(
+        `"${r.secret}" is reserved to OneCLI agent ${r.owner}; remove it from ${agentIdentifier}'s secrets`,
+      );
+    }
+  }
   const grants = await getAgentGrants(agentUuid);
   const declaredSet = new Set(secretUuids);
   const grantedSet = new Set(grants.secrets.map((secret) => secret.secretId));
@@ -549,19 +725,6 @@ export function gatewayRestHosts(declarations: string[]): Array<{ name: string; 
     out.push({ name: secret.name, host });
   }
   return out;
-}
-
-const TYPESAFE_HOST = 'api.typesafe.ai';
-
-/**
- * Placeholder `TYPESAFE_API_KEY` for a Claude container granted `api.typesafe.ai` (the real key is injected at the
- * proxy; the fast-jev-compaction plugin only refuses an empty one). Gated on the grant, which is the clearance to
- * send that group's text to TypeSafe. Reads the cache `applyOnecliSecrets` just warmed; cold yields no key.
- */
-export function typesafeKeyPlaceholderEnv(provider: string, grantedSecrets: string[]): string[] {
-  if (provider !== 'claude') return [];
-  if (!gatewayRestHosts(grantedSecrets).some((h) => h.host === TYPESAFE_HOST)) return [];
-  return ['-e', 'TYPESAFE_API_KEY=onecli-gateway-injected'];
 }
 
 export function __setSecretsCacheForTest(secrets: OnecliSecret[]): void {

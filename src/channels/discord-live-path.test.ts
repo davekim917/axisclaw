@@ -13,7 +13,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { WebSocketServer, type WebSocket } from 'ws';
 
 import { allowNetwork } from '../test-hermeticity.js';
-import type { ChannelSetup, InboundMessage } from './adapter.js';
+import { ChannelRateLimitedError, type ChannelSetup, type InboundMessage } from './adapter.js';
 import { serveAttachments } from '../test-attachment-transport.js';
 
 const TOKEN = 'live-path-test-token';
@@ -23,6 +23,7 @@ const GUILD = '123456789000000003';
 const CHANNEL = '123456789000000004';
 const DM_CHANNEL = '123456789000000005';
 const THREAD = '123456789000000006';
+const DELETED_THREAD = '123456789000000007';
 
 vi.mock('../env.js', async (importOriginal) => {
   const values: Record<string, string> = {
@@ -39,6 +40,7 @@ vi.mock('../env.js', async (importOriginal) => {
 });
 
 const botUser = { id: BOT, username: 'example-agent', discriminator: '0', global_name: null, bot: true, avatar: null };
+const BOT_AVATAR = '0123456789abcdef0123456789abcdef';
 const humanUser = {
   id: HUMAN,
   username: 'example.user',
@@ -56,6 +58,8 @@ let seq = 0;
 let identifyToken: string | undefined;
 let identifyIntents = 0;
 const unfaked: string[] = [];
+let renameRetryAfter: string | null = null;
+let renameForbidden = false;
 const posted: Array<{ path: string; body: Record<string, unknown> }> = [];
 const inbound: Array<{ platformId: string; threadId: string | null; message: InboundMessage }> = [];
 const waiters: Array<() => void> = [];
@@ -83,9 +87,18 @@ function rest(method: string, path: string, body: Record<string, unknown>): [num
       },
     ];
   }
-  if (method === 'GET' && path === '/users/@me') return [200, botUser];
+  if (method === 'GET' && path === '/users/@me') return [200, { ...botUser, avatar: BOT_AVATAR }];
   if (method === 'GET' && path === `/channels/${CHANNEL}`) return [200, channel];
   if (method === 'GET' && path === `/channels/${THREAD}`) return [200, thread];
+  if (method === 'GET' && path === `/channels/${DELETED_THREAD}`)
+    return [404, { message: 'Unknown Channel', code: 10003 }];
+  if (method === 'PATCH' && path === `/channels/${THREAD}`) {
+    if (renameForbidden) return [403, { message: 'Missing Permissions', code: 50013 }];
+    if (renameRetryAfter !== null)
+      return [429, { message: 'You are being rate limited.', retry_after: 0, global: false }];
+    thread.name = String(body.name).trim();
+    return [200, thread];
+  }
   if (method === 'GET' && path === `/channels/${DM_CHANNEL}`) return [200, { id: DM_CHANNEL, type: 1 }];
   if (method === 'GET' && path === `/guilds/${GUILD}/channels`) return [200, [channel]];
   if (method === 'POST' && /^\/channels\/\d+\/messages$/.test(path)) {
@@ -151,6 +164,7 @@ beforeAll(async () => {
     const path = (req.url ?? '').replace(/^\/api(\/v\d+)?/, '').split('?')[0]!;
     const [status, body] = rest(req.method ?? 'GET', path, await readBody(req));
     res.statusCode = status;
+    if (status === 429 && renameRetryAfter !== null) res.setHeader('retry-after', renameRetryAfter);
     res.setHeader('content-type', 'application/json');
     res.end(JSON.stringify(body));
   };
@@ -244,6 +258,13 @@ describe('Discord inbound and outbound through the real adapter and discord.js g
     const required = { Guilds: 1 << 0, GuildMessages: 1 << 9, DirectMessages: 1 << 12, MessageContent: 1 << 15 };
     const missing = Object.entries(required).filter(([, bit]) => (identifyIntents & bit) === 0);
     expect(missing.map(([name]) => name)).toEqual([]);
+  });
+
+  it('registers the bot’s avatar from its own user object, at Discord’s CDN', async () => {
+    const { getKnownDiscordBots } = await import('./discord.js');
+    expect(getKnownDiscordBots().get('discord')?.avatarUrl).toBe(
+      `https://cdn.discordapp.com/avatars/${BOT}/${BOT_AVATAR}.png?size=256`,
+    );
   });
 
   it('delivers a guild @mention that discord.js turns circular once it builds its Message', async () => {
@@ -378,6 +399,52 @@ describe('Discord inbound and outbound through the real adapter and discord.js g
 
     expect(posted.map((p) => p.path)).toContain(`/channels/${THREAD}/messages`);
     expect(JSON.stringify(posted)).toContain('a reply from the agent');
+  });
+
+  describe('thread names', () => {
+    const threadId = `discord:${GUILD}:${CHANNEL}:${THREAD}`;
+    const adapter = () => registry.getChannelAdapterExact('discord')!;
+
+    it('reads a thread’s name and renames it as the bot, returning what the platform stored', async () => {
+      await expect(adapter().threadName!(threadId)).resolves.toBe('a thread');
+      await expect(adapter().renameThread!(threadId, '  Budget review ')).resolves.toBe('Budget review');
+      await expect(adapter().threadName!(threadId)).resolves.toBe('Budget review');
+    });
+
+    it('turns a 429 into the wait its header asked for, at once, and does not queue through it', async () => {
+      renameRetryAfter = '65';
+      try {
+        const started = Date.now();
+        const refused = await adapter().renameThread!(threadId, 'Never applied').catch((err: unknown) => err);
+
+        expect(refused).toBeInstanceOf(ChannelRateLimitedError);
+        expect((refused as ChannelRateLimitedError).retryAfterMs).toBe(65_000);
+        expect(Date.now() - started).toBeLessThan(5_000);
+      } finally {
+        renameRetryAfter = null;
+      }
+      await expect(adapter().threadName!(threadId)).resolves.toBe('Budget review');
+    });
+
+    it('turns a 403 on a rename into a reason an agent can say out loud', async () => {
+      renameForbidden = true;
+      try {
+        await expect(adapter().renameThread!(threadId, 'Never applied')).rejects.toThrow(
+          'Discord refused: this bot needs the Manage Threads permission, or to be the one that created the thread.',
+        );
+      } finally {
+        renameForbidden = false;
+      }
+      await expect(adapter().threadName!(threadId)).resolves.toBe('Budget review');
+    });
+
+    it('refuses an id that is not a Discord thread without calling out', async () => {
+      await expect(adapter().threadName!('discord:guild:channel')).rejects.toThrow('Not a Discord thread id');
+    });
+
+    it('reports a platform refusal as a failure, so a caller never reads it as a name', async () => {
+      await expect(adapter().threadName!(`discord:${GUILD}:${CHANNEL}:${DELETED_THREAD}`)).rejects.toThrow('404');
+    });
   });
 
   it('answers every REST call the host made, so no step ran on a faked failure', () => {

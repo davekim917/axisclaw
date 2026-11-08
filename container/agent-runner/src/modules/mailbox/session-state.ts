@@ -23,7 +23,8 @@ function credentialSlotKey(providerName: string): string {
 }
 
 /**
- * The active OAuth ring slot, persisted so a respawn doesn't restart at the primary and burn a rejected turn.
+ * The last OAuth ring slot that served a turn, persisted so a respawn doesn't restart at the primary and burn a
+ * rejected turn.
  * Stores the env var NAME, never the credential. Only Claude's circular OAuth ring writes it: the forward-only
  * API-key pool relies on a respawn as its reset, and Codex keeps its slot in CODEX_HOME.
  */
@@ -281,6 +282,16 @@ export function requeueWorkContinuationIfMatches(id: string, runnerId: string): 
   })();
 }
 
+/** The runner holding a requeued claim takes it straight back for an in-place retry; no new attempt has begun. */
+export function reclaimWorkContinuation(id: string, runnerId: string): boolean {
+  return getOutboundDb().transaction(() => {
+    const current = getWorkContinuation();
+    if (!current || current.id !== id || current.phase !== 'queued' || current.runner_id !== runnerId) return false;
+    setValue(WORK_CONTINUATION_KEY, JSON.stringify({ ...current, phase: 'running' }));
+    return true;
+  })();
+}
+
 export function clearWorkContinuationIfMatches(id: string): boolean {
   return getOutboundDb().transaction(() => {
     const current = getWorkContinuation();
@@ -515,4 +526,53 @@ export function getWorktreeInFlight(): WorktreeInFlight | undefined {
 
 export function clearWorktreeInFlight(): void {
   deleteValue(WORKTREE_IN_FLIGHT_KEY);
+}
+
+/**
+ * Output of pre-task scripts that woke before the agent booted, keyed by occurrence id. Durable because the boot can
+ * still die after the script ran, and a stateful script (one that advances a cursor) would answer `false` the
+ * second time, dropping the wake.
+ */
+const CARRIED_SCRIPT_WAKES_KEY = 'carried_script_wakes';
+const CARRIED_SCRIPT_WAKE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+type CarriedScriptWakes = Record<string, { output: unknown; at: string }>;
+
+function readCarriedScriptWakes(): CarriedScriptWakes {
+  const raw = getValue(CARRIED_SCRIPT_WAKES_KEY);
+  if (raw === undefined) return {};
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? (parsed as CarriedScriptWakes) : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeCarriedScriptWakes(wakes: CarriedScriptWakes): void {
+  if (Object.keys(wakes).length === 0) deleteValue(CARRIED_SCRIPT_WAKES_KEY);
+  else setValue(CARRIED_SCRIPT_WAKES_KEY, JSON.stringify(wakes));
+}
+
+export function carryScriptWake(occurrenceId: string, output: unknown, nowMs = Date.now()): void {
+  const wakes = readCarriedScriptWakes();
+  for (const [id, wake] of Object.entries(wakes)) {
+    if (!(nowMs - Date.parse(wake.at) < CARRIED_SCRIPT_WAKE_MAX_AGE_MS)) delete wakes[id];
+  }
+  wakes[occurrenceId] = { output: output ?? null, at: new Date(nowMs).toISOString() };
+  writeCarriedScriptWakes(wakes);
+}
+
+/** Kept across reads: a batch can still be dropped unclaimed (a fence landing at admission) and polled again. */
+export function getCarriedScriptWake(occurrenceId: string): { output: unknown } | undefined {
+  const wake = readCarriedScriptWakes()[occurrenceId];
+  return wake === undefined ? undefined : { output: wake.output };
+}
+
+/** A claimed occurrence's carry ends, so a retry after a failed turn runs its script again as before. */
+export function dropCarriedScriptWakes(occurrenceIds: string[]): void {
+  const wakes = readCarriedScriptWakes();
+  const before = Object.keys(wakes).length;
+  for (const id of occurrenceIds) delete wakes[id];
+  if (Object.keys(wakes).length !== before) writeCarriedScriptWakes(wakes);
 }

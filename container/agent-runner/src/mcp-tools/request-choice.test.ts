@@ -139,6 +139,23 @@ describe('request_choice', () => {
     ]);
   });
 
+  it.each([13, 24])('transports %i hold codes on one card', async (count) => {
+    inConversation();
+    const holds = Array.from({ length: count }, (_, i) => `hold:access:f${String(i).padStart(2, '0')}.sql`);
+    const result = await requestChoice.handler({ approvalScope: { ...RELEASE_SCOPE, holds }, decision: DECISION });
+    expect(result.isError).toBeUndefined();
+    expect((outbound('system')[0].content as { approvalScope: { holds: string[] } }).approvalScope.holds).toEqual(
+      holds,
+    );
+  });
+
+  it('advertises the same hold cap the handler enforces', () => {
+    const schema = requestChoice.tool.inputSchema as unknown as {
+      properties: { approvalScope: { properties: { holds: { maxItems: number } } } };
+    };
+    expect(schema.properties.approvalScope.properties.holds.maxItems).toBe(24);
+  });
+
   it('advertises exactly the fields the handler requires for each decision kind', async () => {
     inConversation();
     const schema = requestChoice.tool.inputSchema as {
@@ -294,9 +311,9 @@ describe('request_choice', () => {
       /approvalScope/,
     ],
     [
-      'more than 12 hold codes',
+      'more than 24 hold codes',
       {
-        approvalScope: { ...RELEASE_SCOPE, holds: Array.from({ length: 13 }, (_, i) => `hold:access:f${i}.sql`) },
+        approvalScope: { ...RELEASE_SCOPE, holds: Array.from({ length: 25 }, (_, i) => `hold:access:f${i}.sql`) },
         decision: DECISION,
       },
       /approvalScope/,

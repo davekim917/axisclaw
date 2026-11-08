@@ -21,10 +21,10 @@ describe('dropRetiredMcpServers', () => {
   });
 
   it('is applied in the runner after both MCP sources merge and before any provider consumes the map', () => {
-    // index.ts is the process entry and cannot be imported in a test, so pin
+    // runner-main.ts boots a provider and cannot be imported in a test, so pin
     // the call's position in its source: after the container.json loop and the
     // NANOCLAW_MCP_SERVERS merge, before the first consumer of the map.
-    const source = fs.readFileSync(path.join(import.meta.dir, 'index.ts'), 'utf8');
+    const source = fs.readFileSync(path.join(import.meta.dir, 'runner-main.ts'), 'utf8');
     const call = source.indexOf('dropRetiredMcpServers(mcpServers, log);');
     expect(call).toBeGreaterThan(
       source.indexOf('for (const [name, serverConfig] of Object.entries(config.mcpServers))'),

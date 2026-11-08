@@ -10,7 +10,7 @@
 #   codex-review.sh push [git push args…]     # gate, then push — the loop's only push path
 #   codex-review.sh reply <comment_id> <text> # reply on that thread
 #   codex-review.sh resolve <thread_id>       # mark the thread resolved
-#   codex-review.sh status <sha> <since_iso>  # codex=<pending|clean|findings|unavailable|head-changed> head=<sha> open=<n> review=<n> last_review_at=<iso|none> reaction=<n> last_thumbs_up_at=<iso|none> rounds=<n>
+#   codex-review.sh status <sha> <since_iso>  # codex=<pending|clean|findings|unavailable|head-changed> head=<sha> open=<n> review=<n> last_review_at=<iso|none> reaction=<n> last_thumbs_up_at=<iso|none> rounds=<n> written=<n>
 #   codex-review.sh wait <sha> <since_iso> [minutes]
 #                                             # foreground GraphQL poll, default $CODEX_REVIEW_WAIT_MINUTES or 15
 #                                             # open/status print a STOP banner at rounds>=4 — diagnose, do not push
@@ -46,7 +46,8 @@
 #   22  request: a review of this head was already requested
 #   23  request: REVIEW_ROUND_CAP reached and no converging checkpoint names this head
 #   24  merge-check: merging this head is not allowed — CI is not green on it, it has
-#       neither a clean Codex review nor an approving substitute receipt, the
+#       neither a clean Codex review with a written finding nor an approving substitute
+#       receipt (`review_not_written` when Codex left only a no-findings signal), the
 #       approving receipt's reviewer is not a frontier model id, it is a
 #       fix PR whose body has no Fixes-PR line, the base branch's
 #       .github/pr-review-loop.json requires a Replaces line and the body has none,
@@ -65,7 +66,8 @@
 #       `ci=host` it also says `admin=ready` or `admin=not-ready: <why>`
 #       (admin_readiness); only `admin=ready` licenses `gh pr merge --admin`. A legacy
 #       head still gets 24 first when a check GitHub marks required for the PR is red on it
-#       (`required_red`) or the newest independent-review-receipt:v1 for it is not
+#       (`required_red`; `<name>=unreadable` where a token GitHub refuses check runs cannot
+#       place a required check) or the newest independent-review-receipt:v1 for it is not
 #       CLEAR (`independent_receipt_not_clear`) — legacy_precheck — or on `comment_rule`,
 #       and also while any review thread is unresolved or Codex's 👀 shows a review
 #       still running on the PR
@@ -223,7 +225,7 @@ reviews_page() {
     query($owner:String!,$name:String!,$pr:Int!,$after:String){
       repository(owner:$owner,name:$name){ pullRequest(number:$pr){
         headRefOid reviews(first:100,after:$after){ pageInfo{hasNextPage endCursor} nodes{
-          author{login} submittedAt body commit{oid}
+          author{login} submittedAt body commit{oid} comments(first:1){totalCount}
         } }
       } }
     }' \
@@ -321,9 +323,16 @@ codex_review_in_flight() {
       end'
 }
 
+# Whether a passed head has a written review is judged here, from the same read
+# as its findings: `written=<n>` counts the reviews of this head with a finding
+# in them, as written_review reads it. On a head it passes Codex leaves a
+# thumbs-up and a "didn't find any major issues" comment, which say the same
+# thing: neither shows what it read, and a head carrying a real bug has drawn
+# both. GitHub's timestamps are whole seconds, so a review in the second of the
+# merge is not known to predate it.
 status_observation() {
   local sha="$1" since="$2" thread_pages review_pages comment_pages reaction_pages
-  local observed_heads head_count head_changed head_oid open_count review_matches review_count last_review_at last_valid_review_at last_valid_verdict_at quota_matches quota_count last_usage_limit_at reaction_matches reaction_count last_thumbs_up_at rounds codex
+  local observed_heads head_count head_changed head_oid open_count review_matches review_count written last_review_at last_valid_review_at last_valid_verdict_at quota_matches quota_count last_usage_limit_at reaction_matches reaction_count last_thumbs_up_at rounds codex
 
   # Read verdict evidence before threads: a review submitted between these
   # requests must have its findings included before we can declare it clean.
@@ -365,6 +374,8 @@ status_observation() {
       | select($until == "" or .submittedAt <= $until)
       | select((.body // "") | test($usageLimitRe; "i") | not)
     ]') || return 1
+  written=$(printf '%s' "$review_matches" | jq -er --arg until "$GATE_AS_OF" '
+    [ .[] | select((.comments.totalCount // 0) > 0) | select($until == "" or .submittedAt < $until) ] | length') || return 1
   review_count=$(printf '%s' "$review_matches" | jq -er 'length') || return 1
   last_valid_review_at=$(printf '%s' "$review_matches" | jq -er '([.[].submittedAt] | max) // "none"') || return 1
   last_review_at=$(printf '%s\n' "$review_pages" | jq -ers '
@@ -423,11 +434,14 @@ status_observation() {
   fi
   rounds_banner "$rounds"
   if [ "$codex" = unavailable ]; then
-    echo "codex=$codex reason=usage_limit head=$head_oid open=$open_count review=$review_count last_review_at=$last_review_at reaction=$reaction_count last_thumbs_up_at=$last_thumbs_up_at rounds=$rounds"
+    echo "codex=$codex reason=usage_limit head=$head_oid open=$open_count review=$review_count last_review_at=$last_review_at reaction=$reaction_count last_thumbs_up_at=$last_thumbs_up_at rounds=$rounds written=$written"
   else
-    echo "codex=$codex head=$head_oid open=$open_count review=$review_count last_review_at=$last_review_at reaction=$reaction_count last_thumbs_up_at=$last_thumbs_up_at rounds=$rounds"
+    echo "codex=$codex head=$head_oid open=$open_count review=$review_count last_review_at=$last_review_at reaction=$reaction_count last_thumbs_up_at=$last_thumbs_up_at rounds=$rounds written=$written"
   fi
 }
+
+# Exit 0 when a status_observation line ($1) reports a written review.
+written_review() { [[ "$1" =~ \ written=[1-9][0-9]*$ ]]; }
 
 # Distinct Codex reviews that produced findings — the PR's round count.
 # Printed on open/status so the number is impossible to not see; at 4+ the
@@ -620,6 +634,9 @@ run_gate() {
 RISK_LABEL_WORKFLOW='Risk label'
 # release-policy.py's own contexts are a policy gate, not CI: a pending human approval must never read as ci_pending.
 CI_EXCLUDED_CONTEXTS='["Release policy","Release approval"]'
+# GitHub Actions' app id, which a required check's `integration_id` names when
+# it is pinned to Actions. The jobs API does not say which app a job belongs to.
+GITHUB_ACTIONS_APP_ID=15368
 # The commit status run-host-ci.sh posts: the repository's declared CI, run on
 # a host against the exact head. It stands in for a required Actions workflow
 # only when GitHub never started that workflow's jobs (never_started_runs);
@@ -1803,25 +1820,17 @@ ci_verdict() {
   # Only asked when something could be excused, so a healthy head never pays
   # for (or fails on) the identity read.
   if [ "$unstarted" != '[]' ]; then posters=$(host_ci_posters); fi
-  printf '%s\n%s\n' "$runs" "$statuses" | jq -rs --arg head "$1" --arg labeler "$RISK_LABEL_WORKFLOW" --arg requiredList "$required" --argjson excluded "$CI_EXCLUDED_CONTEXTS" --arg asof "$GATE_AS_OF" --argjson unstarted "$unstarted" --argjson quick "$quick" --arg hostContext "$HOST_CI_CONTEXT" --argjson posters "$posters" '
+  printf '%s\n%s\n' "$runs" "$statuses" | jq_here -rs --arg head "$1" --arg labeler "$RISK_LABEL_WORKFLOW" --arg requiredList "$required" --argjson excluded "$CI_EXCLUDED_CONTEXTS" --arg asof "$GATE_AS_OF" --argjson unstarted "$unstarted" --argjson quick "$quick" --arg hostContext "$HOST_CI_CONTEXT" --argjson posters "$posters" '
+    include "head-checks";
     ( $requiredList | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0)) ) as $required
-    | ( [ .[0][].workflow_runs[]?
-        | select(.head_sha == $head)
-        | select($asof == "" or (.created_at // "") <= $asof)
-        | select((.name == $labeler and .event == "pull_request_target") | not)
-        | if $asof != "" and ((.updated_at // "") as $u | $u == "" or $u > $asof)
-          then .status = "updated after the merge" | .conclusion = null else . end ]
-      # Per workflow name, BOTH its newest run of any event and its newest
-      # pull_request run are judged. The newest run keeps every blocking
-      # signal it always had (a newer failed or pending push of the same sha
-      # still blocks); the newest pull_request run must pass too, because this
-      # gate judges a pull request and a run from another event did not test
-      # its merge ref, so another event success can neither pass nor mask it
-      # (a quick-tier run included). Stricter than either rule alone.
-      | group_by(.name) | map(
-          max_by([.run_started_at // .created_at // "", .id // 0]) as $newest
-          | ( [ .[] | select(.event == "pull_request") ] | if length > 0 then [ max_by([.run_started_at // .created_at // "", .id // 0]) ] else [] end ) as $pr
-          | [ $newest ] + [ $pr[] | select(.id != $newest.id) ] ) | add // [] ) as $runs
+    # Per workflow name, BOTH its newest run of any event and its newest
+    # pull_request run are judged. The newest run keeps every blocking
+    # signal it always had (a newer failed or pending push of the same sha
+    # still blocks); the newest pull_request run must pass too, because this
+    # gate judges a pull request and a run from another event did not test
+    # its merge ref, so another event success can neither pass nor mask it
+    # (a quick-tier run included). Stricter than either rule alone.
+    | ( .[0] | head_runs($head; $labeler; $asof) ) as $runs
     | ( [ .[1][][]? | select(.context as $c | $excluded | index($c) | not)
           | select($asof == "" or (.created_at // "") <= $asof) ]
         | group_by(.context) | map(max_by([.created_at // "", .id // 0])) ) as $statuses
@@ -2089,21 +2098,75 @@ independent_receipt_newest() {
 # GitHub counts on it, each with GitHub's own answer to whether this PR's base
 # requires it. A head nothing has reported on has no rollup at all (null, read
 # 2026-09-17 on a repo with no CI); that is an empty page, not a failed read.
+# Neither is a refusal of its check runs or of their workflow identity
+# (contexts_refused and identity_refused, head-checks.jq),
+# which gh reports by exiting 1 with the partial document on stdout and a line
+# per node on stderr; the page goes on for rollup_nodes to judge.
 rollup_page() {
-  gh api graphql -f query='
+  local page errors rc=0 refused=false
+  errors=$(mktemp) || return 1
+  page=$(gh api graphql -f query='
     query($owner:String!,$name:String!,$pr:Int!,$after:String){
       repository(owner:$owner,name:$name){ pullRequest(number:$pr){
-        headRefOid statusCheckRollup{ contexts(first:100,after:$after){ pageInfo{hasNextPage endCursor} nodes{
+        headRefOid baseRefName statusCheckRollup{ contexts(first:100,after:$after){ pageInfo{hasNextPage endCursor} nodes{
           __typename
-          ... on CheckRun{ databaseId name status conclusion isRequired(pullRequestNumber:$pr) }
+          ... on CheckRun{ databaseId name status conclusion startedAt isRequired(pullRequestNumber:$pr)
+            checkSuite{ app{ databaseId } workflowRun{ event workflow{ databaseId } } } }
           ... on StatusContext{ context state creator{ login } isRequired(pullRequestNumber:$pr) }
         } } }
       } }
     }' \
-    -F owner="$OWNER" -F name="$NAME" -F pr="$PR" -F after="$1" \
+    -F owner="$OWNER" -F name="$NAME" -F pr="$PR" -F after="$1" 2>"$errors") || rc=$?
+  if [ "$rc" != 0 ]; then
+    refused=$(printf '%s' "$page" | jq_here -s 'include "head-checks"; any(.[]; contexts_refused or identity_refused)' 2>/dev/null) || refused=false
+  fi
+  [ "$refused" = true ] || cat "$errors" >&2
+  rm -f "$errors"
+  [ "$rc" = 0 ] || [ "$refused" = true ] || return 1
+  printf '%s' "$page" \
     | jq -c 'if .data.repository.pullRequest != null and .data.repository.pullRequest.statusCheckRollup == null
              then .data.repository.pullRequest.statusCheckRollup = { contexts: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] } }
              else . end'
+}
+
+# The rollup of exactly head $1 as a JSON array of nodes. The rollup is the PR
+# head's, so every page must name $1 as that head; a failed or partial read is
+# no verdict. When GitHub refuses this token the check-run nodes, the same
+# array is rebuilt from what the token can read (rollup_from_readable). That is
+# a projection of GitHub's rules rather than its `isRequired`, which is why it
+# runs only on a refusal and why a required check it cannot place is never green.
+rollup_nodes() {
+  local pages nodes refused rules branch runs picked id attempt jobs=""
+  pages=$(paginate_connection statusCheckRollup.contexts rollup_page) || return 1
+  nodes=$(printf '%s\n' "$pages" | jq -cs --arg head "$1" '
+    if all(.[]; .data.repository.pullRequest.headRefOid == $head) | not
+    then error("the status rollup read is for another head than \($head)") else . end
+    | [ .[] | .data.repository.pullRequest.statusCheckRollup.contexts.nodes[] ]') || return 1
+  refused=$(printf '%s\n' "$pages" | jq_here -s 'include "head-checks"; any(.[]; contexts_refused)') || return 1
+  if [ "$refused" != true ]; then
+    printf '%s\n' "$nodes"
+    return 0
+  fi
+  # A PR can be retargeted with its head unmoved, and the rules read below are
+  # those of the base scope_eval saw.
+  printf '%s\n' "$pages" | jq -se --arg base "$SCOPE_BASE_REF" 'all(.[]; .data.repository.pullRequest.baseRefName == $base)' >/dev/null || {
+    echo "the status rollup read is for another base than $SCOPE_BASE_REF" >&2
+    return 1
+  }
+  echo "merge-check: this token cannot read check runs, so required checks are read from the branch rules, Actions jobs and commit statuses; one those do not show reads unreadable, which is never green" >&2
+  rules=$(gh api --paginate --slurp "repos/$REPO/rules/branches/$SCOPE_BASE_REF" | jq -c 'flatten') || return 1
+  branch=$(gh api "repos/$REPO/branches/$SCOPE_BASE_REF") || return 1
+  runs=$(gh api --paginate --slurp "repos/$REPO/actions/runs?head_sha=$1&per_page=100") || return 1
+  picked=$(printf '%s\n' "$runs" | jq_here -r --arg head "$1" --arg labeler "$RISK_LABEL_WORKFLOW" --arg asof "$GATE_AS_OF" '
+    include "head-checks"; checked_runs | head_runs($head; $labeler; $asof) | .[] | "\(.id)\t\(.run_attempt // 1)"') || return 1
+  while IFS=$'\t' read -r id attempt; do
+    [ -n "$id" ] || continue
+    [[ "$id" =~ ^[0-9]+$ && "$attempt" =~ ^[0-9]+$ ]] || return 1
+    jobs+=$(gh api --paginate --slurp "repos/$REPO/actions/runs/$id/attempts/$attempt/jobs?per_page=100") || return 1
+    jobs+=$'\n'
+  done <<< "$picked"
+  printf '%s\n%s\n%s\n%s\n' "$nodes" "$rules" "$branch" "$jobs" \
+    | jq_here -cs --argjson actionsApp "$GITHUB_ACTIONS_APP_ID" 'include "head-checks"; rollup_from_readable($actionsApp)'
 }
 
 # The required checks that are red on exactly HEAD, as `<name>=<state>` joined
@@ -2112,7 +2175,8 @@ rollup_page() {
 # `isRequired(pullRequestNumber:)` is its evaluation across rulesets and
 # classic protection, app pins, and a status and a check run sharing a name
 # (it requires both). Three review rounds re-deriving those rules one case at
-# a time is why none of them is restated here.
+# a time is why none of them is restated here, outside the refusal rollup_nodes
+# answers for.
 #
 # Red is named by what is acceptable, as in ci_verdict, so a value GitHub adds
 # later is red: a required check run that is COMPLETED with a conclusion other
@@ -2120,9 +2184,8 @@ rollup_page() {
 # SUCCESS, PENDING or EXPECTED. What has not finished or not reported is left
 # alone: a Release approval waiting on a person is not a defect in the head,
 # which is what CI_EXCLUDED_CONTEXTS protects in ci_verdict too, and GitHub
-# holds the merge for it anyway. The rollup is the PR head's, so every page
-# must name HEAD as that head; a failed or partial read is no verdict, and
-# there is no second source to fall back on.
+# holds the merge for it anyway. `isRequired` is true on every run of a required
+# name on the head, not only the newest, so a run superseded() names is not red.
 #
 # Output is `<red>\t<hosted>\t<hosted check-run ids as JSON>`. A required check run that concluded FAILURE
 # because GitHub never started it (its Actions job, read by the check run's
@@ -2134,12 +2197,8 @@ rollup_page() {
 # hides an allowed success and the check run stays red. As in ci_verdict, a
 # job read that fails keeps it red.
 required_status_red() {
-  local pages rollup candidates id job posters='[]' unstarted='[]' runs excusable='[]'
-  pages=$(paginate_connection statusCheckRollup.contexts rollup_page) || return 1
-  rollup=$(printf '%s\n' "$pages" | jq -cs --arg head "$1" '
-    if all(.[]; .data.repository.pullRequest.headRefOid == $head) | not
-    then error("the status rollup read is for another head than \($head)") else . end
-    | [ .[] | .data.repository.pullRequest.statusCheckRollup.contexts.nodes[] ]') || return 1
+  local rollup candidates id job posters='[]' unstarted='[]' runs excusable='[]'
+  rollup=$(rollup_nodes "$1") || return 1
   if printf '%s\n' "$rollup" | jq -e --arg ctx "$HOST_CI_CONTEXT" 'any(.[]; .__typename == "StatusContext" and .context == $ctx and .state == "SUCCESS")' >/dev/null; then
     posters=$(host_ci_posters)
   fi
@@ -2170,12 +2229,13 @@ required_status_red() {
     printf '%s\n' "$job" | jq -e --argjson excusable "$excusable" '(.run_id // null) as $r | $r != null and ($r | IN($excusable[]))' >/dev/null 2>&1 || continue
     unstarted=$(jq -cn --argjson o "$unstarted" --argjson id "$id" '$o + [$id]') || return 1
   done
-  printf '%s\n' "$rollup" | jq -r --argjson unstarted "$unstarted" '
+  printf '%s\n' "$rollup" | jq_here -r --argjson unstarted "$unstarted" '
+    include "head-checks";
     [ .[] | select(.isRequired == true) ] as $required
     | [ $required[] | select(.__typename == "CheckRun" and (.databaseId | IN($unstarted[]))) | .name ] as $hosted
     | [ $required[] | select((.__typename == "CheckRun" and (.databaseId | IN($unstarted[]))) | not)
         | if .__typename == "CheckRun"
-          then select(.status == "COMPLETED" and (.conclusion | IN("SUCCESS", "NEUTRAL", "SKIPPED") | not)) | "\(.name)=\(.conclusion // "none" | ascii_downcase)"
+          then select(.status == "COMPLETED" and (.conclusion | IN("SUCCESS", "NEUTRAL", "SKIPPED") | not) and (superseded($required) | not)) | "\(.name)=\(.conclusion // "none" | ascii_downcase)"
           else select(.state | IN("SUCCESS", "PENDING", "EXPECTED") | not) | "\(.context)=\(.state // "none" | ascii_downcase)" end ]
     | "\(unique | join(", "))\t\($hosted | unique | join(", "))\t\($unstarted | tojson)"'
 }
@@ -2201,7 +2261,7 @@ legacy_precheck() {
   [ "$LEGACY_CI_HOST_IDS" != "$LEGACY_CI_HOST" ] || LEGACY_CI_HOST_IDS='[]'
   LEGACY_CI_HOST="${LEGACY_CI_HOST%%$'\t'*}"
   if [ -n "$red" ]; then
-    echo "merge=refused head=$SCOPE_HEAD mode=legacy: required_red: $red — GitHub requires it for this PR and it is red on this head; fix what it reports, never merge around it" >&2
+    echo "merge=refused head=$SCOPE_HEAD mode=legacy: required_red: $red — GitHub requires it for this PR and it is not green on this head; fix what it reports, never merge around it" >&2
     exit 24
   fi
   receipt=$(independent_receipt_state "$SCOPE_HEAD") || exit 1
@@ -2260,13 +2320,16 @@ legacy_precheck() {
 #   - no strict_required_status_checks_policy (#937 B2): that is GitHub's
 #     "require branches to be up to date before merging", which is a fact about
 #     the base moving, not about this head, and nothing here evaluates it;
-#   - no rule type, app-pinned check, or classic protection it does not model.
+#   - no rule type, app-pinned check, or classic protection it does not model;
+#   - a rollup GitHub gave in full: a token refused check runs cannot see one
+#     another app reports under a required name, and GitHub's own hold on that
+#     check is exactly what --admin would lift.
 # Anything it cannot read is `not-ready`, never `ready`.
 #
 # Deliberately NOT modelled, because no repo in this fleet has the rule it
 # would guard: a required_status_checks parameter allow-list.
 admin_readiness() {
-  local hosted="$1" rules protection pages rollup pr why
+  local hosted="$1" rules protection rollup pr why
   rules=$(gh api --paginate --slurp "repos/$REPO/rules/branches/$SCOPE_BASE_REF" 2>/dev/null | jq -c 'flatten') || {
     printf 'not-ready\tcould not read the rules of %s' "$SCOPE_BASE_REF"; return 0; }
   if protection=$(gh api "repos/$REPO/branches/$SCOPE_BASE_REF/protection" 2>/dev/null); then
@@ -2274,11 +2337,7 @@ admin_readiness() {
   fi
   printf '%s' "$protection" | jq -e '.message == "Branch not protected"' >/dev/null 2>&1 || {
     printf 'not-ready\tcould not read the classic protection of %s' "$SCOPE_BASE_REF"; return 0; }
-  pages=$(paginate_connection statusCheckRollup.contexts rollup_page) || {
-    printf 'not-ready\tcould not read the status rollup'; return 0; }
-  rollup=$(printf '%s\n' "$pages" | jq -cs --arg head "$SCOPE_HEAD" '
-    if all(.[]; .data.repository.pullRequest.headRefOid == $head) | not then error("rollup for another head") else . end
-    | [ .[] | .data.repository.pullRequest.statusCheckRollup.contexts.nodes[] ]') || {
+  rollup=$(rollup_nodes "$SCOPE_HEAD") || {
     printf 'not-ready\tcould not read the status rollup'; return 0; }
   pr=$(gh api graphql -f query='
     query adminReadiness($owner:String!,$name:String!,$pr:Int!){
@@ -2312,6 +2371,8 @@ admin_readiness() {
         ( $checks[] | select(.integration_id != null) | "required check \(.context) is pinned to an app, which this does not evaluate" ),
         ( if $strict then "the base requires the branch to be up to date, which this does not evaluate" else empty end ),
         ( if ($notGreen | length) > 0 then "required, not green: \($notGreen | join(", "))" else empty end ),
+        ( if any($rollup[]; .__typename == "RefusedCheckRuns")
+          then "this token cannot read check runs, so it cannot show every required check is green; run merge-check on a token that can" else empty end ),
         ( if ($changesRequested | length) > 0 then "changes requested by \($changesRequested | join(", "))" else empty end ),
         ( if ($pr.reviewDecision // "none") | IN("none", "APPROVED") | not
           then "GitHub reports reviewDecision=\($pr.reviewDecision)" else empty end ),
@@ -2531,6 +2592,10 @@ merge_check_main() {
   observation=$(status_observation "$SCOPE_HEAD" "$since") || exit 1
   case "$observation" in
     codex=clean*)
+      if ! written_review "$observation"; then
+        echo "merge=refused head=$SCOPE_HEAD verdict=review: review_not_written: Codex left no written finding on this head ($observation), and a thumbs-up or its no-findings comment does not show what it read. Run a fresh-context review of this exact head and post it: codex-review.sh receipt --head $SCOPE_HEAD --outcome approve|changes --reviewer \"<model id> (<runtime>)\" --body-file <report>" >&2
+        exit 24
+      fi
       final_gates
       echo "merge=allowed head=$SCOPE_HEAD mode=risk-scoped verdict=review ci=$ci_word base=$SCOPE_BASE: $observation"
       ;;
@@ -3352,8 +3417,8 @@ $assessment
     # PullRequestReviewThread type has isResolved and resolvedBy, and no time),
     # so a merge over an open Codex thread that someone resolves afterwards
     # passes. What that cannot supply is the review itself: a Codex-review
-    # basis still needs status_observation's clean review of this head, or its
-    # thumbs-up, to predate the merge. And whether a receipt's author is an
+    # basis still needs status_observation's clean review of this head to
+    # predate the merge, with a written finding on it (written_review). And whether a receipt's author is an
     # owner, member or collaborator, which decides whether the receipt counts
     # at all. A legacy repo had no gate to bypass.
     shift
@@ -3516,7 +3581,13 @@ $assessment
     fi
     observation=$(status_observation "$audit_head" "$since") || { echo "audit=error $where: could not read the Codex review" >&2; exit 1; }
     case "$observation" in
-      codex=clean*) echo "audit=pass $where: $observation" ;;
+      codex=clean*)
+        if ! written_review "$observation"; then
+          echo "audit=violation $where: it merged on a no-findings signal with no written review of this head ($observation)"
+          exit 28
+        fi
+        echo "audit=pass $where: $observation"
+        ;;
       *)
         echo "audit=violation $where: $observation before the merge; latest substitute receipt: ${receipt:-none}"
         exit 28

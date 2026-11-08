@@ -14,7 +14,7 @@
  * no hermeticity tripwire is needed in this file.
  *
  * `_listSweepDutySourcesForTesting` is not exported from src/host-sweep.ts —
- * falls back to checking this family's six duties by name via
+ * falls back to checking this family's five duties by name via
  * `_listSweepRegistrationsForTesting()`, the same accessor R-7 uses.
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -24,7 +24,6 @@ const CENTRAL_DUTY_NAMES = [
   'steer-idempotency-prune', // T9
   'channel-ingress-receipt-prune', // T10
   'session-title-sweep', // T15
-  'thread-title-retry', // T16
   'dashboard-token-prune', // T17
 ];
 
@@ -33,10 +32,10 @@ beforeEach(() => {
 });
 
 describe('the production modules barrel registers the central duty source', () => {
-  it("importing src/modules/index.js registers this family's six duties; they are absent before it", async () => {
+  it("importing src/modules/index.js registers this family's five duties; they are absent before it", async () => {
     // host-sweep.js registers its OWN in-file built-ins the moment it is
     // imported, independent of any family module — so import it FIRST (dynamic,
-    // post-reset, so this gets a fresh instance) to prove the six
+    // post-reset, so this gets a fresh instance) to prove the five
     // sweep-central names are specifically ABSENT prior to the barrel import,
     // not just "the registry hasn't loaded yet".
     const hostSweep = await import('../../host-sweep.js');

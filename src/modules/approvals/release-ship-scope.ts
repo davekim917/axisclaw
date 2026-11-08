@@ -22,7 +22,7 @@ const HEAD_RE = /^[a-f0-9]{40}$/;
 const KEYS = ['purpose', 'repository', 'pullRequest', 'base', 'headSha'] as const;
 const OPTIONAL_KEYS = ['holds'] as const;
 const HOLD_RE = /^hold:[A-Za-z0-9_.:/@+-]{1,160}$/;
-const MAX_SCOPE_HOLDS = 12;
+const MAX_SCOPE_HOLDS = 24;
 
 /** Return a host-canonical scope or a deliberately non-specific validation error. */
 export function parseReleaseShipScope(value: unknown): ReleaseShipScope | undefined {

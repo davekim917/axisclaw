@@ -389,6 +389,32 @@ describe('preview proxy routing', () => {
   });
 });
 
+describe('the app host', () => {
+  const APP = 'app.preview.example.test';
+
+  it.each([APP, APP.toUpperCase()])('hands %s to the app API, ahead of any preview', async (host) => {
+    const notFound = await request('/v1/no-such-route', { host });
+    expect([notFound.status, JSON.parse(notFound.body)]).toEqual([404, { error: 'Not found.' }]);
+
+    const page = await request('/pair', { host });
+    expect([page.status, page.headers['content-type']]).toEqual([200, 'text/html; charset=utf-8']);
+    expect(hits).toEqual([]);
+    expect(opened).toEqual([]);
+  });
+
+  it('leaves every other host to the preview routing', async () => {
+    expect((await request('/pair')).body).toBe('from-app');
+    for (const host of ['app.other.example.test', 'x.app.preview.example.test']) {
+      expect((await request('/pair', { host })).body).toBe('No live preview at this address.');
+    }
+  });
+
+  it('offers no WebSocket on the app host', async () => {
+    expect((await upgrade('/pair', APP)).first).toMatch(/^HTTP\/1\.1 404 /);
+    expect(opened).toEqual([]);
+  });
+});
+
 describe('preview proxy over the docker-exec bridge', () => {
   type FakeExec = EventEmitter & { stdin: PassThrough; stdout: PassThrough; kill: ReturnType<typeof vi.fn> };
   let children: FakeExec[];

@@ -4,7 +4,7 @@
 import { getConfig } from '../config.js';
 import { getAgentMailbox } from '../mailbox/index.js';
 import type { InboundMessage } from '../mailbox/types.js';
-import type { NanoclawInboundMessage } from '../modules/mailbox/index.js';
+import { dropCarriedScriptWakes, type NanoclawInboundMessage } from '../modules/mailbox/index.js';
 
 export interface MessageInRow {
   id: string;
@@ -91,6 +91,7 @@ export function getPendingMessages(isFirstPoll = false): MessageInRow[] {
 
 export function markProcessing(ids: string[]): void {
   getAgentMailbox().operations.markMessages(ids, 'processing');
+  dropCarriedScriptWakes(ids);
 }
 
 export function markCompleted(ids: string[]): void {

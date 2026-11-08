@@ -1,6 +1,6 @@
 #!/usr/bin/env tsx
 /**
- * Host daemon: re-runs the Codex sync (AGENTS.md, subagents, local marketplace plugin cache) when its sources
+ * Host daemon: re-runs the Codex sync (subagents, local marketplace plugin cache) when its sources
  * change, debounced and under `~/.codex/.sync.lock`. Plugin skills are deliberately not mirrored to host CLI paths:
  * containers build their own skill set from /workspace/plugins at spawn.
  */
@@ -11,7 +11,7 @@ import path from 'path';
 
 import chokidar from 'chokidar';
 
-import { syncCodexAgentsMd, syncCodexLocalMarketplacePluginCache, syncCodexSubagents } from './codex-sync.js';
+import { syncCodexLocalMarketplacePluginCache, syncCodexSubagents } from './codex-sync.js';
 import { syncOpenCodeSubagents } from './opencode-sync.js';
 
 const HOME = os.homedir();
@@ -30,10 +30,6 @@ const WATCH_PATHS = [CLAUDE_DIR, PLUGINS_DIR, CODEX_CONFIG];
 
 function isRelevantPath(eventPath: string): boolean {
   if (eventPath === CODEX_CONFIG) {
-    return true;
-  }
-  // Top-level ~/.claude/*.md only (rules and @-includes).
-  if (path.dirname(eventPath) === CLAUDE_DIR && eventPath.endsWith('.md')) {
     return true;
   }
   if (path.dirname(eventPath) === path.join(CLAUDE_DIR, 'agents') && eventPath.endsWith('.md')) {
@@ -188,11 +184,6 @@ async function runSync(trigger: string): Promise<void> {
   log(`sync started (trigger=${trigger})`);
   let success = false;
   try {
-    const agentsResult = syncCodexAgentsMd();
-    log(
-      `agents-md: ${agentsResult.changed ? 'wrote' : 'unchanged'} ${agentsResult.target} ` +
-        `(${agentsResult.bytes} bytes)`,
-    );
     // Plugin skills are not mirrored to host CLI paths (containers build their own from /workspace/plugins).
     const subagentsResult = syncCodexSubagents();
     log(

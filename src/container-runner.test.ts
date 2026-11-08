@@ -1293,6 +1293,8 @@ describe('materializeCodexFallbackRuntime', () => {
     fs.writeFileSync(path.join(hostHome, 'config.toml'), 'model = "gpt-5.6-terra"\n');
     fs.writeFileSync(path.join(outside, 'config-victim'), 'keep');
     fs.writeFileSync(path.join(outside, 'auth-victim'), 'keep');
+    fs.writeFileSync(path.join(outside, 'hooks-victim'), 'keep');
+    fs.symlinkSync(path.join(outside, 'hooks-victim'), path.join(runtimeHome, 'hooks.json'));
     fs.writeFileSync(path.join(outside, 'tmp', 'marketplaces', 'sentinel'), 'keep');
     fs.writeFileSync(path.join(outside, 'plugins', 'sentinel'), 'keep');
     fs.writeFileSync(path.join(outside, 'sessions', 'sentinel'), 'keep');
@@ -1310,6 +1312,9 @@ describe('materializeCodexFallbackRuntime', () => {
 
       expect(fs.readFileSync(path.join(outside, 'config-victim'), 'utf8')).toBe('keep');
       expect(fs.readFileSync(path.join(outside, 'auth-victim'), 'utf8')).toBe('keep');
+      expect(fs.readFileSync(path.join(outside, 'hooks-victim'), 'utf8')).toBe('keep');
+      // The guard chain is the image's /etc/codex layer: the home keeps no hooks.json of its own.
+      expect(fs.existsSync(path.join(runtimeHome, 'hooks.json'))).toBe(false);
       expect(fs.readFileSync(path.join(outside, 'tmp', 'marketplaces', 'sentinel'), 'utf8')).toBe('keep');
       expect(fs.readFileSync(path.join(outside, 'plugins', 'sentinel'), 'utf8')).toBe('keep');
       expect(fs.readFileSync(path.join(outside, 'sessions', 'sentinel'), 'utf8')).toBe('keep');
@@ -2290,8 +2295,8 @@ describe('killContainer against a session that is still spawning', () => {
 //
 // Why it needs a guard at all: the container reads CLAUDE_CODE_OAUTH_LANES
 // from its OWN env (laneForSlot in providers/claude.ts), and there is no
-// generic env passthrough into containers — the only one is prefix-limited to
-// RENDER_PG_/RENDER_REDIS_URL_. Without an explicit `-e` push the variable is
+// generic env passthrough into containers — the only one is folderDbEnvNames.
+// Without an explicit `-e` push the variable is
 // undefined in every container and `lane` is NULL forever, with nothing
 // thrown, nothing logged, and every suite still green. That silence is
 // precisely why the guard exists: no other test would ever notice.

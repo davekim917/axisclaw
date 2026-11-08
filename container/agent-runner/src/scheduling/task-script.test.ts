@@ -15,6 +15,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { resetGuardCorePathsForTest, setGuardCorePathsForTest } from '../guard-core-paths.js';
 
 import { getInboundDb, getOutboundDb } from '../mailbox/sqlite/connection.js';
 import { closeSessionDb, initTestSessionDb } from '../modules/mailbox/testing.js';
@@ -30,21 +31,19 @@ import { applyPreTaskScripts, runScript } from './task-script.js';
 // module the interactive Bash gate uses). In a container this lives at
 // /workspace/plugins/...; on the host test runner it's the bootstrap checkout.
 const REAL_CORE = '/home/ubuntu/plugins/bootstrap/plugins/workflow-agents/hooks/guards/block-destructive-core.ts';
-const savedCore = process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE;
 const savedHostDataDir = process.env.NANOCLAW_HOST_DATA_DIR;
 const savedHostTopicWorktreesDir = process.env.NANOCLAW_HOST_TOPIC_WORKTREES_DIR;
 const markerPaths = new Set<string>();
 
 beforeEach(() => {
-  process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = REAL_CORE;
+  setGuardCorePathsForTest({ destructive: REAL_CORE });
   process.env.NANOCLAW_HOST_DATA_DIR = '/srv/nanoclaw/data';
   process.env.NANOCLAW_HOST_TOPIC_WORKTREES_DIR = '/srv/nanoclaw/data/topic-worktrees';
   initTestSessionDb();
 });
 
 afterEach(() => {
-  if (savedCore === undefined) delete process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE;
-  else process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = savedCore;
+  resetGuardCorePathsForTest();
   if (savedHostDataDir === undefined) delete process.env.NANOCLAW_HOST_DATA_DIR;
   else process.env.NANOCLAW_HOST_DATA_DIR = savedHostDataDir;
   if (savedHostTopicWorktreesDir === undefined) delete process.env.NANOCLAW_HOST_TOPIC_WORKTREES_DIR;

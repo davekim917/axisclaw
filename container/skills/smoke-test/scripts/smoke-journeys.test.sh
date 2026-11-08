@@ -902,4 +902,34 @@ expect 7-locked-then-ok '.ok == true' "$(publish "$WORK/p5.json" --expect-sha256
 [ $(( ( $(date +%s%N) - START ) / 1000000 )) -ge 1000 ] || fail "7: publish did not wait for the shared lock"
 wait
 
+# --- 8. core flows ---------------------------------------------------------------
+# A journey marked `coreFlow: true` is a review trigger without being walked on
+# the floor's cadence, so a native-manual flow can be one without going overdue.
+COREFLOW="$WORK/coreflow.json"
+jq '.journeys[2].coreFlow = true' "$EXAMPLE" > "$COREFLOW"
+expect 8-core-flows '.ok == true and ([.coreFlows[] | {id, floor, coreFlow}] == [
+  {id:"branch-scope-crossing", floor:true, coreFlow:false},
+  {id:"mobile-scan-return", floor:false, coreFlow:true}])' "$(python3 "$TOOL" core-flows "$COREFLOW" || true)"
+expect 8-not-due '(.due | index("branch-scope-crossing")) and (.due | index("mobile-scan-return") | not)' \
+  "$(python3 "$TOOL" floor-due "$COREFLOW" "$WORK/no-such-root" --as-of "$NOW" || true)"
+for bad in false '"yes"' 1; do
+  jq ".journeys[2].coreFlow = $bad" "$EXAMPLE" > "$WORK/coreflow-bad.json"
+  expect "8-not-true: $bad" '.ok == false and (.errors | map(test("coreFlow must be true")) | any)' \
+    "$(python3 "$TOOL" validate "$WORK/coreflow-bad.json" || true)"
+done
+jq '.journeys[2].maxIntervalDays = 7' "$EXAMPLE" > "$WORK/native-floor.json"
+expect 8-native-floor-warns '.ok == true and (.warnings | map(test("mobile-scan-return: a native-manual floor journey")) | any)' \
+  "$(python3 "$TOOL" validate "$WORK/native-floor.json" || true)"
+# Marking, unmarking or thinning a core flow is the same human call as the floor.
+LIVE8="$WORK/live8/journeys.json"; mkdir -p "$WORK/live8"
+publish8() { python3 "$TOOL" publish "$LIVE8" "$@" --lock "$WORK/live8/control.lock" || true; }
+expect 8-seed '.ok == true' "$(publish8 "$EXAMPLE" --expect-sha256 absent --floor-authority "seed")"
+E1="$(sha256sum < "$LIVE8" | cut -d' ' -f1)"
+expect 8-mark-needs-authority '.ok == false and (.error | test("core-flow"))' "$(publish8 "$COREFLOW" --expect-sha256 "$E1")"
+expect 8-mark-with-authority '.ok == true' "$(publish8 "$COREFLOW" --expect-sha256 "$E1" --floor-authority "review consensus v9")"
+E2="$(sha256sum < "$LIVE8" | cut -d' ' -f1)"
+jq '.journeys[2].steps = ["Scan once."]' "$COREFLOW" > "$WORK/coreflow-thin.json"
+expect 8-thin-needs-authority '.ok == false and (.error | test("core-flow"))' "$(publish8 "$WORK/coreflow-thin.json" --expect-sha256 "$E2")"
+expect 8-unmark-needs-authority '.ok == false and (.error | test("core-flow"))' "$(publish8 "$EXAMPLE" --expect-sha256 "$E2")"
+
 echo "smoke-journeys: all passed"

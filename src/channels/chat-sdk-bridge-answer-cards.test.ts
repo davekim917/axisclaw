@@ -159,7 +159,7 @@ describe('chat-sdk-bridge answer cards', () => {
     const { bodies, onAction } = await discordClick('ans-d');
 
     expect(bodies).toEqual([{ type: 6 }]);
-    expect(onAction).toHaveBeenCalledWith('ans-d', 'ship', 'U1', 'discord-msg-1', undefined);
+    expect(onAction).toHaveBeenCalledWith('ans-d', 'ship', 'U1', 'discord-msg-1', undefined, null);
   });
 
   it('Discord: classifies from the render read too', async () => {

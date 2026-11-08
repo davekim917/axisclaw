@@ -4,7 +4,7 @@
  * The REAL core (block-destructive-core.ts) lives in the bootstrap repo and its
  * verdict accuracy is validated there. This stub exists only to drive claude.ts's
  * WIRING — that the hooks import the named evaluators and map a non-`allow`
- * verdict to a deny. Pointed at via NANOCLAW_DESTRUCTIVE_GUARD_CORE.
+ * verdict to a deny. Pointed at via setGuardCorePathsForTest({ destructive }).
  *
  * Each evaluator returns a deterministic verdict keyed on a sentinel string so a
  * test can prove the verdict came from THIS module (distinct reason text) rather

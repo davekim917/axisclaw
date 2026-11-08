@@ -93,6 +93,8 @@ function childProcessTripwire(record: string[]): Record<string, (...args: unknow
   };
 }
 
+vi.mock('./modules/mobile/threads.js', () => ({ startChannelVisibilityRefresh: vi.fn(() => Promise.resolve()) }));
+vi.mock('./modules/email-signatures/refresh.js', () => ({ refreshEmailSignaturesIfDue: vi.fn(() => null) }));
 vi.mock('child_process', () => childProcessTripwire(h.spawns));
 vi.mock('node:child_process', () => childProcessTripwire(h.spawns));
 
@@ -284,10 +286,6 @@ vi.mock('./dashboard/session-title-sweep.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./dashboard/session-title-sweep.js')>()),
   runSessionTitleSweep: async () => undefined,
 }));
-vi.mock('./topic-title.js', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('./topic-title.js')>()),
-  retryPendingThreadTitles: async () => undefined,
-}));
 vi.mock('./dashboard/db/dashboard-tokens.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./dashboard/db/dashboard-tokens.js')>()),
   pruneDashboardTokens: () => undefined,
@@ -335,6 +333,7 @@ import {
   _resetQuietSessionCacheForTesting,
   _setSweepYieldForTesting,
   _sweepOnceForTesting,
+  asSessionContext,
   registerSlaObservationHook,
   registerSweepDuty,
   registerSweepDutySource,
@@ -379,7 +378,12 @@ import './modules/sweep-task-escalation/index.js';
 // `service.js`, so nothing it touches — the central DB, the OneCLI gateway —
 // is reachable from this registration alone.
 import './modules/mcp-oauth/index.js';
+import './modules/email-signatures/index.js';
 import './modules/sweep-promise-watch/index.js';
+import './modules/open-asks/index.js';
+import './modules/approved-run/token-guard.js';
+import './modules/sweep-oauth-slots/index.js';
+import './modules/sweep-codex-rollouts/index.js';
 import './modules/sweep-provider-return/index.js';
 import './modules/sweep-orphan-containers/index.js';
 import './modules/wiki-admission/index.js';
@@ -413,6 +417,8 @@ import './modules/sweep-claims/index.js';
 // R-7's registration count includes T19 after the family module moved it out
 // of host-sweep.ts's own in-file builtins.
 import './modules/sweep-usage/index.js';
+// Registers FORK12, whose body is fire-and-forget I/O, mocked below.
+import './modules/sweep-team-search/index.js';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -1389,14 +1395,19 @@ describe('sweep duty registry (S2-PR2)', () => {
     ['duty', 'audit-body-prune', 'tick:housekeeping', 60],
     ['duty', 'completed-task-auto-archive', 'tick:housekeeping', 70],
     ['duty', 'session-title-sweep', 'tick:housekeeping', 80],
-    ['duty', 'thread-title-retry', 'tick:housekeeping', 90],
     ['duty', 'claims-reconcile', 'tick:housekeeping', 100],
     ['duty', 'claims-self-heal', 'tick:housekeeping', 110],
     ['duty', 'dashboard-token-prune', 'tick:housekeeping', 120],
     ['duty', 'coordination-orphans', 'tick:housekeeping', 130],
     ['duty', 'task-failure-escalation', 'tick:housekeeping', 135],
     ['duty', 'promise-watch', 'tick:housekeeping', 136],
+    ['duty', 'open-asks-backstop', 'tick:housekeeping', 137],
+    ['duty', 'approved-run-token-guard', 'tick:housekeeping', 138],
+    ['duty', 'oauth-slot-health', 'tick:housekeeping', 139],
     ['duty', 'orphan-containers', 'tick:housekeeping', 140],
+    ['duty', 'mobile-channel-visibility', 'tick:housekeeping', 141],
+    ['duty', 'codex-rollout-prune', 'tick:housekeeping', 142],
+    ['duty', 'email-signature-refresh', 'tick:housekeeping', 143],
     ['duty', 'wiki-admission-recovery', 'tick:housekeeping', 9500],
     ['sla-observation-hook', 'container-oom-notice', 'sla-observation-hook', 10],
     ['kill-follow-up', 'kill-ceiling-notice', 'kill-follow-up', 10],
@@ -1425,17 +1436,17 @@ describe('sweep duty registry (S2-PR2)', () => {
     // Surface, name, phase AND order, in run order — a swap anywhere fails.
     expect(actual).toEqual(EXPECTED_REGISTRATIONS);
 
-    // The 38 registrations from the seam-2 port (37 unique names, one
+    // The 37 registrations left from the seam-2 port (36 unique names, one
     // registered twice — see below) plus the fork additions:
     // github-token-file-refresh, cli-request-execution-prune,
     // coordination-orphans (seam 4 series A', issue #430),
     // task-failure-escalation, mcp-oauth-refresh, promise-watch,
-    // provider-fallback-return, orphan-containers and gate-expiry.
-    expect(actual).toHaveLength(48);
+    // provider-fallback-return, orphan-containers, gate-expiry, open-asks-backstop, approved-run-token-guard, oauth-slot-health, mobile-channel-visibility, codex-rollout-prune and email-signature-refresh.
+    expect(actual).toHaveLength(53);
     const names = new Set(actual.map((r) => r[1]));
-    expect(names.size).toBe(47);
+    expect(names.size).toBe(52);
     expect(names).toEqual(new Set(Object.values(SWEEP_DUTY_INVENTORY)));
-    expect(Object.keys(SWEEP_DUTY_INVENTORY)).toHaveLength(47);
+    expect(Object.keys(SWEEP_DUTY_INVENTORY)).toHaveLength(52);
     // The one duty registered twice is the orphan-claim reset: once in the tail
     // window, once as the post-kill follow-up (rev-3 grounding §2, S17).
     expect(actual.filter((r) => r[1] === SWEEP_DUTY_INVENTORY.S17)).toHaveLength(2);
@@ -1860,12 +1871,12 @@ describe('sweep duty registry (S2-PR2)', () => {
     // `provider-fallback-return` from `sweep-provider-return`. The numbers here
     // said 39/38/38 from before those landed; the tuple comparison above was
     // already right, which is why it never failed.
-    expect(actual).toHaveLength(48);
+    expect(actual).toHaveLength(53);
     const names = new Set(actual.map((r) => r[1]));
-    expect(names.size).toBe(47);
+    expect(names.size).toBe(52);
     // The inventory comes from the same fresh instance, not this file's binding.
     expect(names).toEqual(new Set(Object.values(hs.SWEEP_DUTY_INVENTORY)));
-    expect(Object.keys(hs.SWEEP_DUTY_INVENTORY)).toHaveLength(47);
+    expect(Object.keys(hs.SWEEP_DUTY_INVENTORY)).toHaveLength(52);
     expect(actual.filter((r) => r[1] === hs.SWEEP_DUTY_INVENTORY.S17)).toHaveLength(2);
     expect(h.spawns).toEqual([]);
   });
@@ -1930,6 +1941,54 @@ describe('sweep duty registry (S2-PR2)', () => {
   // the quiet cache lives in the tick, and driving a whole tick needs the mock
   // set above. host-sweep.test.ts has no such set, so a tick there would reach
   // docker, GitHub and an LLM — the hermeticity rule wins over file placement.
+  it('walks sessions with a running container first, so the idle reap never waits behind the quiet ones', async () => {
+    _resetSweepRegistryForTesting({ builtins: false });
+    const walked: string[] = [];
+    registerSweepDuty({
+      name: 'walk-probe',
+      phase: 'session:plan',
+      order: 10,
+      run: (ctx) => {
+        walked.push(asSessionContext(ctx).session.id);
+      },
+    });
+    h.sessions = ['walk-idle-1', 'walk-live-1', 'walk-idle-2', 'walk-live-2'].map((id) => fakeSession(id));
+    h.running.add('walk-live-1');
+    h.running.add('walk-live-2');
+
+    await _sweepOnceForTesting();
+
+    expect(walked).toEqual(['walk-live-1', 'walk-live-2', 'walk-idle-1', 'walk-idle-2']);
+  });
+
+  it('reaches the one due session among 2,000 quiet ones in the tick it comes due', async () => {
+    _resetSweepRegistryForTesting({ builtins: false });
+    const dueId = 'walk-due';
+    const dueAt = new Date(Date.now() + 5_000).toISOString();
+    h.mailbox = fakeMailbox({ getNextFutureProcessAfter: () => (h.opens.at(-1) === dueId ? dueAt : null) });
+    h.sessions = [...Array.from({ length: 1_999 }, (_, i) => fakeSession(`walk-quiet-${i}`)), fakeSession(dueId)];
+    await _sweepOnceForTesting();
+
+    const swept: string[] = [];
+    registerSweepDuty({
+      name: 'due-probe',
+      phase: 'session:plan',
+      order: 10,
+      run: (ctx) => {
+        swept.push(asSessionContext(ctx).session.id);
+      },
+    });
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      vi.setSystemTime(Date.now() + 10_000);
+      await _sweepOnceForTesting();
+    } finally {
+      vi.useRealTimers();
+    }
+
+    expect(swept).toEqual([dueId]);
+  });
+
   describe('quiet-session cache keeps its time bound and last_active invalidation', () => {
     it('a fully quiet session is skipped until the earlier of its next due row and 30 minutes', async () => {
       const session = fakeSession('sess-quiet');
@@ -2734,5 +2793,17 @@ describe('sweep duty registry (S2-PR2)', () => {
   it('a fixture path never leaves the per-run temp root', () => {
     expect(h.dataDir.startsWith(os.tmpdir())).toBe(true);
     expect(fs.existsSync(h.dataDir)).toBe(true);
+  });
+});
+
+describe('team-search duty', () => {
+  it('starts the channel visibility refresh on every tick', async () => {
+    const { startChannelVisibilityRefresh } = await import('./modules/mobile/threads.js');
+    vi.mocked(startChannelVisibilityRefresh).mockClear();
+    const { duties } = _listSweepRegistrationsForTesting();
+
+    await duties.find((duty) => duty.name === SWEEP_DUTY_INVENTORY.FORK12)!.run({} as Parameters<SweepDuty['run']>[0]);
+
+    await vi.waitFor(() => expect(startChannelVisibilityRefresh).toHaveBeenCalledTimes(1));
   });
 });

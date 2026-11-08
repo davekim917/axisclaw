@@ -167,6 +167,14 @@ describe('adoption order (P3)', () => {
     expect(restore).toBeLessThan(indexOfCall(calls, 'startHostSweep'));
   });
 
+  it('the archive search migration resolves before anything can write or search the archive', () => {
+    const migrate = indexOfCall(calls, 'await migrateArchiveSearchAtBoot');
+    expect(migrate).toBeGreaterThan(indexOfCall(calls, 'ensureArchiveSchema'));
+    for (const later of [ADOPT, 'await initChannelAdapters', 'startHostSweep']) {
+      expect(indexOfCall(calls, later), `${later} starts before the migration resolves`).toBeGreaterThan(migrate);
+    }
+  });
+
   it('nothing in main() calls wakeContainer before adoption resolves', () => {
     const adopt = indexOfCall(calls, ADOPT);
     const wakes = calls

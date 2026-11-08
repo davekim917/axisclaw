@@ -134,10 +134,10 @@ describe('codex provider container-config: agents/ mount', () => {
       // Load-bearing container settings are present.
       expect(written).toContain('sandbox_mode = "workspace-write"');
       expect(written).toContain('approval_policy = "on-request"');
-      expect(written).toContain('model_context_window = 400000');
-      expect(written).toContain('model_auto_compact_token_limit = 360000');
-      expect(written.indexOf('model_context_window = 400000')).toBeLessThan(written.indexOf('[features]'));
-      expect(written.indexOf('model_auto_compact_token_limit = 360000')).toBeLessThan(written.indexOf('[features]'));
+      expect(written).toContain('model_context_window = 800000');
+      expect(written).toContain('model_auto_compact_token_limit = 720000');
+      expect(written.indexOf('model_context_window = 800000')).toBeLessThan(written.indexOf('[features]'));
+      expect(written.indexOf('model_auto_compact_token_limit = 720000')).toBeLessThan(written.indexOf('[features]'));
       expect(written).toContain('model_reasoning_effort = "high"');
       expect(written.indexOf('model_reasoning_effort = "high"')).toBeLessThan(written.indexOf('[features]'));
       expect(written).toContain('[features]');
@@ -179,6 +179,8 @@ describe('codex provider container-config: agents/ mount', () => {
     fs.writeFileSync(path.join(outside, 'agents', 'sentinel'), 'keep');
     fs.writeFileSync(path.join(outside, 'config-victim'), 'keep');
     fs.writeFileSync(path.join(outside, 'auth-victim'), 'keep');
+    fs.writeFileSync(path.join(outside, 'hooks-victim'), 'keep');
+    fs.symlinkSync(path.join(outside, 'hooks-victim'), path.join(runtimeHome, 'hooks.json'));
     fs.symlinkSync(path.join(outside, 'tmp'), path.join(runtimeHome, '.tmp'), 'dir');
     fs.symlinkSync(path.join(outside, 'plugins'), path.join(runtimeHome, 'plugins'), 'dir');
     fs.symlinkSync(path.join(outside, 'agents'), path.join(runtimeHome, 'agents'), 'dir');
@@ -200,6 +202,9 @@ describe('codex provider container-config: agents/ mount', () => {
       expect(fs.readFileSync(path.join(outside, 'agents', 'sentinel'), 'utf8')).toBe('keep');
       expect(fs.readFileSync(path.join(outside, 'config-victim'), 'utf8')).toBe('keep');
       expect(fs.readFileSync(path.join(outside, 'auth-victim'), 'utf8')).toBe('keep');
+      expect(fs.readFileSync(path.join(outside, 'hooks-victim'), 'utf8')).toBe('keep');
+      // The guard chain is the image's /etc/codex layer: the home keeps no hooks.json of its own.
+      expect(fs.existsSync(path.join(runtimeHome, 'hooks.json'))).toBe(false);
       expect(fs.lstatSync(path.join(runtimeHome, 'config.toml')).isFile()).toBe(true);
       expect(fs.readFileSync(path.join(runtimeHome, 'config.toml'), 'utf8')).toBe(buildContainerCodexConfig());
       expect(fs.lstatSync(path.join(runtimeHome, 'auth.json')).isFile()).toBe(true);

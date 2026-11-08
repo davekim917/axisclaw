@@ -819,6 +819,7 @@ describe('remove --delete-secret refuses when the bearer is declared elsewhere (
       agent_group_id: 'ag-1',
       mcp_url: 'https://other.example.test/mcp',
       resource: null,
+      grant_type: 'authorization_code',
       authorization_endpoint: 'https://as.example.test/authorize',
       token_endpoint: 'https://as.example.test/token',
       registration_endpoint: null,

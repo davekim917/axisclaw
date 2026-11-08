@@ -25,10 +25,9 @@ import {
   updatePendingApprovalStatus,
 } from '../../db/sessions.js';
 import { log } from '../../log.js';
-import { equivalentSlackUserIds } from '../../slack-user-identity.js';
+import { displayNameAcrossBots, equivalentSlackUserIds } from '../../slack-user-identity.js';
 import type { PendingApproval, Session } from '../../types.js';
-import { getUser } from '../permissions/db/users.js';
-import { editApprovalCard, headUnits, notifyApprovalResolved } from './primitive.js';
+import { editApprovalCard, fitResolutionLine, headUnits, notifyApprovalResolved } from './primitive.js';
 import { cardReleaseScopeJson, unscopedReleaseCard } from './release-ship-scope.js';
 
 export interface ChoiceHandlerContext {
@@ -148,7 +147,7 @@ export async function resolveChoice(
   });
   await writeChoiceReceipt(approval, deliveredTo, option, userId, resolvedAt);
   await deletePendingApproval(approval.approval_id);
-  const name = (await getUser(userId))?.display_name || userId;
+  const name = (await displayNameAcrossBots(userId)) || userId;
   const uncounted = option.value === 'ship' && unscopedReleaseCard(approval);
   await editApprovalCard(
     approval,
@@ -247,5 +246,5 @@ const UNCOUNTED_SHIP =
   'This card is out of date: it does not list the risks a Ship accepts, so your click did not count. Ask for a fresh card if one does not appear.';
 
 function cardText(approval: PendingApproval, line: string): string {
-  return [approval.title, approval.question, line].filter(Boolean).join('\n\n');
+  return [approval.title, approval.question, fitResolutionLine(line)].filter(Boolean).join('\n\n');
 }

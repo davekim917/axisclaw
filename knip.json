@@ -56,7 +56,6 @@
         "scripts/host-lifecycle-seam-manifest.ts",
         "scripts/mailbox-seam-manifest.ts",
         "scripts/vendor-design-artifact-loop.ts",
-        "scripts/sync-codex-agents-md.ts",
         "scripts/sync-codex-subagents.ts",
         "scripts/sync-opencode-subagents.ts",
         "scripts/upgrade-state.ts",

@@ -17,7 +17,8 @@ import {
   registerChannelAdapter,
   teardownChannelAdapters,
 } from '../../channels/channel-registry.js';
-import { registerSlackBot, unregisterSlackBot } from '../../channels/slack-mentions.js';
+import { linkSlackChannelNames } from '../../channels/channel-links.js';
+import { registerSlackBot, resolveSlackMentions, unregisterSlackBot } from '../../channels/slack-mentions.js';
 import { wakeContainer } from '../../container-runner.js';
 import { closeDb, getDb, initMigratedTestDb } from '../../db/index.js';
 import { createAgentGroup } from '../../db/agent-groups.js';
@@ -210,6 +211,22 @@ async function click(approvalId: string, value: string, handle: string, channelT
     threadId: null,
     messageId,
   });
+}
+
+/** A session in a Discord room, where a release card keeps the 1800-unit budget. */
+async function discordRoom(): Promise<Session> {
+  await createMessagingGroup({
+    id: 'mg-discord',
+    channel_type: 'discord-fixture',
+    platform_id: 'discord:guild-1:chan-4',
+    name: 'Discord room',
+    is_group: 1,
+    unknown_sender_policy: 'strict',
+    created_at: now(),
+  });
+  const room = sessionRow('sess-discord', 'ag-1', 'mg-discord', 'discord:guild-1:chan-4');
+  await createSession(room);
+  return room;
 }
 
 async function wire(mgId: string): Promise<void> {
@@ -615,12 +632,13 @@ describe('request_choice delivery', () => {
       base: 'b'.repeat(120),
     };
     const decision = { ...DECISION, does: Array.from({ length: 6 }, () => 'x'.repeat(80)).join('\n') };
-    const fits = (await ask(session, { approvalScope: scope, decision }))!;
+    const discordSession = await discordRoom();
+    const fits = (await ask(discordSession, { approvalScope: scope, decision }))!;
     const used = `**${String(delivered[0].content.title)}**\n\n${String(delivered[0].content.question)}`.length;
     expect(fits).toBeDefined();
     const over = 1801 - used;
     await ask(
-      session,
+      discordSession,
       { approvalScope: scope, decision: { ...decision, headline: `${DECISION.headline}${'h'.repeat(over)}` } },
       'choice-2',
     );
@@ -662,14 +680,102 @@ describe('request_choice delivery', () => {
   it.each([
     ['a repeated code', ['hold:access:a.sql', 'hold:access:a.sql']],
     ['a code that is not a hold', ['wait:effect_check']],
+    ['an auth code spelled with an underscore', ['hold_moratorium']],
     ['a code with a space', ['hold:access:my file.sql']],
-    ['more than 12 codes', Array.from({ length: 13 }, (_, i) => `hold:access:f${i}.sql`)],
+    ['more than 24 codes', Array.from({ length: 25 }, (_, i) => `hold:access:f${i}.sql`)],
     ['a string instead of a list', 'hold:access:a.sql'],
   ])('refuses holds with %s as a malformed scope', async (_name, holds) => {
     await ask(session, { approvalScope: { ...RELEASE_SCOPE, holds }, decision: DECISION });
     expect(delivered).toHaveLength(0);
     expect(await getPendingApprovalsByAction(REQUEST_CHOICE_ACTION)).toHaveLength(0);
     expect(notes().map((n) => n.text)).toEqual(['request_choice failed: approvalScope is malformed']);
+  });
+
+  it.each([13, 24])('accepts %i hold codes on one card', async (count) => {
+    const holds = Array.from({ length: count }, (_, i) => `hold:access:f${String(i).padStart(2, '0')}.sql`);
+    const row = (await ask(session, { approvalScope: { ...RELEASE_SCOPE, holds }, decision: DECISION }))!;
+    expect(row).toBeDefined();
+    expect(notes()).toHaveLength(0);
+    expect(String(delivered[0].content.question)).toContain(holds.map((code) => `• \`${code}\``).join('\n'));
+  });
+
+  const WEEKLY_RELEASE = {
+    ...RELEASE_DECISION,
+    headline: 'Weekly release: 9 PRs across 3 repos, every hold named below.',
+    warnings: 'Grants widen on several mart models.\nBackfills rewrite rows that cannot be restored.',
+  };
+  const accessHold = (i: number) => `hold:access:models/marts/grants_${String(i).padStart(2, '0')}.sql`;
+  const irreversibleHold = (i: number) =>
+    `hold:irreversible:analytics.fct_orders_${String(i).padStart(2, '0')}:1250_rows`;
+  const SIXTEEN_WITH_LONG_PATHS = [
+    'hold:workflow',
+    'hold:prod_script',
+    'hold:moratorium',
+    'hold:smoke',
+    'hold:diff_unreadable:3f9c2ab',
+    ...[
+      'fulfillment/shipment-reconciler',
+      'billing/invoice-line-normalizer',
+      'inventory/warehouse-stock-ledger',
+      'accounts/customer-merge-resolver',
+      'catalog/product-variant-indexer',
+      'payments/refund-settlement-sync',
+      'shipping/carrier-rate-calculator',
+      'pricing/promotion-eligibility-rules',
+      'orders/order-cancellation-handler',
+      'reporting/daily-revenue-snapshots',
+      'identity/session-token-rotation',
+    ].map((file) => `hold:access:ACME-BACKEND/src/modules/${file}.ts`),
+  ];
+
+  it.each([
+    [
+      '16 mixed access and irreversible holds',
+      Array.from({ length: 16 }, (_, i) => (i % 2 ? irreversibleHold(i) : accessHold(i))),
+    ],
+    ['24 access holds', Array.from({ length: 24 }, (_, i) => accessHold(i))],
+    ['16 holds, 11 of them long source-path access holds', SIXTEEN_WITH_LONG_PATHS],
+  ])('renders a weekly release card with %s whole, within the card budget and button limits', async (_name, holds) => {
+    const row = (await ask(session, { approvalScope: { ...RELEASE_SCOPE, holds }, decision: WEEKLY_RELEASE }))!;
+    expect(notes()).toEqual([]);
+    expect(row).toBeDefined();
+    const { title, question, options } = delivered[0].content as {
+      title: string;
+      question: string;
+      options: Array<{ label: string }>;
+    };
+    expect(`**${title}**\n\n${question}`.length).toBeLessThanOrEqual(1800);
+    expect(question).toContain(
+      [...holds]
+        .sort()
+        .map((code) => `• \`${code}\``)
+        .join('\n'),
+    );
+    expect(options.every((option) => option.label.length <= 75)).toBe(true);
+  });
+
+  it('refuses, rather than cuts, a 24-hold card whose codes outgrow the card budget', async () => {
+    const holds = Array.from({ length: 24 }, (_, i) => (i % 2 ? irreversibleHold(i) : accessHold(i)));
+    const discordSession = await discordRoom();
+    expect(
+      await ask(discordSession, { approvalScope: { ...RELEASE_SCOPE, holds }, decision: WEEKLY_RELEASE }),
+    ).toBeUndefined();
+    expect(delivered).toHaveLength(0);
+    expect(notes().map((n) => n.text)).toEqual([
+      expect.stringMatching(/^request_choice failed: decision is too long for one card: shorten it by \d+ characters$/),
+    ]);
+  });
+
+  it('keeps the warning card’s Ship-anyway label within Slack’s 75-character button text at the longest accept phrase', async () => {
+    const holds = Array.from({ length: 24 }, (_, i) => `hold:access:f${String(i).padStart(2, '0')}.sql`);
+    await ask(session, {
+      approvalScope: { ...RELEASE_SCOPE, holds },
+      decision: { ...DECISION, accept: 'x'.repeat(50) },
+    });
+    expect(notes()).toEqual([]);
+    const options = delivered[0].content.options as Array<{ label: string }>;
+    expect(options[0].label).toBe(`Ship anyway — I accept ${'x'.repeat(50)}`);
+    expect(options[0].label.length).toBeLessThanOrEqual(75);
   });
 
   it('stores and returns the holds sorted, so the receipt names one canonical set', async () => {
@@ -761,6 +867,186 @@ describe('request_choice delivery', () => {
       'request_choice failed: "other-room" is not one of your destinations.',
       'request_choice failed: "ghost" is not one of your destinations.',
     ]);
+  });
+});
+
+describe('release card budget per platform', () => {
+  // A hold list shaped like a busy real release: 14 long access paths, an unreadable diff, and two workflow holds.
+  const SEVENTEEN_HOLDS = [
+    ...[
+      'marts/finance/fct_invoice_lines_daily',
+      'marts/finance/fct_refund_settlements',
+      'marts/sales/fct_order_line_margins',
+      'marts/sales/dim_customer_lifetime_tiers',
+      'marts/ops/fct_shipment_carrier_costs',
+      'marts/ops/fct_warehouse_stock_snapshots',
+      'marts/growth/fct_campaign_attribution',
+      'marts/growth/dim_promotion_eligibility',
+      'staging/billing/stg_billing_invoices',
+      'staging/billing/stg_billing_credit_notes',
+      'staging/catalog/stg_catalog_variants',
+      'staging/catalog/stg_catalog_price_books',
+      'intermediate/int_orders_with_returns',
+      'intermediate/int_subscriptions_by_month',
+    ].map((model) => `hold:access:warehouse/models/${model}.sql`),
+    'hold:diff_unreadable:warehouse/seeds/region_mapping_overrides.csv',
+    'hold:workflow',
+    'hold:prod_script',
+  ];
+  const SCOPE = { ...RELEASE_SCOPE, repository: 'example-org/example-warehouse', holds: SEVENTEEN_HOLDS };
+  const BUSY_DECISION = {
+    kind: 'warning',
+    headline: 'Widening grants on 14 finance and sales models before quarter close; the access holds are deliberate.',
+    asked: 'Jordan, 11-06: “give the finance analysts the close models today”',
+    does: 'Finance analysts can read the 14 models listed below.\nNo rows change and no model is rebuilt.\nThe grant goes to the analyst role only, not to service accounts.\nDashboards keep their current owners.',
+    risk: 'analysts see invoice and refund lines a day before the formal review',
+    undo: 'Revoke the role grant; takes a minute and loses nothing.',
+    holdingCosts: 'Close runs on exports again, about two hours of manual work for the finance team each day.',
+    recommend: 'Ship anyway: the access is what was asked for.',
+    evidence: 'https://github.com/example-org/example-warehouse/pull/42#issuecomment-1',
+    accept: 'early analyst access to close models',
+  };
+  /** The decision with `extra` characters added across fields that render verbatim, each kept within its limit. */
+  function padded(extra: number): typeof BUSY_DECISION {
+    const out = { ...BUSY_DECISION };
+    const room: Array<[keyof typeof BUSY_DECISION, number]> = [
+      ['headline', 200],
+      ['risk', 300],
+      ['undo', 300],
+      ['holdingCosts', 300],
+      ['recommend', 300],
+    ];
+    let left = extra;
+    for (const [field, max] of room) {
+      const add = Math.min(left, max - out[field].length);
+      out[field] = `${out[field]}${'x'.repeat(add)}`;
+      left -= add;
+    }
+    expect(left).toBe(0);
+    return out;
+  }
+
+  function postedCard(): string {
+    const content = delivered.find((d) => d.content.type === 'ask_question')!.content;
+    return `**${String(content.title)}**\n\n${String(content.question)}`;
+  }
+
+  it('accepts a 17-hold warning card on Slack, and refuses the same card on Discord by its overrun', async () => {
+    expect(SEVENTEEN_HOLDS.join('').length).toBeGreaterThan(1000);
+    const decisionText = Object.entries(BUSY_DECISION)
+      .filter(([k]) => k !== 'kind')
+      .map(([, v]) => v)
+      .join('');
+    expect(decisionText.length).toBeGreaterThanOrEqual(690);
+
+    const row = await ask(session, { approvalScope: SCOPE, decision: BUSY_DECISION });
+    expect(notes()).toEqual([]);
+    expect(row).toBeDefined();
+    const card = postedCard();
+    expect(card).toContain(
+      [...SEVENTEEN_HOLDS]
+        .sort()
+        .map((code) => `• \`${code}\``)
+        .join('\n'),
+    );
+    expect(card.endsWith(`Pinned to example-org/example-warehouse#42 from main at ${'a'.repeat(40)}.`)).toBe(true);
+    expect(card.length).toBeGreaterThan(1800);
+
+    await ask(await discordRoom(), { approvalScope: SCOPE, decision: BUSY_DECISION }, 'choice-2');
+    expect(delivered.filter((d) => d.content.type === 'ask_question')).toHaveLength(1);
+    expect(notes().map((n) => n.text)).toEqual([
+      `request_choice failed: decision is too long for one card: shorten it by ${card.length - 1800} characters`,
+    ]);
+  });
+
+  it('budgets a card routed with `to` by the destination’s platform, not the asking session’s', async () => {
+    await discordRoom();
+    await destinationOnly('mg-discord', 'discord-room');
+    await ask(session, {
+      to: 'discord-room',
+      channelType: 'discord-fixture',
+      platformId: 'discord:guild-1:chan-4',
+      approvalScope: SCOPE,
+      decision: BUSY_DECISION,
+    });
+    expect(delivered).toHaveLength(0);
+    expect(notes().map((n) => n.text)).toEqual([
+      expect.stringMatching(/^request_choice failed: decision is too long for one card: shorten it by \d+ characters$/),
+    ]);
+  });
+
+  it('refuses a Slack card one character over its budget, and accepts it at the budget', async () => {
+    await ask(session, { approvalScope: SCOPE, decision: BUSY_DECISION }, 'probe');
+    const base = postedCard().length;
+    delivered.length = 0;
+
+    await ask(session, { approvalScope: SCOPE, decision: padded(2643 - base) }, 'choice-over');
+    expect(delivered).toHaveLength(0);
+    expect(notes().map((n) => n.text)).toEqual([
+      'request_choice failed: decision is too long for one card: shorten it by 1 characters',
+    ]);
+
+    expect(await ask(session, { approvalScope: SCOPE, decision: padded(2642 - base) }, 'choice-at')).toBeDefined();
+    expect(postedCard()).toHaveLength(2642);
+  });
+
+  it('shows a full-budget Slack card whole once resolved, its hold list and pin line beside the longest answer line', async () => {
+    await upsertUser({ id: ADMIN, kind: CHANNEL, display_name: 'N'.repeat(200), created_at: now() });
+    await ask(session, { approvalScope: SCOPE, decision: BUSY_DECISION }, 'probe');
+    const base = postedCard().length;
+    delivered.length = 0;
+    const row = (await ask(session, { approvalScope: SCOPE, decision: padded(2642 - base) }))!;
+    const { title, question } = delivered[0].content as { title: string; question: string };
+
+    expect(await click(row.approval_id, 'ship', ADMIN)).toBe(true);
+
+    const edit = String(delivered.find((d) => d.content.operation === 'edit')!.content.text);
+    expect(edit.length).toBeLessThanOrEqual(2800);
+    expect(edit.startsWith(`${title}\n\n${question}\n\n✅ Ship anyway — I accept`)).toBe(true);
+    expect(edit.split('\n\n').at(-1)).toMatch(/^✅ Ship anyway — I accept early analyst access to close models — N+…$/);
+  });
+
+  it('leaves room for Slack turning a #channel and an @name into links, which happens after the edit is measured', async () => {
+    const teamId = 'T0EXAMPLE';
+    const bot = {
+      userId: 'U0BOT',
+      username: 'release-bot',
+      teamId,
+      workspaceUrl: 'https://examplelabsworkspace1.enterprise.slack.com/',
+    };
+    const human = { userId: 'U0PRIYA', username: 'priya', teamId };
+    registerSlackBot(CHANNEL, bot);
+    try {
+      await upsertUser({ id: ADMIN, kind: CHANNEL, display_name: 'N'.repeat(200), created_at: now() });
+      const linking = { ...BUSY_DECISION, reviewers: 'Read in #ship-room by @priya' };
+      await ask(session, { approvalScope: SCOPE, decision: linking }, 'probe');
+      const base = postedCard().length;
+      delivered.length = 0;
+      const pad = (extra: number) => ({ ...padded(extra), reviewers: linking.reviewers });
+
+      await ask(session, { approvalScope: SCOPE, decision: pad(2642 - 160 - base + 1) }, 'choice-over');
+      expect(notes().map((n) => n.text)).toEqual([
+        'request_choice failed: decision is too long for one card: shorten it by 1 characters',
+      ]);
+
+      const row = (await ask(session, { approvalScope: SCOPE, decision: pad(2642 - 160 - base) }))!;
+      expect(row).toBeDefined();
+      const { question } = delivered[0].content as { question: string };
+      expect(await click(row.approval_id, 'ship', ADMIN)).toBe(true);
+      const edit = String(delivered.find((d) => d.content.operation === 'edit')!.content.text);
+
+      const sent = linkSlackChannelNames(
+        resolveSlackMentions(edit, CHANNEL, new Map([[CHANNEL, bot]]), new Map([[teamId, [human]]])),
+        CHANNEL,
+        [{ channelType: CHANNEL, platformId: 'slack:C0SHIP7', name: 'ship-room' }],
+      );
+      expect(sent).toContain('[#ship-room](https://examplelabsworkspace1.enterprise.slack.com/archives/C0SHIP7)');
+      expect(sent).toContain('<@U0PRIYA>');
+      expect(sent.length).toBeLessThanOrEqual(2800);
+      expect(edit).toContain(question);
+    } finally {
+      unregisterSlackBot(CHANNEL, bot);
+    }
   });
 });
 
@@ -1263,6 +1549,15 @@ describe('the documented response line and the emitted one', () => {
 
     expect(documentedKeys).toEqual(emittedKeys);
     expect(emittedKeys).toEqual(['choice_id', 'approval_id', 'value', 'label', 'user_id', 'user_name']);
+  });
+});
+
+describe('the hold cap the runner transports and the one the host enforces', () => {
+  it('names one value in both package trees', () => {
+    const cap = (file: string) => /^const MAX_SCOPE_HOLDS = (\d+);$/m.exec(fs.readFileSync(file, 'utf8'))?.[1];
+    const host = cap('src/modules/approvals/release-ship-scope.ts');
+    expect(host).toBe('24');
+    expect(cap('container/agent-runner/src/mcp-tools/request-choice.ts')).toBe(host);
   });
 });
 

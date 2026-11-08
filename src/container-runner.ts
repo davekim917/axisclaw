@@ -43,6 +43,7 @@ import {
   CONTAINER_PLUGINS_DIR,
   effectiveOutcomeReporting,
   effectiveTimezone,
+  ONECLI_PLACEHOLDER,
   readContainerConfig,
   readContainerConfigForSpawn,
   updateContainerConfig,
@@ -75,14 +76,20 @@ import {
   waitForContainerExit,
   type InstallContainerScope,
 } from './container-runtime.js';
-import { checkAgentRunnerDepsDrift } from './agent-runner-image-check.js';
+import {
+  BASE_IMAGE_ID_LABEL,
+  checkAgentRunnerDepsDrift,
+  readBaseImageId,
+  type DepsDriftCheck,
+} from './agent-runner-image-check.js';
+import { claudeOauthSlots, spentClaudeSlots } from './claude-accounts.js';
 import {
   codexStartHome,
   resolveCodexAuthDir,
   resolveCodexAuthFallbacks,
   type CodexAuthFallback,
 } from './codex-accounts.js';
-import { requestContainerRebuild } from './container-rebuild-watcher.js';
+import { MIN_RETRY_INTERVAL_MS, requestContainerRebuild } from './container-rebuild-watcher.js';
 import { EGRESS_NETWORK, egressNetworkArgs, ensureEgressNetwork } from './egress-lockdown.js';
 import {
   assertRealDirectory,
@@ -125,16 +132,16 @@ import { buildCentralProjection } from './db/per-agent-projections.js';
 import { ensureArchiveProjection } from './db/archive-projection-worker.js';
 import { initGroupFilesystem } from './group-init.js';
 import { stopTypingRefresh } from './modules/typing/index.js';
-import { copySecretFile, DBT_CONTAINER_DIR, stageDbtProfiles } from './credential-stage.js';
+import { copySecretFile, DBT_CONTAINER_DIR, stageDbtProfiles, tagSnowflakeConnections } from './credential-stage.js';
 import { log } from './log.js';
 import { applyOnecliContainerConfig, describeDiagnosis } from './onecli-apply.js';
 import { previewProxyEnv } from './modules/preview/preview-identity.js';
 import {
   applyOnecliSecrets,
+  assertNotReservedIdentity,
   ensureOnecliAgent,
   resolveSpawnSecrets,
   slackUserTokenSecrets,
-  typesafeKeyPlaceholderEnv,
 } from './onecli-secrets.js';
 import {
   reconcileWorkgroupMemory,
@@ -144,10 +151,16 @@ import {
   WORKGROUP_CONTAINER_PATH,
   WORKGROUP_MEMORY_CONTAINER_PATH,
 } from './modules/workgroup/shared-dirs.js';
-import { browserStateMount } from './modules/browser-takeover/state-dir.js';
+import { browserStateMount, privateBrowserStateMount } from './modules/browser-takeover/state-dir.js';
 import { endPreviewForContainer } from './modules/preview/service.js';
 import { validateAdditionalMounts } from './modules/mount-security/index.js';
-import { protectReadonlyHostPaths, readWorkgroupReadonlyPaths } from './workgroup-readonly-paths.js';
+import { assertMountSourcesPinned, exposedReadonlyOverlays, pinMountSources } from './mount-source-gate.js';
+import {
+  isInside,
+  protectReadonlyHostPaths,
+  readWorkgroupReadonlyPaths,
+  realOrResolved,
+} from './workgroup-readonly-paths.js';
 import {
   assertWorkgroupReadAccessMountStable,
   isDuplicateWorkgroupReadAccessMount,
@@ -231,9 +244,25 @@ import { acquireStorageActivityLease, type StorageActivityLease } from './storag
 import { handleStoragePressureAlert } from './storage-pressure-alert.js';
 import { MemoryAdmissionController, type MemoryAdmissionPriority } from './memory-admission.js';
 import { effectiveMcpServers, excludedFleetMcpServers } from './fleet-mcp-servers.js';
+import { emailSignaturesDirFor, stageEmailSignatures } from './modules/email-signatures/refresh.js';
+import { folderDbEnvNames } from './folder-db-env.js';
 import { neutralReviewerReposEnvArgs } from './neutral-reviewer-repos.js';
 import { effectiveExcludePlugins, WORKGROUP_EXCLUDE_PLUGINS_ENV } from './plugin-exclusions.js';
 import type { AgentGroup, Session } from './types.js';
+
+// The same 610s as the runner bridge's cap in looker-mcp.ts: just past toolbox's own 600s Looker timeout.
+const LOOKER_TOOL_TIMEOUT_MS = 610_000;
+
+/** The runner's loopback forwarder pins toolbox's Looker calls to this origin and sends them through the gateway. */
+function lookerMcpServer(baseUrl: string): McpServerConfig {
+  return {
+    type: 'stdio',
+    command: 'bun',
+    args: ['/app/src/looker-mcp.ts'],
+    env: { LOOKER_BASE_URL: baseUrl },
+    timeout: LOOKER_TOOL_TIMEOUT_MS,
+  };
+}
 
 export const DATAFOLD_MCP_SERVER = {
   type: 'http',
@@ -652,6 +681,16 @@ export function getActiveContainerCount(): number {
 
 export function isContainerRunning(sessionId: string): boolean {
   return activeContainers.has(sessionId);
+}
+
+/**
+ * Either authority says live: the registry (the row can still read 'stopped' for a container already writing) or
+ * the row (a container this process has not adopted yet).
+ */
+export function isSessionContainerLive(session: Pick<Session, 'id' | 'container_status'>): boolean {
+  return (
+    isContainerRunning(session.id) || session.container_status === 'running' || session.container_status === 'idle'
+  );
 }
 
 /**
@@ -1285,13 +1324,15 @@ async function spawnContainer(
   const effectiveResources = resolveContainerResources(containerConfig.resources);
 
   // node_modules is image-baked while source is bind-mounted live: a dep added without an image rebuild
-  // crash-loops every spawn. Checked against the image actually spawned (a per-agent image carries its own label).
+  // crash-loops every spawn. Checked against the image actually spawned (a per-agent image carries its own label),
+  // and a per-agent image must also be built on the current base.
   const spawnImageRef = containerConfig.imageTag || CONTAINER_IMAGE;
+  const perAgentImage = spawnImageRef === agentGroupImageTag(agentGroup.id);
   const depsDriftStartedAt = Date.now();
-  const depsCheck = await checkAgentRunnerDepsDrift(spawnImageRef);
+  const depsCheck = await checkAgentRunnerDepsDrift(spawnImageRef, { derivedFromBase: perAgentImage });
   logSpawnStage('deps-drift-check', depsDriftStartedAt);
   if (!depsCheck.ok) {
-    log.warn('Refusing spawn — agent-runner deps drift', {
+    log.warn('Refusing spawn — agent image drift', {
       sessionId: session.id,
       agentGroup: agentGroup.name,
       imageRef: depsCheck.imageRef,
@@ -1303,9 +1344,10 @@ async function spawnContainer(
       retried: depsCheck.retried,
       message: depsCheck.message,
     });
-    // Only the shared base image is fixable by a rebuild (a per-agent image needs its self-mod re-run). Never
-    // awaited: refuse now; host-sweep retries once the detached rebuild lands.
+    // Never awaited: refuse now; host-sweep retries once the detached rebuild lands. An image_tag naming any other
+    // image is an admin override this host cannot rebuild.
     if (spawnImageRef === CONTAINER_IMAGE) requestContainerRebuild(depsCheck.message);
+    else if (perAgentImage) void rebuildStaleAgentGroupImage(agentGroup.id, depsCheck);
     throw new Error(depsCheck.message);
   }
 
@@ -1509,6 +1551,9 @@ async function spawnContainer(
       }
       const dockerEnvironment = materializeDockerEnvironment(args, dockerEnvironmentDir, session.id);
       dockerEnvironmentFile = dockerEnvironment.file;
+      const mountPinCheckStartedAt = Date.now();
+      assertMountSourcesPinned(mounts);
+      logSpawnStage('mount-sources-pinned', mountPinCheckStartedAt);
       const child = spawn(CONTAINER_RUNTIME_BIN, dockerEnvironment.args, { stdio: ['ignore', 'pipe', 'pipe'] });
 
       channel = { kind: 'spawned', process: child };
@@ -3098,6 +3143,8 @@ export function stageCodexAuth(hostHomePath: string, runtimeHostPath: string, co
   assertRealDirectory(hostHomePath);
   removeUntrustedPathEntry(runtimeHostPath, 'plugins');
   removeUntrustedPathEntry(runtimeHostPath, '.tmp');
+  // The guard chain is the image's /etc/codex layer, so no staged home carries a hooks.json of its own.
+  removeUntrustedPathEntry(runtimeHostPath, 'hooks.json');
 
   const hostAuth = path.join(hostHomePath, 'auth.json');
   const hostAuthStat = fs.lstatSync(hostAuth, { throwIfNoEntry: false });
@@ -3302,19 +3349,12 @@ const SCOPED_CREDENTIAL_VARS = [
   'SNOWFLAKE_ROLE',
   'SNOWFLAKE_DATABASE',
   'DBT_CLOUD_ACCOUNT_ID',
-  'DBT_CLOUD_API_TOKEN',
-  'DBT_CLOUD_EMAIL',
-  'DBT_CLOUD_PASSWORD',
   'DBT_CLOUD_API_URL',
   'DBT_HOST',
   'DBT_MULTICELL_ACCOUNT_PREFIX',
   'DBT_PROD_ENV_ID',
-  'DBT_DEV_ENV_ID',
-  'DBT_USER_ID',
   'DBT_MCP_DISABLE_TOOLS',
   'LOOKER_BASE_URL',
-  'LOOKER_CLIENT_ID',
-  'LOOKER_CLIENT_SECRET',
   'ATLASSIAN_BASE_URL',
   'SELECT_ORGANIZATION_ID',
   // Must stay in sync with capabilities.ts SCOPED_ENV_NAMES.
@@ -3352,6 +3392,8 @@ export function resolveScopedCredentialEnv(
     const value = configuredGitEnv[base] ?? resolve(base, credentialFolder);
     if (value) resolved[base] = value;
   }
+  // The dbt Cloud token lives in the OneCLI vault; scripts that send `Token $DBT_CLOUD_API_TOKEN` get it replaced.
+  if (resolved.DBT_CLOUD_API_URL || resolved.DBT_HOST) resolved.DBT_CLOUD_API_TOKEN = ONECLI_PLACEHOLDER;
   return resolved;
 }
 
@@ -3543,7 +3585,7 @@ export async function buildMounts(
       ),
       ...contribution.mounts,
     ];
-    return mounts;
+    return pinMountSources(mounts, [], agentGroup.id);
   }
   const access = workgroupAccess ?? (await getWorkgroupAccessById(wgKey));
   const workgroupReadAccessStartedAt = Date.now();
@@ -3692,21 +3734,24 @@ export async function buildMounts(
   // each host-resolvable one is bind-mounted at its container path. Absolute targets that exist only in the
   // container are skipped. SECURITY: the group dir is agent-writable, so only targets the agent is entitled to
   // (own group, same-workgroup siblings, the workgroup shared tree) are overlaid; anything else is skipped loudly.
-  const allowedOverlayRoots = [
-    workgroupSharedDir(wgKey),
-    ...(await getAllAgentGroups())
-      .filter((g) => (g.workgroup_id ?? g.folder) === wgKey)
-      .map((g) => path.resolve(GROUPS_DIR, g.folder)),
+  const allGroups = await getAllAgentGroups();
+  const memberGroupDirs = [
+    ...allGroups.filter((g) => (g.workgroup_id ?? g.folder) === wgKey).map((g) => path.resolve(GROUPS_DIR, g.folder)),
     groupDir,
-  ].map((p) => {
-    try {
-      return fs.realpathSync(p);
-    } catch {
-      return path.resolve(p);
-    }
-  });
+  ].map(realOrResolved);
+  // A link adds nothing inside a tree the agent already has mounted; memory-only mode withholds the workgroup tree.
+  const linkWriteWithheld = [
+    ...memberGroupDirs.filter((dir) => dir !== realOrResolved(groupDir)),
+    ...(workgroupSharedTreeMounted(wgKey) ? [] : [realOrResolved(workgroupSharedDir(wgKey))]),
+  ];
+  const allowedOverlayRoots = [realOrResolved(workgroupSharedDir(wgKey)), ...memberGroupDirs];
   const isAllowedOverlayTarget = (target: string): boolean =>
     allowedOverlayRoots.some((root) => target === root || target.startsWith(root + path.sep));
+  // Only the nested bind on /workspace/agent keeps container.json read-only, so a second bind of the file, of a group
+  // folder or of anything above one hands it over writable, with the secrets, mounts and tools it grants.
+  const groupRoots = [...allGroups.map((g) => path.resolve(GROUPS_DIR, g.folder)), groupDir].map(realOrResolved);
+  const exposesGroupControl = (target: string): boolean =>
+    path.basename(target) === 'container.json' || groupRoots.some((root) => target === root || isInside(root, target));
   for (const entry of fs.readdirSync(groupDir, { withFileTypes: true })) {
     if (!entry.isSymbolicLink()) continue;
     const linkPath = path.join(groupDir, entry.name);
@@ -3720,6 +3765,14 @@ export async function buildMounts(
     }
     if (!isAllowedOverlayTarget(realTarget)) {
       log.warn('Refusing symlink-overlay mount outside workgroup boundary', {
+        agentGroupId: agentGroup.id,
+        link: linkPath,
+        target: realTarget,
+      });
+      continue;
+    }
+    if (exposesGroupControl(realTarget)) {
+      log.warn('Refusing symlink-overlay mount of a group root or container.json', {
         agentGroupId: agentGroup.id,
         link: linkPath,
         target: realTarget,
@@ -3747,7 +3800,7 @@ export async function buildMounts(
     mounts.push({
       hostPath: realTarget,
       containerPath: containerPathFor(realTarget),
-      readonly: false,
+      readonly: linkWriteWithheld.some((dir) => realTarget === dir || isInside(realTarget, dir)),
       overlayAllowedRoots: allowedOverlayRoots,
     });
   }
@@ -3766,6 +3819,10 @@ export async function buildMounts(
 
   const browserState = browserStateMount(wgId);
   if (browserState) mounts.push(browserState);
+  if (containerConfig.browserSso) {
+    const privateBrowserState = privateBrowserStateMount(agentGroup.folder);
+    if (privateBrowserState) mounts.push(privateBrowserState);
+  }
 
   // Nested RO mount over the RW group dir: the agent can read its config but not modify it.
   const containerJsonPath = path.join(groupDir, 'container.json');
@@ -4155,6 +4212,7 @@ export async function buildMounts(
   };
 
   const escapeRegex = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const snowflakeQueryTag = `${agentGroup.folder}:${session.id}`;
 
   const gmail = staged('gmail');
   let gmailPrimaryMounted = false;
@@ -4250,12 +4308,16 @@ export async function buildMounts(
 
   const googleWorkspace = staged('google-workspace');
   const googleWorkspaceMcp = staged('google-workspace-mcp');
+  const gwsAccountsDir = path.join(home, '.config', 'gws', 'accounts');
+  let signatureAccounts: string[] | 'all' = [];
+  let mountedGwsAccountsDir = gwsAccountsDir;
   if (googleWorkspace && googleWorkspaceMcp) {
-    const gwsAccountsDir = path.join(home, '.config', 'gws', 'accounts');
     if (fs.existsSync(gwsAccountsDir)) {
       const { scopes: gwsAccts, isScoped: gwsScoped } = googleWorkspace;
+      signatureAccounts = gwsScoped ? [...gwsAccts] : 'all';
       if (gwsScoped) {
         const dest = stageDir('gws-accounts');
+        mountedGwsAccountsDir = dest;
         for (const acct of gwsAccts) {
           const fileCandidate = path.join(gwsAccountsDir, `${acct}.json`);
           const dirCandidate = path.join(gwsAccountsDir, acct);
@@ -4280,7 +4342,9 @@ export async function buildMounts(
         mounts.push({ hostPath: gwsAccountsDir, containerPath: '/home/node/.config/gws/accounts', readonly: true });
       }
     }
-
+  }
+  stageEmailSignatures(gwsAccountsDir, emailSignaturesDirFor(sessDir), signatureAccounts, mountedGwsAccountsDir);
+  if (googleWorkspace && googleWorkspaceMcp) {
     const gwCredsDir = path.join(home, '.google_workspace_mcp', 'credentials');
     if (fs.existsSync(gwCredsDir)) {
       const { scopes: gwStems, isScoped: gwScoped } = googleWorkspaceMcp;
@@ -4333,6 +4397,9 @@ export async function buildMounts(
       const homePattern = new RegExp(escapeRegex(snowflakeDir) + '/', 'g');
       let tomlContent = fs.readFileSync(origToml, 'utf-8').replace(homePattern, '/home/node/.snowflake/');
       if (filterConns) tomlContent = filterConfigSections(tomlContent, allowedConns);
+      const tagged = tagSnowflakeConnections(tomlContent, snowflakeQueryTag);
+      if (tagged === null) log.warn('Snowflake connections staged without a query tag', { agent: agentGroup.folder });
+      else tomlContent = tagged;
       fs.writeFileSync(path.join(dest, 'connections.toml'), tomlContent, { mode: 0o600 });
 
       const origConfig = path.join(snowflakeDir, 'config.toml');
@@ -4465,6 +4532,7 @@ export async function buildMounts(
           dest,
           allowedProfiles: isScoped ? scopes : null,
           agent: agentGroup.folder,
+          queryTag: snowflakeQueryTag,
         });
         mounts.push({ hostPath: dest, containerPath: DBT_CONTAINER_DIR, readonly: true });
       } catch (err) {
@@ -4480,7 +4548,16 @@ export async function buildMounts(
     mounts.push(...providerContribution.mounts);
   }
 
-  return protectReadonlyHostPaths(mounts, readWorkgroupReadonlyPaths());
+  const pinned = pinMountSources(mounts, allowedOverlayRoots, agentGroup.id);
+  const readonlyPaths = readWorkgroupReadonlyPaths();
+  const memberConfigs = memberGroupDirs
+    .map((dir) => path.join(dir, 'container.json'))
+    .filter((config) => fs.existsSync(config))
+    .map(realOrResolved);
+  return protectReadonlyHostPaths(pinned, {
+    ...readonlyPaths,
+    protectedPaths: [...readonlyPaths.protectedPaths, ...memberConfigs, ...exposedReadonlyOverlays(pinned)],
+  });
 }
 
 export function resolveWorkgroupMemoryMount(workgroupId: string, dataDir: string = DATA_DIR): VolumeMount {
@@ -4843,7 +4920,7 @@ export function removeDockerEnvironmentFile(file: string | null): void {
   }
 }
 
-async function buildContainerArgs(
+export async function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
   /** Stamped as the `nanoclaw-session` label so boot inventory can map a survivor back to its session. */
@@ -5166,6 +5243,8 @@ async function buildContainerArgs(
     // profile endpoints that 403 and then 429 for these tokens. Declared because unset makes the CLI treat an env
     // token as profile-capable.
     args.push('-e', 'CLAUDE_CODE_OAUTH_SCOPES=user:inference');
+    const claudeSpent = spentClaudeSlots(claudeOauthSlots(auth));
+    if (claudeSpent.length > 0) args.push('-e', `CLAUDE_SPENT_SLOTS=${claudeSpent.join(',')}`);
   }
 
   // OneCLI's proxy model doesn't fit git auth, so the real token is passed.
@@ -5213,19 +5292,7 @@ async function buildContainerArgs(
     args.push('-e', `${name}=${value}`);
   }
 
-  // Raw connection strings (e.g. RENDER_PG_URL_<FOLDER>_MAIN) passed through verbatim. SECURITY: the tail must
-  // START with the folder token followed by `_` or end-of-string; a substring match let one folder inherit
-  // another folder's vars.
-  const folderTok = credentialFolder.toUpperCase().replace(/-/g, '_');
-  const verbatimPrefixes = ['RENDER_PG_', 'RENDER_REDIS_URL_'];
-  for (const [k, v] of Object.entries(process.env)) {
-    if (!v) continue;
-    const matchedPrefix = verbatimPrefixes.find((p) => k.startsWith(p));
-    if (!matchedPrefix) continue;
-    const tail = k.slice(matchedPrefix.length);
-    if (tail !== folderTok && !tail.startsWith(`${folderTok}_`)) continue;
-    args.push('-e', `${k}=${v}`);
-  }
+  for (const name of folderDbEnvNames(credentialFolder)) args.push('-e', `${name}=${process.env[name]}`);
 
   // ADC env and the default project come from the mounted key; set regardless of gateway state (ADC needs no proxy).
   if (gcpKey) {
@@ -5328,6 +5395,7 @@ async function buildContainerArgs(
         }
       }
 
+      assertNotReservedIdentity(identity);
       // Awaited: synchronous control-API calls stall the host event loop for the round trip.
       await ensureOnecliAgent({
         name:
@@ -5336,7 +5404,6 @@ async function buildContainerArgs(
       });
       await applyOnecliSecrets(identity, effectiveSecrets);
       effectiveIdentifier = identity;
-      args.push(...typesafeKeyPlaceholderEnv(provider, effectiveSecrets));
     }
     // Retried once for the proved-transient class only (src/onecli-apply.ts); a deterministic 4xx throws.
     const applyResult = await applyOnecliContainerConfig(
@@ -5552,55 +5619,36 @@ async function buildContainerArgs(
     }
   }
   if (canInject('looker') && isToolEnabled(tools, 'looker')) {
-    // Credentials are embedded in the env block because the MCP SDK's stdio transport passes only
-    // HOME/LOGNAME/PATH/SHELL/TERM/USER to the child by default.
     const baseUrl = resolveScopedEnv('LOOKER_BASE_URL', credentialFolder);
-    const clientId = resolveScopedEnv('LOOKER_CLIENT_ID', credentialFolder);
-    const clientSecret = resolveScopedEnv('LOOKER_CLIENT_SECRET', credentialFolder);
-    if (baseUrl && clientId && clientSecret) {
-      mcpServers.looker = {
-        type: 'stdio',
-        command: 'toolbox',
-        args: ['--stdio', '--prebuilt', 'looker'],
-        env: {
-          LOOKER_BASE_URL: baseUrl,
-          LOOKER_CLIENT_ID: clientId,
-          LOOKER_CLIENT_SECRET: clientSecret,
-          LOOKER_VERIFY_SSL: resolveScopedEnv('LOOKER_VERIFY_SSL', credentialFolder) ?? 'true',
-        },
-      };
+    if (baseUrl) {
+      mcpServers.looker = lookerMcpServer(baseUrl);
     } else {
-      log.warn('Looker tool enabled but credentials missing', {
-        folder: agentGroup.folder,
-        hasBaseUrl: !!baseUrl,
-        hasClientId: !!clientId,
-        hasClientSecret: !!clientSecret,
-      });
+      log.warn('Looker tool enabled but LOOKER_BASE_URL is not set', { folder: agentGroup.folder });
     }
   }
   if (canInject('dbt-mcp') && isToolEnabled(tools, 'dbt-mcp')) {
-    // Read-only by default: CLI/LSP toolsets and the mutating Admin tools are disabled (override per folder via
-    // DBT_MCP_DISABLE_TOOLS_<FOLDER>).
+    // Read-only by default: the mutating Admin tools are off through a list a folder can replace with
+    // DBT_MCP_DISABLE_TOOLS_<FOLDER>. Every remote tool stays off too: with one enabled, dbt-mcp connects to dbt's remote
+    // MCP at session start, and most failures there kill the server, such as the 401 a token without Developer gets.
     const host = resolveScopedEnv('DBT_HOST', credentialFolder);
-    const token = resolveScopedEnv('DBT_CLOUD_API_TOKEN', credentialFolder);
     const prodEnvId = resolveScopedEnv('DBT_PROD_ENV_ID', credentialFolder);
-    if (host && token && prodEnvId) {
+    if (host && prodEnvId) {
       const env: Record<string, string> = {
         DBT_HOST: host,
-        DBT_TOKEN: token,
+        DBT_TOKEN: ONECLI_PLACEHOLDER,
         DBT_PROD_ENV_ID: prodEnvId,
-        DBT_MCP_ENABLE_DBT_CLI: 'false',
-        DBT_MCP_ENABLE_LSP: 'false',
+        DISABLE_DBT_CLI: 'true',
+        DISABLE_LSP: 'true',
+        DISABLE_SQL: 'true',
         DISABLE_TOOLS:
-          resolveScopedEnv('DBT_MCP_DISABLE_TOOLS', credentialFolder) ?? 'trigger_job_run,cancel_job_run,retry_job_run',
+          resolveScopedEnv('DBT_MCP_DISABLE_TOOLS', credentialFolder) ??
+          'trigger_job_run,cancel_job_run,retry_job_run,search,get_related_models',
       };
-      // Every Admin API tool needs DBT_ACCOUNT_ID, or dbt-mcp fails it with an empty error before any HTTP call.
+      // Every Admin API tool needs DBT_ACCOUNT_ID, or dbt-mcp fails it with an empty error before any HTTP call, so
+      // without one the toolset is off.
       const accountId = resolveScopedEnv('DBT_CLOUD_ACCOUNT_ID', credentialFolder);
       if (accountId) env.DBT_ACCOUNT_ID = accountId;
-      const devEnvId = resolveScopedEnv('DBT_DEV_ENV_ID', credentialFolder);
-      if (devEnvId) env.DBT_DEV_ENV_ID = devEnvId;
-      const userId = resolveScopedEnv('DBT_USER_ID', credentialFolder);
-      if (userId) env.DBT_USER_ID = userId;
+      else env.DISABLE_ADMIN_API = 'true';
       const multicell = resolveScopedEnv('DBT_MULTICELL_ACCOUNT_PREFIX', credentialFolder);
       if (multicell) env.MULTICELL_ACCOUNT_PREFIX = multicell;
       mcpServers['dbt-mcp'] = {
@@ -5613,7 +5661,6 @@ async function buildContainerArgs(
       log.warn('dbt-mcp tool enabled but credentials missing', {
         folder: agentGroup.folder,
         hasHost: !!host,
-        hasToken: !!token,
         hasProdEnvId: !!prodEnvId,
       });
     }
@@ -5691,6 +5738,8 @@ export function dockerResourceLimitArgs(resources?: ContainerResources): string[
 const execAsync = promisify(exec);
 
 const imageBuildChains = new Map<string, Promise<void>>();
+const agentGroupImageRebuilds = new Map<string, Promise<void>>();
+const agentGroupImageFailures = new Map<string, { at: number; ownerAlerted: boolean }>();
 
 /**
  * One build per group at a time, reading the package lists once it holds the turn: the last to finish owns the tag.
@@ -5701,7 +5750,11 @@ export function buildAgentGroupImage(
   adding: { apt: string[]; npm: string[] } = { apt: [], npm: [] },
 ): Promise<void> {
   const previous = imageBuildChains.get(agentGroupId) ?? Promise.resolve();
-  const run = previous.then(() => buildAgentGroupImageNow(agentGroupId, adding));
+  const run = previous
+    .then(() => buildAgentGroupImageNow(agentGroupId, adding))
+    .then(() => {
+      agentGroupImageFailures.delete(agentGroupId);
+    });
   const settled = run.then(
     () => undefined,
     () => undefined,
@@ -5711,6 +5764,96 @@ export function buildAgentGroupImage(
     if (imageBuildChains.get(agentGroupId) === settled) imageBuildChains.delete(agentGroupId);
   });
   return run;
+}
+
+export function agentGroupImageTag(agentGroupId: string): string {
+  return `${CONTAINER_IMAGE_BASE}:${agentGroupId}`;
+}
+
+/** Test-only: the in-flight drift rebuild for a group, so a test can tell "none started" from "not there yet". */
+export function _agentGroupImageRebuildForTesting(agentGroupId: string): Promise<void> | undefined {
+  return agentGroupImageRebuilds.get(agentGroupId);
+}
+
+/** Resolves when the requested rebuild settles; an inspect error is usually host load, not drift, so it builds nothing. */
+function rebuildStaleAgentGroupImage(agentGroupId: string, check: DepsDriftCheck): Promise<void> | undefined {
+  if (check.ok || check.lookup.kind === 'inspect-error') return undefined;
+  requestAgentGroupImageRebuild(agentGroupId, check.message);
+  return agentGroupImageRebuilds.get(agentGroupId);
+}
+
+/**
+ * Boot: rebuild each per-agent image the spawn check would refuse (a deploy that rebuilt the base leaves every one
+ * stale), one at a time so a deploy does not start every build at once, before a spawn has to wait on it.
+ */
+export async function prewarmAgentGroupImages(): Promise<void> {
+  for (const group of await getAllAgentGroups()) {
+    const imageTag = agentGroupImageTag(group.id);
+    try {
+      if (readContainerConfig(group.folder).imageTag !== imageTag) continue;
+      const check = await checkAgentRunnerDepsDrift(imageTag, { derivedFromBase: true });
+      await rebuildStaleAgentGroupImage(group.id, check);
+    } catch (err) {
+      log.warn('Per-agent-group image pre-warm skipped a group', { agentGroupId: group.id, err });
+    }
+  }
+}
+
+function requestAgentGroupImageRebuild(agentGroupId: string, reason: string): void {
+  if (agentGroupImageRebuilds.has(agentGroupId)) return;
+  const failure = agentGroupImageFailures.get(agentGroupId);
+  if (failure && Date.now() - failure.at < MIN_RETRY_INTERVAL_MS) return;
+  const attempt = rebuildDriftedAgentGroupImage(agentGroupId, reason)
+    .catch((err) => log.error('Per-agent-group image rebuild threw unexpectedly', { agentGroupId, err }))
+    .finally(() => agentGroupImageRebuilds.delete(agentGroupId));
+  agentGroupImageRebuilds.set(agentGroupId, attempt);
+}
+
+async function rebuildDriftedAgentGroupImage(agentGroupId: string, reason: string): Promise<void> {
+  // The per-agent image is built FROM the base: building on a drifted or still-rebuilding base would bake the same
+  // drift back in.
+  const base = await checkAgentRunnerDepsDrift(CONTAINER_IMAGE);
+  if (base.lookup.kind === 'inspect-error') return;
+  if (!base.ok) {
+    requestContainerRebuild(base.message);
+    return;
+  }
+  // The deps check above can be a cached pass for a base that has since gone; that is the base's failure, not the
+  // group's, so it must not start the group's failure cooldown.
+  const baseImageId = await readBaseImageId();
+  if (baseImageId.kind === 'inspect-error') return;
+  if (baseImageId.kind === 'no-image') {
+    requestContainerRebuild(`base image ${CONTAINER_IMAGE} not found; per-agent image ${agentGroupId} waits on it`);
+    return;
+  }
+  // An install build that queued during the check would retag ahead of its package record if this one followed it.
+  if (imageBuildChains.has(agentGroupId)) return;
+  log.info('Rebuilding drifted per-agent-group image', { agentGroupId, reason });
+  await buildAgentGroupImage(agentGroupId).catch((err: unknown) =>
+    recordAgentGroupImageFailure(agentGroupId, err instanceof Error ? err.message : String(err)),
+  );
+}
+
+async function recordAgentGroupImageFailure(agentGroupId: string, detail: string): Promise<void> {
+  const ownerAlerted = agentGroupImageFailures.get(agentGroupId)?.ownerAlerted ?? false;
+  agentGroupImageFailures.set(agentGroupId, { at: Date.now(), ownerAlerted });
+  log.error('Per-agent-group image rebuild failed; its spawns stay refused', { agentGroupId, detail });
+  if (ownerAlerted) return;
+  // Dynamic: notify-owner imports the Slack adapter module, which registers the adapter as it loads.
+  const { notifyOwner } = await import('./notify-owner.js');
+  const result = await notifyOwner({
+    title: `Agent image for ${agentGroupId} could not rebuild`,
+    body:
+      `Every spawn of agent group ${agentGroupId} is refused: its image ${agentGroupImageTag(agentGroupId)} ` +
+      `was built on an older base image or older agent-runner deps, and the automatic rebuild failed: ${detail.slice(0, 500)}\n\n` +
+      `The first spawn attempt ${MIN_RETRY_INTERVAL_MS / 60_000} or more minutes from now builds again, and there ` +
+      `is no further alert until a rebuild succeeds. Manual rebuild: \`ncl groups restart --id ${agentGroupId} --rebuild\`.`,
+  });
+  // A build that succeeded while the alert was in flight already ended this episode.
+  const current = agentGroupImageFailures.get(agentGroupId);
+  if (result.code === 0 && current) current.ownerAlerted = true;
+  if (result.code !== 0)
+    log.warn('Per-agent-group image rebuild: could not alert the owner', { agentGroupId, ...result });
 }
 
 async function buildAgentGroupImageNow(agentGroupId: string, adding: { apt: string[]; npm: string[] }): Promise<void> {
@@ -5738,6 +5881,14 @@ async function buildAgentGroupImageNow(agentGroupId: string, adding: { apt: stri
     const allowBuilds = JSON.stringify(Object.fromEntries(npmPackages.map((pkg) => [pkg, true])));
     dockerfile += `RUN ${legacyAllowlist} && pnpm config set --global --json allowBuilds '${allowBuilds}' && pnpm install -g ${npmPackages.join(' ')}\n`;
   }
+  // Read before the build: if the base tag moves mid-build, the label names the older base and the next check
+  // rebuilds again, never the reverse.
+  const baseImageId = await readBaseImageId();
+  if (baseImageId.kind !== 'found') {
+    const why = baseImageId.kind === 'inspect-error' ? baseImageId.reason : baseImageId.kind;
+    throw new Error(`cannot read the ID of base image ${CONTAINER_IMAGE} to record it (${why})`);
+  }
+  dockerfile += `LABEL ${BASE_IMAGE_ID_LABEL}=${JSON.stringify(baseImageId.value)}\n`;
   const retentionCreatedAt = new Date().toISOString();
   const retentionHours = resolveStoragePolicy().candidateRetentionHours;
   dockerfile += `LABEL nanoclaw.retention.created_at=${JSON.stringify(retentionCreatedAt)}\n`;
@@ -5748,7 +5899,7 @@ async function buildAgentGroupImageNow(agentGroupId: string, adding: { apt: stri
   dockerfile += `LABEL nanoclaw.image.install=${JSON.stringify(INSTALL_SLUG)}\n`;
   dockerfile += 'USER node\n';
 
-  const imageTag = `${CONTAINER_IMAGE_BASE}:${agentGroupId}`;
+  const imageTag = agentGroupImageTag(agentGroupId);
 
   log.info('Building per-agent-group image', { agentGroupId, imageTag, apt: aptPackages, npm: npmPackages });
 

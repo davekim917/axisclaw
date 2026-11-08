@@ -2,7 +2,7 @@ import type Database from 'better-sqlite3';
 import type { Migration } from './index.js';
 
 /**
- * Durable idempotency and retry state for Discord thread titling (src/topic-title.ts). An in-process guard is reset
+ * Durable idempotency and retry state for Discord thread titling. An in-process guard is reset
  * by restarts and blind to session archival, which lets a follow-up message re-title an already-titled thread; and an
  * immediate 429 retry lost titles with nothing to retry from.
  * `first_message` is load-bearing: a retry must regenerate from the ORIGINAL opening message, never a follow-up.

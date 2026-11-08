@@ -41,20 +41,26 @@ const GROUP = 'ag-qz';
 const DM_PLATFORM = 'discord:1:dm';
 const CHANNEL_PLATFORM = 'discord:1:chan';
 
-async function makeSession(id: string, threadId: string | null, mgId: string | null = null): Promise<Session> {
+async function makeSession(
+  id: string,
+  threadId: string | null,
+  mgId: string | null = null,
+  group = GROUP,
+  status: Session['status'] = 'active',
+): Promise<Session> {
   const session: Session = {
     id,
-    agent_group_id: GROUP,
+    agent_group_id: group,
     messaging_group_id: mgId,
     thread_id: threadId,
     agent_provider: null,
-    status: 'active',
+    status,
     container_status: 'stopped',
     last_active: null,
     created_at: NOW,
   };
   await createSession(session);
-  initSessionFolder(GROUP, id);
+  initSessionFolder(group, id);
   return session;
 }
 
@@ -70,6 +76,21 @@ function addTaskRow(sessionId: string, channelType: string, platformId: string, 
     db.close();
   }
 }
+
+/** A dispatched task row the way `ncl tasks dispatch` writes one from a chat-less caller: no route, an origin. */
+function addDispatchRow(sessionId: string, originSessionId: string | null, group = GROUP): void {
+  const db = openInboundDb(inboundDbPath(group, sessionId));
+  try {
+    db.prepare(
+      `INSERT INTO messages_in (id, seq, timestamp, status, tries, kind, channel_type, platform_id, content)
+       VALUES ('dispatch-2', 2, ?, 'pending', 0, 'task', NULL, NULL, ?)`,
+    ).run(NOW, JSON.stringify({ prompt: 'x', originSessionId }));
+  } finally {
+    db.close();
+  }
+}
+
+const dispatchThread = (n: number) => taskThreadId(`dispatch-${String(n).padStart(64, 'a')}`);
 
 beforeEach(async () => {
   fs.rmSync(TEST_DIR, { recursive: true, force: true });
@@ -168,5 +189,90 @@ describe('resolveSlackSafetyMessagingGroupId', () => {
   it('fail-closes on a non-task session with no messaging group (admin shell)', async () => {
     const s = await makeSession('sess-admin', null);
     expect(await resolveSlackSafetyMessagingGroupId(s)).toBeNull();
+  });
+
+  describe('a route-less dispatched session is judged by the session that dispatched it', () => {
+    it('inherits the subject of a task-session origin that posts to an owner-safe destination', async () => {
+      await makeSession('sess-series', taskThreadId('watch-1'));
+      addTaskRow('sess-series', 'discord', DM_PLATFORM);
+      const child = await makeSession('sess-child', dispatchThread(1));
+      addDispatchRow('sess-child', 'sess-series');
+      expect(await resolveSlackSafetyMessagingGroupId(child)).toBe('mg-dm');
+    });
+
+    it("inherits a chat origin's messaging group", async () => {
+      await makeSession('sess-origin-chat', 'discord:1:chan:7', 'mg-chan');
+      const child = await makeSession('sess-child-chat', dispatchThread(2));
+      addDispatchRow('sess-child-chat', 'sess-origin-chat');
+      expect(await resolveSlackSafetyMessagingGroupId(child)).toBe('mg-chan');
+    });
+
+    it('keeps its own route over its origin when it has one', async () => {
+      await makeSession('sess-origin-dm', 'discord:1:dm:1', 'mg-dm');
+      const child = await makeSession('sess-routed', dispatchThread(3));
+      addTaskRow('sess-routed', 'discord', CHANNEL_PLATFORM, 4);
+      addDispatchRow('sess-routed', 'sess-origin-dm');
+      expect(await resolveSlackSafetyMessagingGroupId(child)).toBe('mg-chan');
+    });
+
+    it('re-judges the origin on every call, so closing it closes the child', async () => {
+      await makeSession('sess-live', 'discord:1:dm:2', 'mg-dm');
+      const child = await makeSession('sess-child-live', dispatchThread(4));
+      addDispatchRow('sess-child-live', 'sess-live');
+      expect(await resolveSlackSafetyMessagingGroupId(child)).toBe('mg-dm');
+      const { updateSession } = await import('../../db/sessions.js');
+      await updateSession('sess-live', { status: 'closed' });
+      expect(await resolveSlackSafetyMessagingGroupId(child)).toBeNull();
+    });
+
+    it.each([
+      ['no origin recorded', null],
+      ['an origin that does not exist', 'sess-gone'],
+      ['a closed origin', 'sess-closed'],
+      ['an origin in another agent group', 'sess-foreign'],
+    ])('fail-closes on %s', async (_label, origin) => {
+      await createAgentGroup({ id: 'ag-other', name: 'o', folder: 'ag-other', agent_provider: null, created_at: NOW });
+      await makeSession('sess-closed', 'discord:1:dm:3', 'mg-dm', GROUP, 'closed');
+      await makeSession('sess-foreign', 'discord:1:dm:4', 'mg-dm', 'ag-other');
+      const child = await makeSession('sess-child-x', dispatchThread(5));
+      addDispatchRow('sess-child-x', origin);
+      expect(await resolveSlackSafetyMessagingGroupId(child)).toBeNull();
+    });
+
+    it('stops inheriting when another task row in the session names a different origin', async () => {
+      await makeSession('sess-author2', 'discord:1:dm:8', 'mg-dm');
+      const child = await makeSession('sess-two-events', dispatchThread(10));
+      addDispatchRow('sess-two-events', 'sess-other');
+      const db = openInboundDb(inboundDbPath(GROUP, 'sess-two-events'));
+      try {
+        db.prepare(
+          `INSERT INTO messages_in (id, seq, timestamp, status, tries, kind, content)
+           VALUES ('dispatch-4', 40, ?, 'pending', 0, 'task', ?)`,
+        ).run(NOW, JSON.stringify({ prompt: 'y', originSessionId: 'sess-author2' }));
+      } finally {
+        db.close();
+      }
+      expect(await resolveSlackSafetyMessagingGroupId(child)).toBeNull();
+    });
+
+    it('does not inherit for a scheduled series, only for a dispatch', async () => {
+      await makeSession('sess-origin-dm2', 'discord:1:dm:5', 'mg-dm');
+      const series = await makeSession('sess-sched', taskThreadId('created-from-chat-1'));
+      addDispatchRow('sess-sched', 'sess-origin-dm2');
+      expect(await resolveSlackSafetyMessagingGroupId(series)).toBeNull();
+    });
+
+    it('stops after two hops', async () => {
+      await makeSession('sess-root', 'discord:1:dm:6', 'mg-dm');
+      const hop1 = await makeSession('sess-hop1', dispatchThread(6));
+      addDispatchRow('sess-hop1', 'sess-root');
+      const hop2 = await makeSession('sess-hop2', dispatchThread(7));
+      addDispatchRow('sess-hop2', 'sess-hop1');
+      const hop3 = await makeSession('sess-hop3', dispatchThread(8));
+      addDispatchRow('sess-hop3', 'sess-hop2');
+      expect(await resolveSlackSafetyMessagingGroupId(hop1)).toBe('mg-dm');
+      expect(await resolveSlackSafetyMessagingGroupId(hop2)).toBe('mg-dm');
+      expect(await resolveSlackSafetyMessagingGroupId(hop3)).toBeNull();
+    });
   });
 });

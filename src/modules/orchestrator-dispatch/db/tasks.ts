@@ -230,11 +230,13 @@ export async function flagNeedsInput(taskId: string, question: string | null): P
   const result = await getDb().run(
     `UPDATE tasks
           SET needs_input = 1,
-              steer_question = ?
+              steer_question = ?,
+              needs_input_at = ?
         WHERE task_id = ?
           AND status = 'running'
           AND (needs_input = 0 OR steer_question IS NOT ?)`,
     question,
+    new Date().toISOString(),
     taskId,
     question,
   );

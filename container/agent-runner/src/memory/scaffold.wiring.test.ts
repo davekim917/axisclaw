@@ -7,7 +7,7 @@ import path from 'path';
 // /workspace/agent/container.json and enters the poll loop), so the guard is
 // structural: call + import must both be present in the real entry point.
 describe('memory scaffold boot wiring', () => {
-  const indexSrc = fs.readFileSync(path.join(import.meta.dir, '..', 'index.ts'), 'utf-8');
+  const indexSrc = fs.readFileSync(path.join(import.meta.dir, '..', 'runner-main.ts'), 'utf-8');
 
   it('scaffolds memory unconditionally in main()', () => {
     expect(indexSrc).toMatch(/\n\s*ensureMemoryScaffold\(\);/);

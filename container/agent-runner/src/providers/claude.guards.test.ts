@@ -20,14 +20,17 @@ import * as messagesOut from '../db/messages-out.js';
 import * as sessionRouting from '../db/session-routing.js';
 import * as deliveryAcks from '../db/delivery-acks.js';
 import { allowSubprocess, resetHermeticityAllowances } from '../test-hermeticity.js';
+import { resetGuardCorePathsForTest, setGuardCorePathsForTest } from '../guard-core-paths.js';
+import { STUB_DRAFT_BINDING, stubDraftCheck } from './__test-fixtures__/email-gate-core-stub.js';
 
-// Fixture core paths — claude.ts resolves these via NANOCLAW_DESTRUCTIVE_GUARD_CORE
-// (block-destructive) and NANOCLAW_EMAIL_GATE_CORE (email).
+// Fixture core paths, handed to claude.ts through setGuardCorePathsForTest.
 const STUB_CORE = new URL('./__test-fixtures__/guard-core-stub.ts', import.meta.url).pathname;
 const BROKEN_CORE = new URL('./__test-fixtures__/guard-core-broken.ts', import.meta.url).pathname;
 const THROWING_CORE = new URL('./__test-fixtures__/guard-core-throwing.ts', import.meta.url).pathname;
 const EMAIL_STUB_CORE = new URL('./__test-fixtures__/email-gate-core-stub.ts', import.meta.url).pathname;
 const EMAIL_MALFORMED_CORE = new URL('./__test-fixtures__/email-gate-core-malformed.ts', import.meta.url).pathname;
+const EMAIL_NO_DRAFT_CHECK_CORE = new URL('./__test-fixtures__/email-gate-core-no-draft-check.ts', import.meta.url)
+  .pathname;
 
 const EMPTY_CTX = {} as Parameters<HookCallback>[1];
 const EMPTY_OPTS = {} as Parameters<HookCallback>[2];
@@ -66,14 +69,12 @@ async function runRewriteHook(command: string): Promise<string> {
 
 // ── E1: createSelfApprovalBlockHook delegates to the core ──
 describe('E1 createSelfApprovalBlockHook', () => {
-  const savedGuard = process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE;
   afterEach(() => {
-    if (savedGuard === undefined) delete process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE;
-    else process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = savedGuard;
+    resetGuardCorePathsForTest();
   });
 
   it('test_claude_self_approval_blocks_via_core', async () => {
-    process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = STUB_CORE;
+    setGuardCorePathsForTest({ destructive: STUB_CORE });
     // The stub blocks on STUB_SELF_APPROVAL with a distinct reason, proving the
     // verdict came from the delegated core (not the inline fallback regex, which
     // keys on `.claude-destructive-gate`).
@@ -83,7 +84,7 @@ describe('E1 createSelfApprovalBlockHook', () => {
   });
 
   it('test_claude_self_approval_fallback_blocks_when_core_absent', async () => {
-    process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = '/nonexistent/guard-core.ts';
+    setGuardCorePathsForTest({ destructive: '/nonexistent/guard-core.ts' });
     // Core import fails → inline fail-closed fallback blocks the marker.
     const r = await runBashHook(createSelfApprovalBlockHook(), 'touch .claude-destructive-gate');
     expect(r.permissionDecision).toBe('deny');
@@ -91,19 +92,19 @@ describe('E1 createSelfApprovalBlockHook', () => {
   });
 
   it('falls back (fail-closed) when the core export is malformed', async () => {
-    process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = BROKEN_CORE;
+    setGuardCorePathsForTest({ destructive: BROKEN_CORE });
     const r = await runBashHook(createSelfApprovalBlockHook(), 'echo > .claude-destructive-gate');
     expect(r.permissionDecision).toBe('deny');
   });
 
   it('falls back (fail-closed) when the core evaluator throws', async () => {
-    process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = THROWING_CORE;
+    setGuardCorePathsForTest({ destructive: THROWING_CORE });
     const r = await runBashHook(createSelfApprovalBlockHook(), 'rm -f .claude-destructive-gate');
     expect(r.permissionDecision).toBe('deny');
   });
 
   it('allows a benign command via the core', async () => {
-    process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = STUB_CORE;
+    setGuardCorePathsForTest({ destructive: STUB_CORE });
     const r = await runBashHook(createSelfApprovalBlockHook(), 'ls -la');
     expect(r.permissionDecision).toBeUndefined();
   });
@@ -119,14 +120,12 @@ describe('E1 createSelfApprovalBlockHook', () => {
 
 // ── E2: createBlockSnowflakeConnectorHook delegates ──
 describe('E2 createBlockSnowflakeConnectorHook', () => {
-  const savedGuard = process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE;
   afterEach(() => {
-    if (savedGuard === undefined) delete process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE;
-    else process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = savedGuard;
+    resetGuardCorePathsForTest();
   });
 
   it('test_claude_snowflake_blocks_via_core', async () => {
-    process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = STUB_CORE;
+    setGuardCorePathsForTest({ destructive: STUB_CORE });
     const r = await runBashHook(createBlockSnowflakeConnectorHook(), 'echo STUB_SNOWFLAKE');
     expect(r.permissionDecision).toBe('deny');
     expect(r.permissionDecisionReason).toContain('STUB-CORE: snowflake connector blocked');
@@ -135,17 +134,17 @@ describe('E2 createBlockSnowflakeConnectorHook', () => {
   it('test_claude_snowflake_allows_snow_cli', async () => {
     // `snow sql` is NOT the python connector — neither the core stub nor the
     // inline fallback should block it. Verified under both core states.
-    process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = STUB_CORE;
+    setGuardCorePathsForTest({ destructive: STUB_CORE });
     const viaCore = await runBashHook(createBlockSnowflakeConnectorHook(), "snow sql -q 'select 1'");
     expect(viaCore.permissionDecision).toBeUndefined();
 
-    process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = '/nonexistent/guard-core.ts';
+    setGuardCorePathsForTest({ destructive: '/nonexistent/guard-core.ts' });
     const viaFallback = await runBashHook(createBlockSnowflakeConnectorHook(), "snow sql -q 'select 1'");
     expect(viaFallback.permissionDecision).toBeUndefined();
   });
 
   it('test_claude_snowflake_fallback_when_core_absent', async () => {
-    process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = '/nonexistent/guard-core.ts';
+    setGuardCorePathsForTest({ destructive: '/nonexistent/guard-core.ts' });
     // Inline fallback blocks the python snowflake.connector form.
     const r = await runBashHook(createBlockSnowflakeConnectorHook(), 'python -c "import snowflake.connector"');
     expect(r.permissionDecision).toBe('deny');
@@ -153,7 +152,7 @@ describe('E2 createBlockSnowflakeConnectorHook', () => {
   });
 
   it('falls back (fail-closed) when the core evaluator throws', async () => {
-    process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = THROWING_CORE;
+    setGuardCorePathsForTest({ destructive: THROWING_CORE });
     const r = await runBashHook(createBlockSnowflakeConnectorHook(), 'python3 -c "import snowflake.connector"');
     expect(r.permissionDecision).toBe('deny');
   });
@@ -175,7 +174,6 @@ describe('E2 createBlockSnowflakeConnectorHook', () => {
 // deterministic AND leak-free. The hook's `await import('../db/...')` returns the
 // same cached namespace these spies patch.
 describe('E3 createEmailGateHook', () => {
-  const savedEmail = process.env.NANOCLAW_EMAIL_GATE_CORE;
   const savedSched = process.env.NANOCLAW_IS_SCHEDULED_TASK;
 
   let staged: Array<{ id: string } & Record<string, unknown>>;
@@ -215,16 +213,15 @@ describe('E3 createEmailGateHook', () => {
 
   afterEach(() => {
     for (const s of spies) s.mockRestore();
-    if (savedEmail === undefined) delete process.env.NANOCLAW_EMAIL_GATE_CORE;
-    else process.env.NANOCLAW_EMAIL_GATE_CORE = savedEmail;
+    resetGuardCorePathsForTest();
     if (savedSched === undefined) delete process.env.NANOCLAW_IS_SCHEDULED_TASK;
     else process.env.NANOCLAW_IS_SCHEDULED_TASK = savedSched;
   });
 
-  const gateCard = () => staged.find((c) => c.action === 'request_bash_gate');
+  const gateCard = () => staged.find((c) => c.action === 'request_send_gate');
 
   it('test_claude_email_gate_verdict_from_core', async () => {
-    process.env.NANOCLAW_EMAIL_GATE_CORE = EMAIL_STUB_CORE;
+    setGuardCorePathsForTest({ emailGate: EMAIL_STUB_CORE });
     delete process.env.NANOCLAW_IS_SCHEDULED_TASK;
     ackToReturn = { status: 'delivered' };
     const r = await runBashHook(
@@ -242,8 +239,27 @@ describe('E3 createEmailGateHook', () => {
     expect(card!.command).toBe('gws gmail +send STUB_EMAIL_GATE --to person8@fixture1.example.com');
   });
 
+  it("stages the core's pure-send mark, and none when the core gives none", async () => {
+    setGuardCorePathsForTest({ emailGate: EMAIL_STUB_CORE });
+    delete process.env.NANOCLAW_IS_SCHEDULED_TASK;
+    await runBashHook(createEmailGateHook(), 'gws gmail +send STUB_PURE_SEND --to person8@fixture1.example.com');
+    await runBashHook(createEmailGateHook(), 'gws gmail +send STUB_EMAIL_GATE --to person8@fixture1.example.com');
+    expect(staged.map((c) => c.pureSend)).toEqual([true, undefined]);
+  });
+
+  it("refuses a send the core says shares its command, with the core's reason and no card", async () => {
+    setGuardCorePathsForTest({ emailGate: EMAIL_STUB_CORE });
+    delete process.env.NANOCLAW_IS_SCHEDULED_TASK;
+    const r = await runBashHook(createEmailGateHook(), 'gws gmail +send STUB_BUNDLE --to person8@fixture1.example.com');
+    expect([r.permissionDecision, r.permissionDecisionReason, staged.length]).toEqual([
+      'deny',
+      'STUB-CORE run the send alone',
+      0,
+    ]);
+  });
+
   it('test_claude_email_gate_preserves_async_ack', async () => {
-    process.env.NANOCLAW_EMAIL_GATE_CORE = EMAIL_STUB_CORE;
+    setGuardCorePathsForTest({ emailGate: EMAIL_STUB_CORE });
     delete process.env.NANOCLAW_IS_SCHEDULED_TASK;
     // Admin DECLINES → the async round-trip resolves to failed → hook denies.
     ackToReturn = { status: 'failed', error: 'admin declined' };
@@ -251,18 +267,18 @@ describe('E3 createEmailGateHook', () => {
       createEmailGateHook(),
       'gws gmail +send STUB_EMAIL_GATE --to person8@fixture1.example.com',
     );
-    // Round-trip preserved: staged a request_bash_gate AND awaited its ack keyed
+    // Round-trip preserved: staged a request_send_gate AND awaited its ack keyed
     // on the same requestId (proving writeMessageOut → awaitDeliveryAck plumbing).
     const card = gateCard();
     expect(card).toBeDefined();
-    expect(card!.action).toBe('request_bash_gate');
+    expect(card!.action).toBe('request_send_gate');
     expect(ackedRequestId).toBe(card!.id);
     expect(r.permissionDecision).toBe('deny');
     expect(r.permissionDecisionReason).toContain('admin declined');
   });
 
   it('approved ack → allow (round-trip both directions)', async () => {
-    process.env.NANOCLAW_EMAIL_GATE_CORE = EMAIL_STUB_CORE;
+    setGuardCorePathsForTest({ emailGate: EMAIL_STUB_CORE });
     delete process.env.NANOCLAW_IS_SCHEDULED_TASK;
     ackToReturn = { status: 'delivered' };
     const r = await runBashHook(
@@ -274,7 +290,7 @@ describe('E3 createEmailGateHook', () => {
   });
 
   it('timeout ack (null) → deny', async () => {
-    process.env.NANOCLAW_EMAIL_GATE_CORE = EMAIL_STUB_CORE;
+    setGuardCorePathsForTest({ emailGate: EMAIL_STUB_CORE });
     delete process.env.NANOCLAW_IS_SCHEDULED_TASK;
     ackToReturn = null; // awaitDeliveryAck timed out
     const r = await runBashHook(
@@ -286,7 +302,7 @@ describe('E3 createEmailGateHook', () => {
   });
 
   it('scheduled tasks bypass the gate (verdict allow, no staging)', async () => {
-    process.env.NANOCLAW_EMAIL_GATE_CORE = EMAIL_STUB_CORE;
+    setGuardCorePathsForTest({ emailGate: EMAIL_STUB_CORE });
     process.env.NANOCLAW_IS_SCHEDULED_TASK = '1';
     const r = await runBashHook(
       createEmailGateHook(),
@@ -297,8 +313,65 @@ describe('E3 createEmailGateHook', () => {
     expect(ackedRequestId).toBeNull(); // and no ack round-trip
   });
 
+  describe('a send of a stored draft the card showed', () => {
+    const DRAFT_SEND = 'gws gmail users drafts send STUB_DRAFT_SEND';
+    beforeEach(() => {
+      setGuardCorePathsForTest({ emailGate: EMAIL_STUB_CORE });
+      delete process.env.NANOCLAW_IS_SCHEDULED_TASK;
+      stubDraftCheck.answer = null;
+      stubDraftCheck.throws = false;
+      stubDraftCheck.calls = [];
+    });
+
+    it('goes ahead once approved while the draft is still the version shown', async () => {
+      const r = await runBashHook(createEmailGateHook(), DRAFT_SEND);
+      expect(r.permissionDecision).toBeUndefined();
+      expect(stubDraftCheck.calls).toEqual([STUB_DRAFT_BINDING]);
+    });
+
+    it("is refused with the core's reason when the draft changed after the card", async () => {
+      stubDraftCheck.answer = 'STUB-CORE draft was edited';
+      const r = await runBashHook(createEmailGateHook(), DRAFT_SEND);
+      expect([r.permissionDecision, r.permissionDecisionReason]).toEqual(['deny', 'STUB-CORE draft was edited']);
+    });
+
+    it('is refused when the re-read throws', async () => {
+      stubDraftCheck.throws = true;
+      const r = await runBashHook(createEmailGateHook(), DRAFT_SEND);
+      expect(r.permissionDecision).toBe('deny');
+      expect(r.permissionDecisionReason).toContain('could not be re-read');
+    });
+
+    it('is not re-read when the approver declines', async () => {
+      ackToReturn = { status: 'failed', error: 'admin declined' };
+      const r = await runBashHook(createEmailGateHook(), DRAFT_SEND);
+      expect(r.permissionDecision).toBe('deny');
+      expect(stubDraftCheck.calls).toEqual([]);
+    });
+
+    it('is refused when the core binds a draft but offers no way to re-read it', async () => {
+      setGuardCorePathsForTest({ emailGate: EMAIL_NO_DRAFT_CHECK_CORE });
+      const r = await runBashHook(createEmailGateHook(), DRAFT_SEND);
+      expect(gateCard()!.label).toBe('NO-CHECK email label');
+      expect(r.permissionDecision).toBe('deny');
+      expect(r.permissionDecisionReason).toContain('could not be re-read');
+    });
+
+    it('without the core, still gates with the card it had before and binds nothing', async () => {
+      setGuardCorePathsForTest({ emailGate: '/nonexistent/email-gate-core.ts' });
+      const r = await runBashHook(
+        createEmailGateHook(),
+        `GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE=/home/node/.config/gws/accounts/team-inbox.json gws gmail users drafts send --params '{"userId":"me"}' --json '{"id":"r-stub-draft"}' 2>&1 | tail -15`,
+      );
+      expect(gateCard()!.label).toBe('Email send to unknown recipient');
+      expect(gateCard()!.summary).toBe('*From:* team-inbox\n*To:* unknown recipient');
+      expect(r.permissionDecision).toBeUndefined();
+      expect(stubDraftCheck.calls).toEqual([]);
+    });
+  });
+
   it('test_claude_email_gate_fallback_when_core_absent', async () => {
-    process.env.NANOCLAW_EMAIL_GATE_CORE = '/nonexistent/email-gate-core.ts';
+    setGuardCorePathsForTest({ emailGate: '/nonexistent/email-gate-core.ts' });
     delete process.env.NANOCLAW_IS_SCHEDULED_TASK;
     ackToReturn = { status: 'delivered' };
     // Core import fails → inline fallback still gates a real gws send and runs
@@ -317,7 +390,7 @@ describe('E3 createEmailGateHook', () => {
   });
 
   it('inline fallback: a real --dry-run argv token bypasses the gate (allow, no staging)', async () => {
-    process.env.NANOCLAW_EMAIL_GATE_CORE = '/nonexistent/email-gate-core.ts';
+    setGuardCorePathsForTest({ emailGate: '/nonexistent/email-gate-core.ts' });
     delete process.env.NANOCLAW_IS_SCHEDULED_TASK;
     // --dry-run as a genuine argv token in a simple gws command → bypass.
     const r = await runBashHook(
@@ -329,20 +402,47 @@ describe('E3 createEmailGateHook', () => {
     expect(ackedRequestId).toBeNull(); // and no ack round-trip
   });
 
-  it('inline fallback: the bounded gws help probe bypasses without staging', async () => {
-    process.env.NANOCLAW_EMAIL_GATE_CORE = '/nonexistent/email-gate-core.ts';
+  it('inline fallback: one gws call of plain words with a real no-send flag is excused', async () => {
+    setGuardCorePathsForTest({ emailGate: '/nonexistent/email-gate-core.ts' });
     delete process.env.NANOCLAW_IS_SCHEDULED_TASK;
-    const r = await runBashHook(
-      createEmailGateHook(),
+    for (const command of [
+      'gws gmail +send --to a@example.com --subject hi --body hello --dry-run',
+      'gws gmail +send --to a@example.com --help',
+      `gws gmail +send --to a@example.com --subject "Weekly notes" --body 'see you then' --dry-run`,
+    ]) {
+      staged.length = 0;
+      const r = await runBashHook(createEmailGateHook(), command);
+      expect([command, r.permissionDecision, gateCard()]).toEqual([command, undefined, undefined]);
+    }
+  });
+
+  it('inline fallback: any shell syntax beside a send, however harmless, means a card, not an excuse', async () => {
+    setGuardCorePathsForTest({ emailGate: '/nonexistent/email-gate-core.ts' });
+    delete process.env.NANOCLAW_IS_SCHEDULED_TASK;
+    ackToReturn = { status: 'delivered' };
+    const send = ['gws', 'gmail', '+' + 'send'].join(' ');
+    const body = `${send} --to victim@example.com --subject Hi --body`;
+    const slash = String.fromCharCode(92);
+    for (const command of [
+      `${body} "'"; ${body} "'" --dry-run`,
+      `review_a[$(${slash}${body} Hi)]=1; ${send} --help`,
+      `${body} "\${review_x:=${slash}044${slash}050${body} Hi${slash}051}\${review_y:=\${review_x@E}}\${review_y@P}" --dry-run`,
+      `gws gmail +send --to a@example.com --body "'$(gws gmail +send --to b@example.com --body hi)'" --dry-run`,
       'export GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE=/home/node/.config/gws/accounts/primary.json && gws gmail users messages send --help 2>&1 | head -60',
-    );
-    expect(r.permissionDecision).toBeUndefined();
-    expect(gateCard()).toBeUndefined();
-    expect(ackedRequestId).toBeNull();
+      'GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE=/home/node/.config/gws/accounts/x.json gws gmail +send --to a@example.com --body z --dry-run',
+      `gws gmail +send --to a@example.com --body $'cost is 5' --dry-run`,
+      'gws gmail +send --to a@example.com --body "cost is $5" --dry-run',
+      `gws gmail +send --to a@example.com --body "it's" --dry-run`,
+      'gws gmail +send --to a@example.com --body x "--" --dry-run',
+    ]) {
+      staged.length = 0;
+      await runBashHook(createEmailGateHook(), command);
+      expect([command, gateCard() !== undefined]).toEqual([command, true]);
+    }
   });
 
   it('inline fallback: a bypass flag after a redirection does NOT bypass — it gates (QA codex re-pass #3)', async () => {
-    process.env.NANOCLAW_EMAIL_GATE_CORE = '/nonexistent/email-gate-core.ts';
+    setGuardCorePathsForTest({ emailGate: '/nonexistent/email-gate-core.ts' });
     delete process.env.NANOCLAW_IS_SCHEDULED_TASK;
     ackToReturn = { status: 'delivered' };
     // `<<< --dry-run` makes --dry-run a here-string operand, not gws argv — the
@@ -360,7 +460,7 @@ describe('E3 createEmailGateHook', () => {
   });
 
   it('inline fallback: a bypass flag after a # comment does NOT bypass — it gates (QA codex re-pass #4)', async () => {
-    process.env.NANOCLAW_EMAIL_GATE_CORE = '/nonexistent/email-gate-core.ts';
+    setGuardCorePathsForTest({ emailGate: '/nonexistent/email-gate-core.ts' });
     delete process.env.NANOCLAW_IS_SCHEDULED_TASK;
     ackToReturn = { status: 'delivered' };
     // `# --dry-run` is a bash comment — gws sends without --dry-run. The `#`
@@ -377,7 +477,7 @@ describe('E3 createEmailGateHook', () => {
   });
 
   it('inline fallback: a fake first send segment does NOT suppress the gate on a later real send (QA codex re-pass #4)', async () => {
-    process.env.NANOCLAW_EMAIL_GATE_CORE = '/nonexistent/email-gate-core.ts';
+    setGuardCorePathsForTest({ emailGate: '/nonexistent/email-gate-core.ts' });
     delete process.env.NANOCLAW_IS_SCHEDULED_TASK;
     ackToReturn = { status: 'delivered' };
     // First segment is a harmless `:` no-op carrying --dry-run; the real send is
@@ -395,7 +495,7 @@ describe('E3 createEmailGateHook', () => {
   });
 
   it('inline fallback: a wrapper prefix (exec -a) does NOT bypass — it gates (QA codex re-pass #8)', async () => {
-    process.env.NANOCLAW_EMAIL_GATE_CORE = '/nonexistent/email-gate-core.ts';
+    setGuardCorePathsForTest({ emailGate: '/nonexistent/email-gate-core.ts' });
     delete process.env.NANOCLAW_IS_SCHEDULED_TASK;
     ackToReturn = { status: 'delivered' };
     // `exec -a --dry-run gws …` makes --dry-run the argv0 name, not a gws flag —
@@ -412,7 +512,7 @@ describe('E3 createEmailGateHook', () => {
   });
 
   it('inline fallback: a bypass flag consumed as a prior option value does NOT bypass — it gates (QA codex re-pass #8)', async () => {
-    process.env.NANOCLAW_EMAIL_GATE_CORE = '/nonexistent/email-gate-core.ts';
+    setGuardCorePathsForTest({ emailGate: '/nonexistent/email-gate-core.ts' });
     delete process.env.NANOCLAW_IS_SCHEDULED_TASK;
     ackToReturn = { status: 'delivered' };
     // `--subject --dry-run` feeds --dry-run to --subject; gws sends.
@@ -427,20 +527,8 @@ describe('E3 createEmailGateHook', () => {
     expect(r.permissionDecision).toBeUndefined();
   });
 
-  it('inline fallback: the real creds-prefix dry-run form still bypasses (no over-block, codex #8)', async () => {
-    process.env.NANOCLAW_EMAIL_GATE_CORE = '/nonexistent/email-gate-core.ts';
-    delete process.env.NANOCLAW_IS_SCHEDULED_TASK;
-    const r = await runBashHook(
-      createEmailGateHook(),
-      'GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE=/home/node/.config/gws/accounts/x.json gws gmail +send --to person8@fixture1.example.com --body z --dry-run',
-    );
-    expect(r.permissionDecision).toBeUndefined();
-    expect(gateCard()).toBeUndefined(); // bypassed → nothing staged
-    expect(ackedRequestId).toBeNull();
-  });
-
   it('inline fallback: adjacent-quote concatenation does NOT manufacture a bypass — it gates (QA codex re-pass #7)', async () => {
-    process.env.NANOCLAW_EMAIL_GATE_CORE = '/nonexistent/email-gate-core.ts';
+    setGuardCorePathsForTest({ emailGate: '/nonexistent/email-gate-core.ts' });
     delete process.env.NANOCLAW_IS_SCHEDULED_TASK;
     ackToReturn = { status: 'delivered' };
     // bash concatenates `'x'--dry-run` into the word `x--dry-run` (no real flag,
@@ -458,7 +546,7 @@ describe('E3 createEmailGateHook', () => {
   });
 
   it('inline fallback: backslash-escaped whitespace before a bypass flag does NOT bypass — it gates (QA codex re-pass #6)', async () => {
-    process.env.NANOCLAW_EMAIL_GATE_CORE = '/nonexistent/email-gate-core.ts';
+    setGuardCorePathsForTest({ emailGate: '/nonexistent/email-gate-core.ts' });
     delete process.env.NANOCLAW_IS_SCHEDULED_TASK;
     ackToReturn = { status: 'delivered' };
     // `\ ` is an escaped (literal) space — bash joins it into the body value, so
@@ -476,7 +564,7 @@ describe('E3 createEmailGateHook', () => {
   });
 
   it('inline fallback: form-feed (non-IFS whitespace) before a bypass flag does NOT bypass — it gates (QA codex re-pass #6)', async () => {
-    process.env.NANOCLAW_EMAIL_GATE_CORE = '/nonexistent/email-gate-core.ts';
+    setGuardCorePathsForTest({ emailGate: '/nonexistent/email-gate-core.ts' });
     delete process.env.NANOCLAW_IS_SCHEDULED_TASK;
     ackToReturn = { status: 'delivered' };
     // bash keeps `x\f--dry-run` as one word (sends); the inline fallback splits
@@ -493,7 +581,7 @@ describe('E3 createEmailGateHook', () => {
   });
 
   it('inline fallback: a newline-separated decoy does NOT suppress the gate on a later real send (QA codex re-pass #5)', async () => {
-    process.env.NANOCLAW_EMAIL_GATE_CORE = '/nonexistent/email-gate-core.ts';
+    setGuardCorePathsForTest({ emailGate: '/nonexistent/email-gate-core.ts' });
     delete process.env.NANOCLAW_IS_SCHEDULED_TASK;
     ackToReturn = { status: 'delivered' };
     // Decoy --dry-run on line 1; real send on line 2. The newline is a command
@@ -510,20 +598,8 @@ describe('E3 createEmailGateHook', () => {
     expect(r.permissionDecision).toBeUndefined();
   });
 
-  it("inline fallback: a real --dry-run with ANSI-C $'…' body still bypasses (QA codex re-pass #4)", async () => {
-    process.env.NANOCLAW_EMAIL_GATE_CORE = '/nonexistent/email-gate-core.ts';
-    delete process.env.NANOCLAW_IS_SCHEDULED_TASK;
-    const r = await runBashHook(
-      createEmailGateHook(),
-      `gws gmail +send --to person8@fixture1.example.com --body $'cost is $5' --dry-run`,
-    );
-    expect(r.permissionDecision).toBeUndefined();
-    expect(gateCard()).toBeUndefined(); // bypassed → nothing staged
-    expect(ackedRequestId).toBeNull();
-  });
-
   it('inline fallback: a bypass flag inside quoted body content does NOT bypass — it gates (QA codex-#2)', async () => {
-    process.env.NANOCLAW_EMAIL_GATE_CORE = '/nonexistent/email-gate-core.ts';
+    setGuardCorePathsForTest({ emailGate: '/nonexistent/email-gate-core.ts' });
     delete process.env.NANOCLAW_IS_SCHEDULED_TASK;
     ackToReturn = { status: 'delivered' };
     // --dry-run lives only inside the quoted --body; it is NOT a real argv flag.
@@ -539,7 +615,7 @@ describe('E3 createEmailGateHook', () => {
   });
 
   it('malformed core verdict falls back to inline fail-closed (gates, not allow) — codex #126 F2', async () => {
-    process.env.NANOCLAW_EMAIL_GATE_CORE = EMAIL_MALFORMED_CORE;
+    setGuardCorePathsForTest({ emailGate: EMAIL_MALFORMED_CORE });
     delete process.env.NANOCLAW_IS_SCHEDULED_TASK;
     ackToReturn = { status: 'delivered' };
     // The core returns {action:'bogus'} — untrusted. The hook must NOT treat the
@@ -568,7 +644,7 @@ describe('E3 createEmailGateHook', () => {
     const saved = process.env.ANTHROPIC_API_KEY;
     process.env.ANTHROPIC_API_KEY = 'sk-test';
     try {
-      process.env.NANOCLAW_EMAIL_GATE_CORE = '/nonexistent/email-gate-core.ts'; // inline path
+      setGuardCorePathsForTest({ emailGate: '/nonexistent/email-gate-core.ts' }); // inline path
       delete process.env.NANOCLAW_IS_SCHEDULED_TASK;
 
       const emailCommand = 'gws gmail +send --to person8@fixture1.example.com --subject hi --body x --dry-run';
@@ -603,7 +679,7 @@ describe('E3 createEmailGateHook', () => {
   });
 
   it('non-email commands are a no-op (allow, no staging)', async () => {
-    process.env.NANOCLAW_EMAIL_GATE_CORE = EMAIL_STUB_CORE;
+    setGuardCorePathsForTest({ emailGate: EMAIL_STUB_CORE });
     const r = await runBashHook(createEmailGateHook(), 'ls -la');
     expect(r.permissionDecision).toBeUndefined();
     expect(staged).toHaveLength(0);
@@ -623,14 +699,12 @@ describe('E3 createEmailGateHook', () => {
 // Claude guard factory directly and asserts the migrated guards + uniform
 // fail-closed direction. The git-clone guard is included for parity.
 describe('E6 claude dispatch — each guard', () => {
-  const savedGuard = process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE;
   afterEach(() => {
-    if (savedGuard === undefined) delete process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE;
-    else process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = savedGuard;
+    resetGuardCorePathsForTest();
   });
 
   it('test_claude_dispatch_each_guard', async () => {
-    process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = STUB_CORE;
+    setGuardCorePathsForTest({ destructive: STUB_CORE });
     type Case = { name: string; hook: HookCallback; block: string; allow: string };
     const cases: Case[] = [
       {
@@ -661,7 +735,7 @@ describe('E6 claude dispatch — each guard', () => {
   });
 
   it('every bash guard is fail-closed when its core export is malformed', async () => {
-    process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = BROKEN_CORE;
+    setGuardCorePathsForTest({ destructive: BROKEN_CORE });
     // Each guard must fall back to its inline policy and still BLOCK the marker.
     const selfApproval = await runBashHook(createSelfApprovalBlockHook(), 'touch .claude-destructive-gate');
     expect(selfApproval.permissionDecision).toBe('deny');
@@ -812,8 +886,6 @@ describe('createBashCommandRewriteHook: jest serialization', () => {
 // rather than staging a second card.
 describe('createEmailGateHook — one approval card per tool call', () => {
   const CLAIM_CORE = new URL('./__test-fixtures__/gate-claim-core-stub.ts', import.meta.url).pathname;
-  const savedEmail = process.env.NANOCLAW_EMAIL_GATE_CORE;
-  const savedGuard = process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE;
   const savedSched = process.env.NANOCLAW_IS_SCHEDULED_TASK;
 
   let staged: Array<{ id: string } & Record<string, unknown>>;
@@ -833,10 +905,13 @@ describe('createEmailGateHook — one approval card per tool call', () => {
 
   const GATED = 'gws gmail +send STUB_EMAIL_GATE --to person8@fixture1.example.com';
 
-  async function runWithToolUseId(toolUseId: string | undefined): Promise<{ permissionDecision?: string }> {
+  async function runWithToolUseId(
+    toolUseId: string | undefined,
+    command: string = GATED,
+  ): Promise<{ permissionDecision?: string }> {
     const input = {
       tool_name: 'Bash',
-      tool_input: { command: GATED },
+      tool_input: { command },
       ...(toolUseId ? { tool_use_id: toolUseId } : {}),
     } as unknown as PreToolUseHookInput;
     const out = await createEmailGateHook({ sharedApprovalClaim: true })(
@@ -863,8 +938,8 @@ describe('createEmailGateHook — one approval card per tool call', () => {
       peerAlreadyDecided: false,
       decidedChecks: [],
     };
-    process.env.NANOCLAW_EMAIL_GATE_CORE = EMAIL_STUB_CORE;
-    process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = CLAIM_CORE;
+    setGuardCorePathsForTest({ emailGate: EMAIL_STUB_CORE });
+    setGuardCorePathsForTest({ destructive: CLAIM_CORE });
     delete process.env.NANOCLAW_IS_SCHEDULED_TASK;
     resetGateClaimApiForTest();
     spies.push(
@@ -891,10 +966,7 @@ describe('createEmailGateHook — one approval card per tool call', () => {
   afterEach(() => {
     for (const s of spies) s.mockRestore();
     resetGateClaimApiForTest();
-    if (savedEmail === undefined) delete process.env.NANOCLAW_EMAIL_GATE_CORE;
-    else process.env.NANOCLAW_EMAIL_GATE_CORE = savedEmail;
-    if (savedGuard === undefined) delete process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE;
-    else process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = savedGuard;
+    resetGuardCorePathsForTest();
     if (savedSched === undefined) delete process.env.NANOCLAW_IS_SCHEDULED_TASK;
     else process.env.NANOCLAW_IS_SCHEDULED_TASK = savedSched;
   });
@@ -905,13 +977,13 @@ describe('createEmailGateHook — one approval card per tool call', () => {
     // them runs). A command-keyed claim produced two keys for one tool call and
     // both guards staged anyway — the exact behaviour the claim removes.
     await runWithToolUseId('exec-abc');
-    expect(rec().keyArgs).toEqual([['exec-abc', 'request_bash_gate']]);
+    expect(rec().keyArgs).toEqual([['exec-abc', 'request_send_gate']]);
   });
 
   it('as the claim OWNER, stages one card and publishes its requestId', async () => {
     await runWithToolUseId('exec-abc');
     expect(staged).toHaveLength(1);
-    expect(rec().published).toEqual([['key:exec-abc|request_bash_gate', staged[0].id as string]]);
+    expect(rec().published).toEqual([['key:exec-abc|request_send_gate', staged[0].id as string]]);
     expect(rec().abandoned).toEqual([]);
   });
 
@@ -921,6 +993,21 @@ describe('createEmailGateHook — one approval card per tool call', () => {
     expect(staged).toEqual([]);
     expect(ackedRequestIds).toEqual(['gate-peer-1']);
     expect(r.permissionDecision).toBeUndefined(); // peer approved → allow
+  });
+
+  it('a LOSER whose peer card was approved still refuses a stored draft edited since that card', async () => {
+    rec().peerRequestId = 'gate-peer-1';
+    stubDraftCheck.answer = 'STUB-CORE draft was edited';
+    stubDraftCheck.calls = [];
+    try {
+      const r = await runWithToolUseId('exec-abc', 'gws gmail users drafts send STUB_DRAFT_SEND');
+      expect(staged).toEqual([]);
+      expect(ackedRequestIds).toEqual(['gate-peer-1']);
+      expect(r.permissionDecision).toBe('deny');
+      expect(stubDraftCheck.calls).toEqual([STUB_DRAFT_BINDING]);
+    } finally {
+      stubDraftCheck.answer = null;
+    }
   });
 
   it('a LOSER honours the peer’s DENIAL rather than raising its own card', async () => {
@@ -987,7 +1074,7 @@ describe('createEmailGateHook — one approval card per tool call', () => {
       throw new Error('outbound.db unavailable');
     });
     await expect(runWithToolUseId('exec-abc')).rejects.toThrow(/outbound.db unavailable/);
-    expect(rec().abandoned).toEqual(['key:exec-abc|request_bash_gate']);
+    expect(rec().abandoned).toEqual(['key:exec-abc|request_send_gate']);
     expect(rec().published).toEqual([]);
   });
 });
@@ -1175,8 +1262,7 @@ describe('universal /dev/null stdin wrap', () => {
     const cmd = `echo 'foo; snow sql --query ""'`;
     // The empty-query deny hook is gone; no remaining Bash guard objects.
     expect((await import('./claude.js')).createBlockSnowflakeEmptyQueryHook).toBeUndefined();
-    const savedGuard = process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE;
-    process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = '/nonexistent/guard-core.ts';
+    setGuardCorePathsForTest({ destructive: '/nonexistent/guard-core.ts' });
     try {
       for (const hook of [
         createSelfApprovalBlockHook(),
@@ -1187,8 +1273,7 @@ describe('universal /dev/null stdin wrap', () => {
         expect((await runBashHook(hook, cmd)).permissionDecision).toBeUndefined();
       }
     } finally {
-      if (savedGuard === undefined) delete process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE;
-      else process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = savedGuard;
+      resetGuardCorePathsForTest();
     }
     const r = await run(await runRewriteHook(cmd));
     expect(r.out.trim()).toBe('foo; snow sql --query ""');

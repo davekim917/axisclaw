@@ -80,7 +80,10 @@ export function getDueWakePriority(db: Database.Database): 'interactive' | 'sche
  * insertion, scheduled rows from their fire time (so a valid multi-day wait
  * isn't expired as it comes due). Recurring rows are NEVER expired here: they
  * cross the cutoff the moment they come due, and reaping one loses the fire and
- * can strand the series. Returns the number expired.
+ * can strand the series. A `recall-<X>` row is never expired while X is live
+ * either: it carries X's `process_after`, and a workgroup runner will not run X
+ * without it. `closeOrphanRecallRows` retires it once X is terminal. Returns
+ * the number expired.
  */
 export function expireStalePending(db: Database.Database, maxAgeMs: number): number {
   migrateMessagesInTable(db);
@@ -95,6 +98,15 @@ export function expireStalePending(db: Database.Database, maxAgeMs: number): num
          AND (
            (process_after IS NULL AND datetime(timestamp) < datetime(?))
            OR (process_after IS NOT NULL AND datetime(process_after) < datetime(?))
+         )
+         AND NOT (
+           id >= 'recall-' AND id < 'recall.'
+           AND kind = 'system'
+           AND EXISTS (
+             SELECT 1 FROM messages_in AS target
+              WHERE target.id = substr(messages_in.id, 8)
+                AND target.status IN ('pending', 'paused', 'processing')
+           )
          )`,
     )
     .run(cutoffIso, cutoffIso);
@@ -141,7 +153,11 @@ export function syncProcessingAcks(inDb: Database.Database, outDb: Database.Data
     .prepare(`SELECT message_id, status FROM processing_ack WHERE status IN ${TERMINAL_ACK_SQL}`)
     .all() as Array<{ message_id: string; status: string }>;
 
+  // Acks are never deleted, so one UPDATE per ack would re-settle the session's whole history on every sweep.
   if (completed.length > 0) {
+    const unsettled = new Set(
+      inDb.prepare("SELECT id FROM messages_in WHERE status NOT IN ('completed', 'failed')").pluck().all() as string[],
+    );
     // A paused recurring row is skipped: the pause landed after the run, and
     // settling it here would let recurrence arm a pending successor. Recurrence
     // settles it instead (`getCompletedRecurring`), arming the successor paused.
@@ -152,7 +168,7 @@ export function syncProcessingAcks(inDb: Database.Database, outDb: Database.Data
     );
     inDb.transaction(() => {
       for (const { message_id, status } of completed) {
-        settleStmt.run(settledStatusForAck(status), message_id);
+        if (unsettled.has(message_id)) settleStmt.run(settledStatusForAck(status), message_id);
       }
     })();
   }

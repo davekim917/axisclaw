@@ -5,6 +5,7 @@
  * review socket into a general privileged process launcher.
  */
 export const CLAUDE_REVIEW_SOCKET_ENV = 'NANOCLAW_CLAUDE_REVIEW_SOCKET';
+export const ORIGINAL_CLAUDE_CLI = '/pnpm/claude-real';
 export const MAX_CLAUDE_REVIEW_PROMPT_BYTES = 32 * 1024 * 1024;
 export const MAX_CLAUDE_REVIEW_OUTPUT_BYTES = 16 * 1024 * 1024;
 const MAX_CLAUDE_REVIEW_CWD_BYTES = 4096;

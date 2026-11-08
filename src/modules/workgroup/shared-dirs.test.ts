@@ -1,3 +1,4 @@
+import { execFileSync } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -263,6 +264,133 @@ describe('reconcileWorkgroupSharedDirs', () => {
     expect(fs.readlinkSync(seedSources)).toBe('/workspace/workgroup/sources');
     expect(fs.existsSync(path.join(wgDir, 'sources', 'inbox', 'f.json'))).toBe(true);
   });
+
+  it('keeps a private seed dir whose name an agent also created in the shared tree', () => {
+    const wgDir = path.join(dataDir, 'workgroups', 'wgx');
+    const seedWork = path.join(groupsDir, 'wgx', 'workpad');
+    fs.mkdirSync(path.join(seedWork, 'drafts'), { recursive: true });
+    fs.writeFileSync(path.join(seedWork, 'notes.md'), 'seed notes');
+    fs.writeFileSync(path.join(seedWork, 'drafts', 'q3.sql'), 'select 1');
+    fs.mkdirSync(path.join(wgDir, 'workpad', 'label-run'), { recursive: true });
+    fs.writeFileSync(path.join(wgDir, 'workpad', 'label-run', 'out.csv'), 'a,b');
+
+    reconcileWorkgroupSharedDirs(db, { groupsDir, dataDir });
+
+    expect(fs.lstatSync(seedWork).isDirectory()).toBe(true);
+    expect(fs.readFileSync(path.join(seedWork, 'notes.md'), 'utf8')).toBe('seed notes');
+    expect(fs.readFileSync(path.join(seedWork, 'drafts', 'q3.sql'), 'utf8')).toBe('select 1');
+    expect(fs.readFileSync(path.join(wgDir, 'workpad', 'label-run', 'out.csv'), 'utf8')).toBe('a,b');
+  });
+
+  it('merges a shared seed dir into a different shared copy, setting aside only true collisions', () => {
+    const wgDir = path.join(dataDir, 'workgroups', 'wgx');
+    const seedSources = path.join(groupsDir, 'wgx', 'sources');
+    // `sources` is shared by rule, and the shared tree already has one with other content.
+    fs.writeFileSync(path.join(seedSources, 'inbox', 'only-in-seed.txt'), 'seed only');
+    fs.writeFileSync(path.join(seedSources, 'same.txt'), 'same');
+    fs.mkdirSync(path.join(seedSources, 'notes'), { recursive: true });
+    fs.writeFileSync(path.join(seedSources, 'notes', 'a.md'), 'note a');
+    fs.symlinkSync('inbox/f.json', path.join(seedSources, 'latest'));
+    fs.mkdirSync(path.join(seedSources, 'ext'), { recursive: true });
+    fs.writeFileSync(path.join(seedSources, 'ext', 'x.txt'), 'seed x');
+    execFileSync('mkfifo', [path.join(seedSources, 'pipe')]);
+    const outside = path.join(tmp, 'outside');
+    fs.mkdirSync(outside);
+    fs.mkdirSync(path.join(wgDir, 'sources', 'inbox'), { recursive: true });
+    fs.symlinkSync(outside, path.join(wgDir, 'sources', 'ext'));
+    fs.writeFileSync(path.join(wgDir, 'sources', 'inbox', 'f.json'), '{"differs":true}');
+    fs.writeFileSync(path.join(wgDir, 'sources', 'same.txt'), 'same');
+    fs.writeFileSync(path.join(wgDir, 'sources', 'notes'), 'a file where the seed has a dir');
+    fs.writeFileSync(path.join(wgDir, 'sources', 'agent.txt'), 'agent');
+
+    const [report] = reconcileWorkgroupSharedDirs(db, { groupsDir, dataDir });
+
+    const shared = path.join(wgDir, 'sources');
+    expect(fs.readFileSync(path.join(shared, 'inbox', 'only-in-seed.txt'), 'utf8')).toBe('seed only');
+    expect(fs.readlinkSync(path.join(shared, 'latest'))).toBe('inbox/f.json');
+    expect(fs.readFileSync(path.join(shared, 'inbox', 'f.json'), 'utf8')).toBe('{"differs":true}');
+    expect(fs.readFileSync(path.join(shared, 'notes'), 'utf8')).toBe('a file where the seed has a dir');
+    expect(fs.readFileSync(path.join(shared, 'agent.txt'), 'utf8')).toBe('agent');
+    const aside = fs.readdirSync(wgDir).filter((n) => n.startsWith('.orphaned-sources-'));
+    expect(aside).toHaveLength(1);
+    const asideDir = path.join(wgDir, aside[0]);
+    expect(fs.readFileSync(path.join(asideDir, 'inbox', 'f.json'), 'utf8')).toBe('{}');
+    expect(fs.readFileSync(path.join(asideDir, 'notes', 'a.md'), 'utf8')).toBe('note a');
+    expect(fs.readFileSync(path.join(asideDir, 'ext', 'x.txt'), 'utf8')).toBe('seed x');
+    expect(fs.readdirSync(outside)).toEqual([]);
+    expect(fs.existsSync(path.join(asideDir, 'inbox', 'only-in-seed.txt'))).toBe(false);
+    expect(fs.readdirSync(shared, { recursive: true }).filter((n) => String(n).endsWith('.merging'))).toEqual([]);
+    expect(fs.readlinkSync(seedSources)).toBe('/workspace/workgroup/sources');
+    expect(report.mutations.map((m) => `${m.kind}:${m.name}`)).toContain('merge:sources');
+    expect(report.merges).toEqual([
+      {
+        workgroupId: 'wgx',
+        name: 'sources',
+        source: seedSources,
+        sharedPath: shared,
+        copied: 2,
+        duplicates: 1,
+        collisions: 3,
+        skipped: 1,
+        orphanPath: asideDir,
+        unaccounted: [],
+      },
+    ]);
+
+    expect(reconcileWorkgroupSharedDirs(db, { groupsDir, dataDir })[0].merges).toEqual([]);
+  });
+
+  it.each([
+    { name: 'dbt', repo: '', gitDir: '.git' },
+    { name: 'sources', repo: 'repo', gitDir: '.git' },
+    { name: 'sources', repo: 'mirror.git', gitDir: '' },
+  ])('copies a colliding git repo ($name/$repo) aside whole instead of merging it', ({ name, repo, gitDir }) => {
+    const wgDir = path.join(dataDir, 'workgroups', 'wgx');
+    const seedRepo = path.join(groupsDir, 'wgx', name, repo);
+    const sharedRepo = path.join(wgDir, name, repo);
+    const makeRepo = (dir: string): void => {
+      fs.mkdirSync(path.join(dir, gitDir, 'refs', 'heads'), { recursive: true });
+      fs.mkdirSync(path.join(dir, gitDir, 'objects'), { recursive: true });
+      fs.writeFileSync(path.join(dir, gitDir, 'HEAD'), 'ref: refs/heads/main\n');
+    };
+    makeRepo(seedRepo);
+    fs.writeFileSync(path.join(seedRepo, gitDir, 'refs', 'heads', 'main'), 'seed-commit\n');
+    fs.writeFileSync(path.join(seedRepo, 'model.sql'), 'select 1');
+    makeRepo(sharedRepo);
+    fs.writeFileSync(path.join(sharedRepo, gitDir, 'packed-refs'), 'shared-commit refs/heads/main\n');
+    const sharedBefore = fs.readdirSync(sharedRepo, { recursive: true }).map(String).sort();
+
+    const [report] = reconcileWorkgroupSharedDirs(db, { groupsDir, dataDir });
+
+    expect(fs.readdirSync(sharedRepo, { recursive: true }).map(String).sort()).toEqual(sharedBefore);
+    expect(fs.existsSync(path.join(sharedRepo, gitDir, 'refs', 'heads', 'main'))).toBe(false);
+    const asideRoot = path.join(wgDir, fs.readdirSync(wgDir).filter((n) => n.startsWith(`.orphaned-${name}-`))[0]);
+    const asideRepo = path.join(asideRoot, repo);
+    expect(fs.readFileSync(path.join(asideRepo, gitDir, 'refs', 'heads', 'main'), 'utf8')).toBe('seed-commit\n');
+    expect(fs.readFileSync(path.join(asideRepo, 'model.sql'), 'utf8')).toBe('select 1');
+    expect(fs.readlinkSync(path.join(groupsDir, 'wgx', name))).toBe(`/workspace/workgroup/${name}`);
+    expect(report.merges.map((m) => [m.orphanPath, m.unaccounted])).toEqual([[asideRoot, []]]);
+  });
+
+  it.skipIf(process.getuid?.() === 0)(
+    'keeps the seed dir, without failing boot, when the shared dir is not writable',
+    () => {
+      const shared = path.join(dataDir, 'workgroups', 'wgx', 'sources');
+      fs.mkdirSync(shared, { recursive: true });
+      fs.writeFileSync(path.join(shared, 'agent.txt'), 'agent');
+      fs.chmodSync(shared, 0o555);
+      try {
+        const [report] = reconcileWorkgroupSharedDirs(db, { groupsDir, dataDir });
+        expect(report.merges.map((m) => m.unaccounted)).toEqual([['inbox']]);
+      } finally {
+        fs.chmodSync(shared, 0o755);
+      }
+      const seedSources = path.join(groupsDir, 'wgx', 'sources');
+      expect(fs.lstatSync(seedSources).isDirectory()).toBe(true);
+      expect(fs.readFileSync(path.join(seedSources, 'inbox', 'f.json'), 'utf8')).toBe('{}');
+      expect(fs.readlinkSync(path.join(groupsDir, 'wgx-codex', 'sources'))).toBe('../wgx/sources');
+    },
+  );
 
   it('recovers a moved dir whose name ends in .partial (no staging-namespace collision)', () => {
     const wgDir = path.join(dataDir, 'workgroups', 'wgx');

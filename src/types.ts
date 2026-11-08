@@ -240,6 +240,8 @@ export interface PendingApproval {
   platform_id: string | null;
   thread_id: string | null;
   platform_message_id: string | null;
+  /** JSON array of the other places this card was posted (`ApprovalCardCopy`); a click on one counts like the card. */
+  card_copies?: string;
   /**
    * For OneCLI credential rows, the gateway's request TTL. For a module
    * approval held by "Reject with reason…", the deadline after which the

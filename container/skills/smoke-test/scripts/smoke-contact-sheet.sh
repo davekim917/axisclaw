@@ -367,6 +367,11 @@ norm_path() {
 # Viewport-sized, animations frozen, re-captured until the live page still
 # matches the file (see SETTLE_* above).
 SETTLE_DIFF="$SESSIONS_FILE.settle.png"
+png_width() { # <file> -> pixel width from the PNG header, empty if unreadable
+  # shellcheck disable=SC2046 # intentional split of od's four bytes
+  set -- $(od -An -tu1 -j16 -N4 -- "$1" 2>/dev/null)
+  [ "$#" -eq 4 ] && printf '%s' "$(((${1} << 24) + (${2} << 16) + (${3} << 8) + ${4}))"
+}
 capture_view() {
   local w="$1" h="$2" file="$3" out attempt=1
   CAP_REASON=""
@@ -396,6 +401,13 @@ capture_view() {
     attempt=$((attempt + 1))
     agent-browser --session "$SESSION" wait "$SETTLE_INTERVAL_MS" >/dev/null 2>&1 || true
   done
+  local got
+  got="$(png_width "$file")"
+  if [ "$got" != "$w" ]; then
+    rm -f "$file"
+    CAP_REASON="image is ${got:-unreadable} wide, not the ${w} this width was captured at"
+    return 1
+  fi
   # Checked after the capture, so it is the location of the image just taken.
   out="$(agent-browser --session "$SESSION" eval "location.pathname" 2>&1)" || out=""
   out="$(norm_path "$(printf '%s' "$out" | tr -d '"' | tr -d '[:space:]')")"

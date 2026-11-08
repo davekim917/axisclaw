@@ -27,7 +27,7 @@ export interface LoopbackListener {
  * from anyone who can point the operator's browser at this port. Unescaped,
  * they would run script on a page with same-origin access to this port.
  */
-function escapeHtml(value: string): string {
+export function escapeHtml(value: string): string {
   return value
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')

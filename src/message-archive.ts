@@ -8,10 +8,23 @@ import path from 'path';
 
 import Database from 'better-sqlite3';
 
+import {
+  ARCHIVE_INDEX_ROW_COLUMNS,
+  archiveDedupMatch,
+  archiveSearchReady,
+  archiveSearchTable,
+  assertArchiveSearchReady,
+  ensureArchiveSearchSchema,
+  markArchiveSearchReady,
+  reindexArchiveRow,
+  searchablePartitionId,
+  type ArchiveIndexRow,
+  type ArchiveTenancy,
+} from './archive-search-index.js';
 import { DATA_DIR } from './config.js';
 import { log } from './log.js';
 
-const ARCHIVE_PATH = path.join(DATA_DIR, 'archive.db');
+export const ARCHIVE_PATH = path.join(DATA_DIR, 'archive.db');
 
 /**
  * Per-agent-group counter of in-place rewrites (the upsert's `DO UPDATE`), which move neither `COUNT(*)` nor
@@ -59,13 +72,43 @@ function openDb(): Database.Database {
   // TRUNCATE, not WAL: containers mount only archive.db, not the -wal/-shm sidecars, so WAL writes are invisible.
   db.pragma('journal_mode = TRUNCATE');
   db.pragma('synchronous = NORMAL');
-  initSchema(db);
+  initArchiveSchema(db);
   _db = db;
   _dbPath = ARCHIVE_PATH;
   return db;
 }
 
-function initSchema(db: Database.Database): void {
+/**
+ * Nothing here reads the global index. It is kept exact, as main makes it, so the code before the partitions can be
+ * started again on this archive with nothing to rebuild.
+ */
+const GLOBAL_INDEX_SQL = `
+    CREATE VIRTUAL TABLE IF NOT EXISTS messages_archive_fts USING fts5(
+      text,
+      sender_name,
+      content='messages_archive',
+      content_rowid='rowid'
+    );
+
+    CREATE TRIGGER IF NOT EXISTS messages_archive_ai AFTER INSERT ON messages_archive BEGIN
+      INSERT INTO messages_archive_fts(rowid, text, sender_name)
+      VALUES (new.rowid, new.text, new.sender_name);
+    END;
+    CREATE TRIGGER IF NOT EXISTS messages_archive_ad AFTER DELETE ON messages_archive BEGIN
+      INSERT INTO messages_archive_fts(messages_archive_fts, rowid, text, sender_name)
+      VALUES ('delete', old.rowid, old.text, old.sender_name);
+    END;
+    CREATE TRIGGER IF NOT EXISTS messages_archive_au AFTER UPDATE ON messages_archive BEGIN
+      INSERT INTO messages_archive_fts(messages_archive_fts, rowid, text, sender_name)
+      VALUES ('delete', old.rowid, old.text, old.sender_name);
+      INSERT INTO messages_archive_fts(rowid, text, sender_name)
+      VALUES (new.rowid, new.text, new.sender_name);
+    END;
+`;
+
+export function initArchiveSchema(db: Database.Database): void {
+  const fresh = !db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'messages_archive'`).get();
+  const globalIndexMissing = !db.prepare(`SELECT 1 FROM sqlite_master WHERE name = 'messages_archive_fts'`).get();
   db.exec(`
     CREATE TABLE IF NOT EXISTS messages_archive (
       id                  TEXT PRIMARY KEY,
@@ -86,10 +129,12 @@ function initSchema(db: Database.Database): void {
     -- without the channel_name column. No-op if the column already
     -- exists (we swallow the SQLITE_ERROR below).
   `);
-  try {
-    db.exec('ALTER TABLE messages_archive ADD COLUMN channel_name TEXT');
-  } catch {
-    // column already exists
+  for (const column of ['channel_name TEXT', 'sender_is_bot INTEGER']) {
+    try {
+      db.exec(`ALTER TABLE messages_archive ADD COLUMN ${column}`);
+    } catch {
+      // column already exists
+    }
   }
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_archive_ag_sent ON messages_archive(agent_group_id, sent_at);
@@ -143,30 +188,18 @@ function initSchema(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_archive_conv_recent
       ON messages_archive(messaging_group_id, role, sent_at, id,
                           agent_group_id, thread_id, sender_name, sender_id);
-
-    CREATE VIRTUAL TABLE IF NOT EXISTS messages_archive_fts USING fts5(
-      text,
-      sender_name,
-      content='messages_archive',
-      content_rowid='rowid'
-    );
-
-    CREATE TRIGGER IF NOT EXISTS messages_archive_ai AFTER INSERT ON messages_archive BEGIN
-      INSERT INTO messages_archive_fts(rowid, text, sender_name)
-      VALUES (new.rowid, new.text, new.sender_name);
-    END;
-    CREATE TRIGGER IF NOT EXISTS messages_archive_ad AFTER DELETE ON messages_archive BEGIN
-      INSERT INTO messages_archive_fts(messages_archive_fts, rowid, text, sender_name)
-      VALUES ('delete', old.rowid, old.text, old.sender_name);
-    END;
-    CREATE TRIGGER IF NOT EXISTS messages_archive_au AFTER UPDATE ON messages_archive BEGIN
-      INSERT INTO messages_archive_fts(messages_archive_fts, rowid, text, sender_name)
-      VALUES ('delete', old.rowid, old.text, old.sender_name);
-      INSERT INTO messages_archive_fts(rowid, text, sender_name)
-      VALUES (new.rowid, new.text, new.sender_name);
-    END;
   `);
+  // The global index is created, triggered and filled in one transaction: a table left empty by a failed fill would be
+  // taken as complete by the next open, and an empty one takes deletes for words it never held.
+  db.transaction(() => {
+    db.exec(GLOBAL_INDEX_SQL);
+    if (!fresh && globalIndexMissing)
+      db.exec(`INSERT INTO messages_archive_fts(messages_archive_fts) VALUES('rebuild')`);
+  })();
   ensureArchiveRowMarks(db);
+  ensureArchiveSearchSchema(db);
+  // An archive that predates the partitions is migrated at boot (`migrateArchiveSearch`) before anything reads it.
+  if (fresh) markArchiveSearchReady(db);
 }
 
 /** Reads `sqlite_master` because `IF NOT EXISTS` can't tell "created" from "already there". */
@@ -217,35 +250,68 @@ export interface ArchiveMessage {
   role: 'user' | 'assistant' | 'system';
   senderId: string | null;
   senderName: string | null;
+  /** The platform's own flag on the author, where the adapter sent one. */
+  senderIsBot?: boolean;
   text: string;
   sentAt: string;
 }
 
 /** The ONLY statement in the host that writes `messages_archive`; the freshness stamp depends on that (test-held). */
+// An id is supplied by whoever wrote the message, an agent included, so a rewrite never crosses role, agent or sender.
 export const ARCHIVE_UPSERT_SQL = `INSERT INTO messages_archive
-       (id, agent_group_id, messaging_group_id, channel_type, channel_name, platform_id, thread_id, role, sender_id, sender_name, text, sent_at)
-     VALUES (@id, @agentGroupId, @messagingGroupId, @channelType, @channelName, @platformId, @threadId, @role, @senderId, @senderName, @text, @sentAt)
+       (id, agent_group_id, messaging_group_id, channel_type, channel_name, platform_id, thread_id, role, sender_id, sender_name, sender_is_bot, text, sent_at)
+     VALUES (@id, @agentGroupId, @messagingGroupId, @channelType, @channelName, @platformId, @threadId, @role, @senderId, @senderName, @senderIsBot, @text, @sentAt)
      ON CONFLICT(id) DO UPDATE SET
        text = excluded.text,
        sender_name = excluded.sender_name,
        channel_name = COALESCE(excluded.channel_name, channel_name)
-     WHERE excluded.text IS NOT NULL`;
+     WHERE excluded.text IS NOT NULL
+       AND messages_archive.role = excluded.role
+       AND messages_archive.agent_group_id = excluded.agent_group_id
+       AND COALESCE(messages_archive.sender_id, '') = COALESCE(excluded.sender_id, '')`;
 
-const upsertStmt = () => openDb().prepare(ARCHIVE_UPSERT_SQL);
+const bindings = ({ senderIsBot, ...msg }: ArchiveMessage) => ({
+  ...msg,
+  senderIsBot: senderIsBot === undefined ? null : senderIsBot ? 1 : 0,
+});
 
-export function upsertArchiveMessage(msg: ArchiveMessage): void {
+export type ArchiveRowBindings = ReturnType<typeof bindings>;
+
+const INDEX_ROW_BY_ID_SQL = `SELECT ${ARCHIVE_INDEX_ROW_COLUMNS} FROM messages_archive WHERE id = ?`;
+
+/**
+ * The archive's only write: the row and the search index change in one transaction. Immediate, because SQLite never
+ * waits on behalf of a transaction that has already read: it would fail at once against another writer. `tenancy` is
+ * the central DB's answer at this write (`archiveTenancyOf`), undefined for an agent group it does not hold.
+ */
+export function writeArchiveRow(
+  db: Database.Database,
+  row: ArchiveRowBindings,
+  tenancy: ArchiveTenancy | undefined,
+): void {
+  db.transaction(() => {
+    const readRow = db.prepare(INDEX_ROW_BY_ID_SQL);
+    const before = readRow.get(row.id) as ArchiveIndexRow | undefined;
+    const indexing = archiveSearchReady(db);
+    db.prepare(ARCHIVE_UPSERT_SQL).run(row);
+    const after = readRow.get(row.id) as ArchiveIndexRow | undefined;
+    if (after && indexing) reindexArchiveRow(db, before, after, tenancy);
+  }).immediate();
+}
+
+export function upsertArchiveMessage(msg: ArchiveMessage, tenancy: ArchiveTenancy | undefined): void {
   if (!msg.text || msg.text.length === 0) return;
   try {
-    upsertStmt().run(msg);
+    writeArchiveRow(openDb(), bindings(msg), tenancy);
   } catch (err) {
     log.warn('Failed to upsert archive message', { id: msg.id, err });
   }
 }
 
 /** Throws rather than swallowing: when the router skips a message, the archive row is its only copy. */
-export function archiveMessage(msg: ArchiveMessage): boolean {
+export function archiveMessage(msg: ArchiveMessage, tenancy: ArchiveTenancy | undefined): boolean {
   if (!msg.text || msg.text.length === 0) return false;
-  upsertStmt().run(msg);
+  writeArchiveRow(openDb(), bindings(msg), tenancy);
   return true;
 }
 
@@ -322,6 +388,17 @@ function trustedMemberClause(memberAgentGroupIds: string[]): { sql: string; para
   return { sql: `agent_group_id IN (${ids.map(() => '?').join(',')})`, params: ids };
 }
 
+/** Rows indexed in this tenant's table, which holds what was archived for the workgroup while each message was written. */
+function tenantClause(db: Database.Database, tenantKey: string): { sql: string; params: number[] } {
+  const partitionId = searchablePartitionId(db, tenantKey);
+  if (partitionId === undefined) return { sql: '0', params: [] };
+  return {
+    sql: `EXISTS (SELECT 1 FROM archive_search_rows placed
+                   WHERE placed.row_id = messages_archive.rowid AND placed.partition_id = ?)`,
+    params: [partitionId],
+  };
+}
+
 const ARCHIVE_FTS_STOP_WORDS = new Set([
   'a',
   'an',
@@ -356,19 +433,51 @@ const ARCHIVE_FTS_STOP_WORDS = new Set([
   'www',
 ]);
 
-/** FTS5 query shape shared with the container thread-search tool: OR quoted, non-trivial tokens. */
-export function sanitizeArchiveFtsQuery(query: string): string {
-  const terms = query
+/**
+ * Without a prefix index FTS5 merges every term sharing the prefix inside one statement, on every statement: on the
+ * live archive 330 ms for one letter, 130 for two, 60 for three, 10 for four.
+ */
+const ARCHIVE_PREFIX_MIN_CHARS = 3;
+/** Eight common words cost 23 ms a statement on the live archive, and twenty-two cost 41. */
+const ARCHIVE_TEXT_MAX_TERMS = 8;
+/**
+ * Everything FTS5's unicode61 tokenizer splits on, so a quoted term is always one token. A term that splits is a phrase,
+ * and a phrase of common tokens scans the whole doclist in one statement: 50 tokens took 540 ms and returned no rows.
+ * The listed characters are letters and numbers to JavaScript and separators to the tokenizer.
+ */
+const ARCHIVE_TOKEN_SEPARATORS = /[^\p{L}\p{N}\s]|[\u19b0-\u19c0\u19c8\u19c9\u1cf2\u1cf3]/gu;
+
+function archiveFtsTerms(query: string, dropped: RegExp): string[] {
+  return query
     .normalize('NFKC')
     .toLocaleLowerCase('en-US')
-    .replace(/[^\p{L}\p{N}_\s-]/gu, ' ')
+    .replace(dropped, ' ')
     .replace(/\s+/g, ' ')
     .trim()
     .split(' ')
     .filter((term) => term.length > 1 && !ARCHIVE_FTS_STOP_WORDS.has(term))
-    .slice(0, 24)
-    .map((term) => `"${term.replaceAll('"', '""')}"`);
-  return terms.join(' OR ');
+    .slice(0, 24);
+}
+
+const quotedFtsTerm = (term: string) => `"${term.replaceAll('"', '""')}"`;
+
+/** FTS5 query shape shared with the container thread-search tool: OR quoted, non-trivial tokens. */
+export function sanitizeArchiveFtsQuery(query: string): string {
+  return archiveFtsTerms(query, /[^\p{L}\p{N}_\s-]/gu)
+    .map(quotedFtsTerm)
+    .join(' OR ');
+}
+
+/**
+ * Every term in one message body, never its sender. A search box narrows as it gets longer, so terms AND where
+ * `sanitizeArchiveFtsQuery` ORs them, and the last term is a prefix because it is the one still being typed. Empty when
+ * nothing searchable is left.
+ */
+export function archiveTextMatch(query: string): string {
+  const terms = [...new Set(archiveFtsTerms(query, ARCHIVE_TOKEN_SEPARATORS))].slice(0, ARCHIVE_TEXT_MAX_TERMS);
+  if (terms.length === 0) return '';
+  const prefix = [...terms[terms.length - 1]].length >= ARCHIVE_PREFIX_MIN_CHARS ? '*' : '';
+  return `text : (${terms.map(quotedFtsTerm).join(' ')}${prefix})`;
 }
 
 /** Newest first; deterministic, no ranking or FTS. */
@@ -414,6 +523,66 @@ export function recentConversationSenders(input: {
   return senders;
 }
 
+/**
+ * `null` in `threads` is the channel's top level. The router archives an inbound text message whether or not it wakes
+ * an agent, so this sees replies no session holds; it never sees a file-only reply, nor one a `drop` room or the access
+ * gate discards. Rows archived before `sender_is_bot` existed carry no flag, and our own bots' posts reach their
+ * siblings as `user` rows, which is what `isBot` is for.
+ */
+export function latestHumanMessage(input: {
+  channelTypes: string[];
+  platformId: string;
+  threads: Array<string | null>;
+  isBot: (senderId: string) => boolean;
+  after?: string;
+  atOrBefore?: string;
+}): { senderId: string; sentAt: string } | null {
+  if (input.channelTypes.length === 0) return null;
+  const named = input.threads.filter((t): t is string => t !== null);
+  // One branch per thread shape, so each keeps idx_archive_channel's thread_id column.
+  const branches = [
+    ...(named.length ? [`thread_id IN (${named.map(() => '?').join(',')})`] : []),
+    ...(input.threads.includes(null) ? ['thread_id IS NULL', "thread_id = ''"] : []),
+  ];
+  if (branches.length === 0) return null;
+  const select = (thread: string) =>
+    `SELECT sender_id, sent_at
+       FROM messages_archive
+      WHERE channel_type IN (${input.channelTypes.map(() => '?').join(',')})
+        AND platform_id = ?
+        AND ${thread}
+        AND role = 'user'
+        AND sender_id IS NOT NULL
+        AND COALESCE(sender_is_bot, 0) = 0
+        AND (? IS NULL OR julianday(sent_at) > julianday(?))
+        AND (? IS NULL OR julianday(sent_at) <= julianday(?))`;
+  const window = [input.after ?? null, input.after ?? null, input.atOrBefore ?? null, input.atOrBefore ?? null];
+  const rows = openDb()
+    .prepare(`${branches.map(select).join(' UNION ALL ')} ORDER BY sent_at DESC`)
+    .iterate(
+      ...branches.flatMap((branch) => [
+        ...input.channelTypes,
+        input.platformId,
+        ...(branch.startsWith('thread_id IN') ? named : []),
+        ...window,
+      ]),
+    ) as IterableIterator<{ sender_id: string; sent_at: string }>;
+  for (const row of rows) {
+    if (!input.isBot(row.sender_id)) return { senderId: row.sender_id, sentAt: row.sent_at };
+  }
+  return null;
+}
+
+export interface ThreadMessage {
+  id: string;
+  role: 'user' | 'assistant';
+  senderId: string | null;
+  senderName: string | null;
+  senderIsBot: boolean;
+  text: string;
+  sentAt: string;
+}
+
 /** One agent's view of a thread, oldest first: people's messages and its own posts that landed there. */
 export function recentThreadMessages(input: {
   agentGroupId: string;
@@ -421,102 +590,292 @@ export function recentThreadMessages(input: {
   platformId: string;
   threadId: string | null;
   limit: number;
-}): Array<{ role: 'user' | 'assistant'; senderName: string | null; text: string }> {
+}): ThreadMessage[] {
+  // One statement per thread shape, so each walks idx_archive_thread; a combined OR walks the agent's whole history.
+  const thread = input.threadId === null ? [] : [input.threadId];
   const rows = openDb()
     .prepare(
-      `SELECT role, sender_name, text
+      `SELECT id, role, sender_id, sender_name, sender_is_bot, text, sent_at
          FROM messages_archive
         WHERE agent_group_id = ?
+          AND ${input.threadId === null ? 'thread_id IS NULL' : 'thread_id = ?'}
           AND channel_type = ?
           AND platform_id = ?
           AND role IN ('user', 'assistant')
-          AND ((? IS NOT NULL AND thread_id = ?) OR (? IS NULL AND thread_id IS NULL))
         ORDER BY sent_at DESC, id DESC
         LIMIT ?`,
     )
-    .all(
-      input.agentGroupId,
-      input.channelType,
-      input.platformId,
-      input.threadId,
-      input.threadId,
-      input.threadId,
-      input.limit,
-    ) as Array<{ role: 'user' | 'assistant'; sender_name: string | null; text: string }>;
-  return rows.reverse().map((r) => ({ role: r.role, senderName: r.sender_name, text: r.text }));
+    .all(input.agentGroupId, ...thread, input.channelType, input.platformId, input.limit) as ThreadMessageRow[];
+  return rows.reverse().map(threadMessage);
 }
+
+/** One archived message by its id: an agent's own post is archived under its outbound row's id. */
+export function threadMessageById(id: string): ThreadMessage | null {
+  const row = openDb()
+    .prepare(
+      `SELECT id, role, sender_id, sender_name, sender_is_bot, text, sent_at
+         FROM messages_archive
+        WHERE id = ? AND role IN ('user', 'assistant')`,
+    )
+    .get(id) as ThreadMessageRow | undefined;
+  return row ? threadMessage(row) : null;
+}
+
+export function threadsHoldingMessages(channelTypes: string[], platformId: string, threadIds: string[]): Set<string> {
+  if (threadIds.length === 0 || channelTypes.length === 0) return new Set();
+  const rows = openDb()
+    .prepare(
+      `SELECT DISTINCT thread_id FROM messages_archive
+        WHERE channel_type IN (SELECT value FROM json_each(?)) AND platform_id = ?
+          AND thread_id IN (SELECT value FROM json_each(?))`,
+    )
+    .all(JSON.stringify(channelTypes), platformId, JSON.stringify(threadIds)) as Array<{ thread_id: string }>;
+  return new Set(rows.map((row) => row.thread_id));
+}
+
+export function rowsInTenant(ids: string[], tenantKey: string): Set<string> {
+  if (ids.length === 0) return new Set();
+  const db = openDb();
+  const scope = tenantClause(db, tenantKey);
+  const rows = db
+    .prepare(`SELECT id FROM messages_archive WHERE id IN (SELECT value FROM json_each(?)) AND ${scope.sql}`)
+    .all(JSON.stringify(ids), ...scope.params) as Array<{ id: string }>;
+  return new Set(rows.map((row) => row.id));
+}
+
+export interface RootPost {
+  id: string;
+  channelType: string;
+  platformId: string;
+  sentAt: string;
+}
+
+export function rootPostsAmong(agentGroupId: string, ids: string[]): RootPost[] {
+  if (ids.length === 0) return [];
+  // Filtered here, not in SQL: given the agent and role, the planner walks the agent's whole history by
+  // idx_archive_fingerprint rather than reading each id by its key.
+  const rows = openDb()
+    .prepare(
+      `SELECT id, agent_group_id, messaging_group_id, role, thread_id, channel_type, platform_id, sent_at
+         FROM messages_archive WHERE id IN (${ids.map(() => '?').join(', ')})`,
+    )
+    .all(...ids) as Array<{
+    id: string;
+    agent_group_id: string;
+    messaging_group_id: string | null;
+    role: string;
+    thread_id: string | null;
+    channel_type: string;
+    platform_id: string | null;
+    sent_at: string;
+  }>;
+  return rows.flatMap((row) =>
+    row.agent_group_id === agentGroupId &&
+    row.role === 'assistant' &&
+    row.thread_id === null &&
+    row.messaging_group_id === null &&
+    row.platform_id !== null
+      ? [{ id: row.id, channelType: row.channel_type, platformId: row.platform_id, sentAt: row.sent_at }]
+      : [],
+  );
+}
+
+interface ThreadMessageRow {
+  id: string;
+  role: 'user' | 'assistant';
+  sender_id: string | null;
+  sender_name: string | null;
+  sender_is_bot: number | null;
+  text: string;
+  sent_at: string;
+}
+
+const threadMessage = (r: ThreadMessageRow): ThreadMessage => ({
+  id: r.id,
+  role: r.role,
+  senderId: r.sender_id,
+  senderName: r.sender_name,
+  senderIsBot: r.sender_is_bot === 1,
+  text: r.text,
+  sentAt: r.sent_at,
+});
+
+/** When this agent's own post last landed in the thread, from the archive; null if it never posted there. */
+export function lastOwnPostAt(input: {
+  agentGroupId: string;
+  channelType: string;
+  platformId: string;
+  threadId: string;
+}): string | null {
+  const row = openDb()
+    .prepare(
+      `SELECT MAX(sent_at) AS at
+         FROM messages_archive
+        WHERE agent_group_id = ?
+          AND thread_id = ?
+          AND channel_type = ?
+          AND platform_id = ?
+          AND role = 'assistant'`,
+    )
+    .get(input.agentGroupId, input.threadId, input.channelType, input.platformId) as { at: string | null } | undefined;
+  return row?.at ?? null;
+}
+
+/**
+ * The messages these senders posted in the thread at or after `since`, by the archive, oldest first: each once, though
+ * the archive keeps one row for every agent group that heard it.
+ */
+export function postsSince(input: {
+  platformId: string;
+  threadId: string;
+  senderIds: string[];
+  since: string;
+}): Array<{ sentAt: string; text: string }> {
+  if (input.senderIds.length === 0) return [];
+  return openDb()
+    .prepare(
+      `SELECT sent_at AS sentAt, MIN(text) AS text
+         FROM messages_archive
+        WHERE platform_id = ?
+          AND thread_id = ?
+          AND role = 'user'
+          AND sender_id IN (${input.senderIds.map(() => '?').join(', ')})
+          AND datetime(sent_at) >= datetime(?)
+        GROUP BY sent_at
+        ORDER BY sent_at`,
+    )
+    .all(input.platformId, input.threadId, ...input.senderIds, input.since) as Array<{ sentAt: string; text: string }>;
+}
+
+/** False until the boot migration has placed every row, and again once other code has written the archive since. */
+export const archiveSearchAvailable = (): boolean => archiveSearchReady(openDb());
 
 /** FTS generates candidates only; the pre-turn builder scores and bounds them. */
 export function searchArchiveEvidence(input: {
-  memberAgentGroupIds: string[];
+  /** `archiveTenantKey` of the searching agent group's workgroup, from the central DB. */
+  tenantKey: string;
   query: string;
   currentMessagingGroupId: string | null;
   currentThreadId: string | null;
   currentNormalizedContent: string;
   candidateLimit: number;
 }): ArchiveEvidenceRow[] {
-  if (input.memberAgentGroupIds.length === 0) return [];
+  const db = openDb();
+  assertArchiveSearchReady(db);
   const fts = sanitizeArchiveFtsQuery(input.query);
   if (!fts || input.candidateLimit <= 0) return [];
-  const scope = trustedMemberClause(input.memberAgentGroupIds);
-  const candidateLimit = Math.max(1, Math.floor(input.candidateLimit));
-  const rows = openDb()
+  const search = { ...input, fts, candidateLimit: Math.max(1, Math.floor(input.candidateLimit)) };
+  const rows = searchTenant(db, search);
+  return rows.map((row) => rankedEvidence(row, input.currentMessagingGroupId, input.currentThreadId));
+}
+
+function rankedEvidence(
+  row: ArchiveSqlRow,
+  currentMessagingGroupId: string | null,
+  currentThreadId: string | null,
+): ArchiveEvidenceRow {
+  const isCurrentThread =
+    currentThreadId !== null
+      ? row.thread_id === currentThreadId
+      : row.thread_id === null && row.messaging_group_id === currentMessagingGroupId;
+  return toEvidence(row, isCurrentThread ? 'current-thread' : 'workgroup');
+}
+
+export type ArchiveMessageIdentity = Pick<ArchiveEvidenceRow, 'platformId' | 'threadId' | 'sentAt' | 'text'>;
+
+/**
+ * Every sibling bot wired to a channel archives its own copy of each message there, under its own id and messaging
+ * group, with the sender id prefixed by its own channel type; the copies share this identity. Copies whose text differs
+ * stay separate, including the common case of a mention one bot renders as a name and another as a raw user id.
+ */
+export function archiveMessageKey(row: ArchiveMessageIdentity & Pick<ArchiveEvidenceRow, 'senderId'>): string {
+  const sender = row.senderId === null ? null : row.senderId.slice(row.senderId.indexOf(':') + 1);
+  return JSON.stringify([row.platformId, row.threadId, row.sentAt, sender, row.text]);
+}
+
+export function archiveCopiesOf(input: {
+  /** `archiveTenantKey` of the reading agent group's workgroup, from the central DB. */
+  tenantKey: string;
+  messages: readonly ArchiveMessageIdentity[];
+  currentMessagingGroupId: string | null;
+  currentThreadId: string | null;
+}): ArchiveEvidenceRow[][] {
+  if (input.messages.length === 0) return [];
+  const db = openDb();
+  const scope = tenantClause(db, input.tenantKey);
+  const copies = db.prepare(
+    `SELECT id, agent_group_id, messaging_group_id, channel_type, channel_name,
+            platform_id, thread_id, role, sender_id, sender_name, text, sent_at
+       FROM messages_archive
+      WHERE ${scope.sql}
+        AND sent_at = ?
+        AND platform_id IS ?
+        AND thread_id IS ?
+        AND text = ?
+      ORDER BY id ASC`,
+  );
+  return input.messages.map((message) =>
+    (
+      copies.all(...scope.params, message.sentAt, message.platformId, message.threadId, message.text) as ArchiveSqlRow[]
+    ).map((row) => rankedEvidence(row, input.currentMessagingGroupId, input.currentThreadId)),
+  );
+}
+
+interface EvidenceSearch {
+  tenantKey: string;
+  fts: string;
+  currentMessagingGroupId: string | null;
+  currentThreadId: string | null;
+  currentNormalizedContent: string;
+  candidateLimit: number;
+}
+
+/**
+ * A tenant's table indexes one copy of each message archived for it, so a hit is widened back to every copy recorded
+ * with it there, and to no copy archived for another tenant.
+ */
+function searchTenant(db: Database.Database, input: EvidenceSearch): ArchiveSqlRow[] {
+  const partitionId = searchablePartitionId(db, input.tenantKey);
+  if (partitionId === undefined) return [];
+  const table = archiveSearchTable(partitionId);
+  const hits = `SELECT rowid AS rowid, bm25(${table}, 1.0, 1.0, 0.0) AS score FROM ${table} WHERE ${table} MATCH @fts`;
+  return db
     .prepare(
-      `WITH matches AS MATERIALIZED (
-         SELECT messages_archive_fts.rowid AS rowid,
-                bm25(messages_archive_fts) AS score,
+      `WITH hits AS MATERIALIZED (${hits}),
+       matches AS MATERIALIZED (
+         SELECT copy.rowid AS rowid,
+                hits.score AS score,
                 CASE
-                  WHEN (? IS NOT NULL AND scoped.thread_id = ?)
-                    OR (? IS NULL AND scoped.messaging_group_id = ? AND scoped.thread_id IS NULL)
+                  WHEN (@thread IS NOT NULL AND copy.thread_id = @thread)
+                    OR (@thread IS NULL AND copy.messaging_group_id = @messagingGroup AND copy.thread_id IS NULL)
                   THEN 0 ELSE 1
                 END AS current_rank
-           FROM messages_archive_fts
-           JOIN messages_archive scoped ON scoped.rowid = messages_archive_fts.rowid
-          WHERE messages_archive_fts MATCH ?
-            AND scoped.${scope.sql}
-          -- rowid completes the sort key. current_rank and score alone are not
-          -- unique — on the live archive 14,627 (current_rank, score) groups hold
-          -- more than one row, and for a typical query the LIMIT lands inside one
-          -- of them, so WHICH tied rows survive the cut would otherwise be the
-          -- planner's choice rather than ours. rowid is unique, so this makes the
-          -- order total and the surviving set reproducible.
-          --
-          -- This does not change today's output: SQLite already returns FTS
-          -- matches in rowid order and its sorter preserves that for equal keys,
-          -- verified byte-identical on real data across MATERIALIZED /
-          -- NOT MATERIALIZED / reversed-join-order plans. It pins that incidental
-          -- behavior so a future SQLite, index, or query edit cannot silently
-          -- reshuffle delivered evidence.
-          ORDER BY current_rank ASC, score ASC, messages_archive_fts.rowid ASC
-          LIMIT ?
+           FROM hits
+           JOIN messages_archive hit_row ON hit_row.rowid = hits.rowid
+           JOIN messages_archive copy ON ${archiveDedupMatch('copy', 'hit_row')}
+           JOIN archive_search_rows placed ON placed.row_id = copy.rowid AND placed.partition_id = @partition
+          -- rowid completes the sort key so the rows that survive the cut are ours to choose, not the planner's.
+          ORDER BY current_rank ASC, score ASC, copy.rowid ASC
+          LIMIT @inner
        )
        SELECT a.id, a.agent_group_id, a.messaging_group_id, a.channel_type,
               a.channel_name, a.platform_id, a.thread_id, a.role, a.sender_id,
-              a.sender_name, a.text, a.sent_at, m.score
+              a.sender_name, a.text, a.sent_at
          FROM messages_archive a
          JOIN matches m ON m.rowid = a.rowid
-        WHERE trim(a.text) <> trim(?)
+        WHERE trim(a.text) <> trim(@current)
         ORDER BY m.current_rank ASC, m.score ASC, a.sent_at DESC, a.id ASC
-        LIMIT ?`,
+        LIMIT @limit`,
     )
-    .all(
-      input.currentThreadId,
-      input.currentThreadId,
-      input.currentThreadId,
-      input.currentMessagingGroupId,
-      fts,
-      ...scope.params,
-      candidateLimit * 8,
-      input.currentNormalizedContent,
-      candidateLimit,
-    ) as Array<ArchiveSqlRow & { score: number }>;
-  return rows.map((row) => {
-    const isCurrentThread =
-      input.currentThreadId !== null
-        ? row.thread_id === input.currentThreadId
-        : row.thread_id === null && row.messaging_group_id === input.currentMessagingGroupId;
-    return toEvidence(row, isCurrentThread ? 'current-thread' : 'workgroup');
-  });
+    .all({
+      fts: `{text sender_name} : (${input.fts})`,
+      thread: input.currentThreadId,
+      messagingGroup: input.currentMessagingGroupId,
+      partition: partitionId,
+      inner: input.candidateLimit * 8,
+      current: input.currentNormalizedContent,
+      limit: input.candidateLimit,
+    }) as ArchiveSqlRow[];
 }
 
 export type ArchivePermalink =
@@ -562,17 +921,17 @@ export function parseArchivePermalinks(content: string): ArchivePermalink[] {
   return parsed;
 }
 
-/** Resolve parsed permalinks against exact archive routing, still bounded to trusted member ids. */
+/** Resolve parsed permalinks against exact archive routing, bounded to the reading agent group's tenant table. */
 export function queryArchiveExactLinks(input: {
-  memberAgentGroupIds: string[];
+  /** `archiveTenantKey` of the reading agent group's workgroup, from the central DB. */
+  tenantKey: string;
   normalizedContent: string;
   candidateLimit: number;
 }): ArchiveEvidenceRow[] {
-  if (input.memberAgentGroupIds.length === 0) return [];
   const links = parseArchivePermalinks(input.normalizedContent);
   if (links.length === 0 || input.candidateLimit <= 0) return [];
-  const scope = trustedMemberClause(input.memberAgentGroupIds);
   const db = openDb();
+  const scope = tenantClause(db, input.tenantKey);
   const selected: ArchiveEvidenceRow[] = [];
   const seen = new Set<string>();
   for (const link of links) {

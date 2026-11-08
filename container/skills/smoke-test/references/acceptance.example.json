@@ -3,7 +3,7 @@
   "v": 1,
   "sources": {
     "R1": "issue#412",
-    "R2": "slack:lantern-desk/1726000000.000100",
+    "R2": "slack:example-desk/1726000000.000100",
     "R3": "pr-body"
   },
   "items": [

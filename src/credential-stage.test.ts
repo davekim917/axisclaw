@@ -5,7 +5,7 @@ import path from 'path';
 import YAML from 'yaml';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { stageDbtProfiles } from './credential-stage.js';
+import { stageDbtProfiles, tagSnowflakeConnections } from './credential-stage.js';
 
 let home: string;
 let dest: string;
@@ -30,7 +30,14 @@ function snowflakeProfile(auth: Record<string, unknown>): Record<string, unknown
 type StagedProfiles = Record<string, { outputs: Record<string, Record<string, unknown>> }>;
 
 function stage(allowedProfiles: string[] | null): StagedProfiles {
-  stageDbtProfiles({ profilesPath: path.join(home, '.dbt', 'profiles.yml'), home, dest, allowedProfiles, agent: 't' });
+  stageDbtProfiles({
+    profilesPath: path.join(home, '.dbt', 'profiles.yml'),
+    home,
+    dest,
+    allowedProfiles,
+    agent: 't',
+    queryTag: 'grp:sess-1',
+  });
   return YAML.parse(fs.readFileSync(path.join(dest, 'profiles.yml'), 'utf-8')) as StagedProfiles;
 }
 
@@ -216,5 +223,70 @@ describe('stageDbtProfiles', () => {
     fs.writeFileSync(path.join(home, '.dbt', 'profiles.yml'), '- a\n- b\n');
 
     expect(() => stage(null)).toThrow('not a mapping');
+  });
+});
+
+describe('dbt query_tag', () => {
+  it('tags every snowflake output and leaves an existing query_tag and other adapters alone', () => {
+    writeProfiles({
+      a: {
+        target: 'dev',
+        outputs: {
+          dev: { type: 'snowflake', account: 'acct', user: 'u' },
+          prod: { type: 'snowflake', account: 'acct', user: 'u', query_tag: 'nightly' },
+          pg: { type: 'postgres', host: 'h' },
+        },
+      },
+    });
+    const outputs = stage(null).a.outputs;
+    expect(outputs.dev.query_tag).toBe('grp:sess-1');
+    expect(outputs.prod.query_tag).toBe('nightly');
+    expect(outputs.pg).toEqual({ type: 'postgres', host: 'h' });
+  });
+});
+
+describe('tagSnowflakeConnections', () => {
+  const tagLine = 'session_parameters = { QUERY_TAG = "grp:sess-1" }';
+
+  it('adds the tag to each connection right under its header', () => {
+    expect(tagSnowflakeConnections('[a]\nuser = "u"\n\n[b]\nuser = "v"\n', 'grp:sess-1')).toBe(
+      `[a]\n${tagLine}\nuser = "u"\n\n[b]\n${tagLine}\nuser = "v"\n`,
+    );
+  });
+
+  it('tags a file whose lines carry trailing whitespace', () => {
+    expect(tagSnowflakeConnections('[a] \t\nuser = "u"  \n', 'grp:sess-1')).toBe(`[a] \t\n${tagLine}\nuser = "u"  \n`);
+  });
+
+  it('keeps a connection that already declares session_parameters and tags the rest', () => {
+    const toml = '[own]\nsession_parameters = { QUERY_TAG = "job" }\n[other] # note\r\nuser = "u"\r\n';
+    expect(tagSnowflakeConnections(toml, 'grp:sess-1')).toBe(
+      `[own]\nsession_parameters = { QUERY_TAG = "job" }\n[other] # note\r\n${tagLine}\nuser = "u"\r\n`,
+    );
+  });
+
+  it.each([
+    ['a dotted session_parameters key', '[a]\nsession_parameters.QUERY_TAG = "job"\n'],
+    ['a session_parameters subtable', '[a]\nuser = "u"\n[a.session_parameters]\nQUERY_TAG = "job"\n'],
+    ['a quoted session_parameters subtable', '[a]\nuser = "u"\n[a."session_parameters"]\nQUERY_TAG = "job"\n'],
+    ['an escaped key', '[a]\n"\\u0073ession_parameters" = { QUERY_TAG = "job" }\n'],
+    ['a quoted connection name', '["a"]\nuser = "u"\n'],
+    ['a header-shaped line inside a multi-line string', '[a]\npassword = """\n[salt]\n"""\n'],
+    ['an array of tables', '[[a]]\nuser = "u"\n'],
+    [
+      'a multi-line string opened inside an inline table',
+      '[a]\nsession_parameters = { QUERY_TAG = """start" }\n[decoy]\nx = { y = "end""" }\n',
+    ],
+    [
+      'a literal multi-line string opened inside an inline table',
+      "[a]\nx = { y = '''start' }\n[decoy]\nz = { w = 'end''' }\n",
+    ],
+  ])('returns null rather than editing a file with %s', (_shape, toml) => {
+    expect(tagSnowflakeConnections(toml, 'grp:sess-1')).toBeNull();
+  });
+
+  it('changes nothing when there is no connection', () => {
+    expect(tagSnowflakeConnections('', 'grp:sess-1')).toBe('');
+    expect(tagSnowflakeConnections('# none\n', 'grp:sess-1')).toBe('# none\n');
   });
 });

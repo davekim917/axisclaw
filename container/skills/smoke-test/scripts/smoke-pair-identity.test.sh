@@ -8,8 +8,9 @@
 # baseline, and `finish` (and the evidence barrier) refuse until every lane
 # the contract declared at the re-freeze has been redispatched after it
 # (F3), and check/finish/refreeze reading the frozen services rather than
-# whatever pair the env names. Contracts and redispatches go through the real
-# smoke-run-scaffold.sh verbs, so the snapshot is tested against its field.
+# whatever pair the env names, and `finish` accepting a pair that moved only
+# after every evidence file was written. Contracts and redispatches go through
+# the real smoke-run-scaffold.sh verbs, so the snapshot is tested against its field.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -648,5 +649,68 @@ expect_rc "$(unset_run start "$RUNST")" 2 frozen-ids-start-still-needs-env
 expect_rc "$(dev_run start "$RUNST")" 0 frozen-ids-start-uses-env
 jq -e --arg dev "$DEV_FE" '.frontend.service == $dev' "$RUNST/coordinator/identity.json" >/dev/null || fail "frozen-ids-start-uses-env"
 expect_rc "$(unset_run read)" 2 frozen-ids-read-still-needs-env
+
+# --- 11. finish: the pair moved only after the evidence closed -------------
+MOVED_REL=coordinator/identity-moved-after-evidence.json
+evidence_run() { # <run> [fe commit] [be commit]: frozen, evidence a minute old, one ok closing check
+  mkdir -p "$1/markers" "$1/challenger"; serve_pair 111 "${2:-$A}" "${3:-$B}"
+  expect_rc "$(run start "$1")" 0 "moved-start-${1##*/}"
+  for l in A B; do printf '{"lane":"%s"}\n' "$l" > "$1/markers/$l.json"; done
+  printf '{"lane":"challenger"}\n' > "$1/challenger/challenge.complete.json"
+  touch -d "@$(( $(date +%s) - 60 ))" "$1"/markers/*.json "$1/challenger/challenge.complete.json"
+  expect_rc "$(run check "$1" coordinator-end)" 0 "moved-closing-check-${1##*/}"
+}
+closing_at() { date -ud "$(tail -1 "$1/coordinator/identity-checks.ndjson" | jq -r .readAt)" +%s; }
+expect_kept() { # <run> <rc> <verdict> <label>: finish appends its verdict as before and records no move
+  local before; before="$(journal_lines "$1")"
+  expect_rc "$(run finish "$1")" "$2" "$4"
+  [ "$(journal_lines "$1")" = "$((before + 1))" ] &&
+    tail -1 "$1/coordinator/identity-checks.ndjson" | jq -e --arg v "$3" '.label == "finish-prepublication" and .verdict == $v' >/dev/null ||
+    fail "$4: finish did not append its $3 record"
+  [ ! -e "$1/$MOVED_REL" ] || fail "$4: a moved-after-evidence record was written"
+}
+# (a) Every evidence file predates the closing check; then dev redeploys.
+RM="$T/run-moved"; evidence_run "$RM"
+AT="$(tail -1 "$RM/coordinator/identity-checks.ndjson" | jq -r .readAt)"
+BEFORE="$(journal_lines "$RM")"
+serve_pair 112 "$A" "$B"
+expect_rc "$(run finish "$RM")" 0 moved-after-evidence-finish
+[ "$(journal_lines "$RM")" = "$BEFORE" ] && ! grep -q '"verdict":"drift"' "$RM/coordinator/identity-checks.ndjson" ||
+  fail "moved-after-evidence-finish: finish wrote to the journal"
+out | grep -Fq dep-be000000111 && out | grep -Fq dep-be000000112 && out | grep -Fq 'must cite both' ||
+  fail "moved-after-evidence-finish: the line did not name both pairs and the citation duty"
+jq -e --arg at "$AT" '.frozen.backend.deploy == "dep-be000000111" and .now.backend.deploy == "dep-be000000112"
+    and .closingCheck.readAt == $at and (.newestEvidence.mtime | type) == "string"' "$RM/$MOVED_REL" >/dev/null ||
+  fail "moved-after-evidence-record: $(cat "$RM/$MOVED_REL" 2>/dev/null)"
+cp "$RM/$MOVED_REL" "$T/moved.bak"
+expect_rc "$(run finish "$RM")" 0 moved-after-evidence-finish-again
+cmp -s "$RM/$MOVED_REL" "$T/moved.bak" || fail "moved-after-evidence-finish-again: the write-once record was rewritten"
+expect_rc "$(run check "$RM" late-lane)" 3 moved-check-still-records-drift
+expect_rc "$(run finish "$RM")" 3 moved-finish-after-recorded-drift
+RM2="$T/run-moved-twice"; evidence_run "$RM2"; serve_pair 112 "$A" "$B"
+expect_rc "$(run finish "$RM2")" 0 moved-twice-first
+serve_pair 113 "$A" "$B"
+expect_rc "$(run finish "$RM2")" 3 moved-twice-second
+jq -e '.now.backend.deploy == "dep-be000000112"' "$RM2/$MOVED_REL" >/dev/null || fail "moved-twice-second: the record was overwritten"
+# (b) One marker written after the closing check, and one in the same second
+# (readAt is whole seconds, so that marker may postdate the read).
+RB="$T/run-moved-late-marker"; evidence_run "$RB"
+touch -d "@$(( $(closing_at "$RB") + 1 ))" "$RB/markers/B.json"
+serve_pair 112 "$A" "$B"; expect_kept "$RB" 3 drift moved-marker-after-closing-check
+RB2="$T/run-moved-same-second"; evidence_run "$RB2"
+touch -d "@$(closing_at "$RB2")" "$RB2/markers/B.json"
+serve_pair 112 "$A" "$B"; expect_kept "$RB2" 3 drift moved-marker-same-second-as-check
+# (c) No marker at all: an old challenge.complete.json alone is not lane evidence.
+RN="$T/run-moved-no-marker"; evidence_run "$RN"; rm "$RN"/markers/*.json
+serve_pair 112 "$A" "$B"; expect_kept "$RN" 3 drift moved-without-markers
+# (d) The challenger completed after the closing check.
+RD="$T/run-moved-late-challenge"; evidence_run "$RD"
+touch -d "@$(( $(closing_at "$RD") + 1 ))" "$RD/challenger/challenge.complete.json"
+serve_pair 112 "$A" "$B"; expect_kept "$RD" 3 drift moved-challenge-after-closing-check
+# (e) Source mismatch and an unreadable read.
+RS="$T/run-moved-source"; mkdir -p "$RS"; pr_contract "$RS" "$SRC_SHA"; evidence_run "$RS" "$SRC_SHA" "$SRC_SHA"
+serve_pair 112 "$A" "$B"; expect_kept "$RS" 3 source-mismatch moved-source-mismatch
+RU="$T/run-moved-unreadable"; evidence_run "$RU"
+printf 'not json' > "$SMOKE_PAIR_FIXTURE_DIR/fe.json"; expect_kept "$RU" 2 unreadable moved-live-read-unreadable
 
 echo "smoke pair identity tests passed"

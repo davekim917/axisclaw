@@ -1,6 +1,8 @@
 import { getConfig } from './config.js';
 import { getTaskSeriesId } from './db/session-routing.js';
 import { getAgentMailbox } from './mailbox/index.js';
+import { discardUncredited, takeUncredited } from './source-ledger.js';
+import { summarizeSources } from './turn-sources.js';
 
 /**
  * Context occupancy is kept here, not on `TurnUsageInfo`: the usage ledger
@@ -81,6 +83,7 @@ export function setTurnSettings(nextModel?: string | null, nextEffort?: string |
  * effort survive: they are standing configuration.
  */
 export function clearContextTokens(): void {
+  discardUncredited();
   if (contextTokens === null && servedModel === null && !persistFailed) return;
   contextTokens = null;
   servedModel = null;
@@ -352,6 +355,14 @@ function statusSubtextEnabled(): boolean {
   }
 }
 
+function sourcesFooterEnabled(): boolean {
+  try {
+    return getConfig().sourcesFooter;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * The only stamping decision, reached through `withStatusSubtext`. Both reply
  * paths (`<message>` envelopes and the `send_message` MCP tool, the default
@@ -369,15 +380,6 @@ export function stampStatusSubtext(msg: {
   content: string;
 }): string {
   if (msg.agentReply !== true || msg.kind !== 'chat') return msg.content;
-  // Hydrate first: in the send_message subprocess nothing set this state in memory.
-  hydrateTurnStatus();
-  if (!isOwnConversation(msg.channel_type, msg.platform_id) && !isTaskOutput(msg.channel_type, msg.platform_id)) {
-    return msg.content;
-  }
-  if (!statusSubtextEnabled()) return msg.content;
-  const subtext = formatStatusSubtext();
-  if (!subtext) return msg.content;
-
   let parsed: unknown;
   try {
     parsed = JSON.parse(msg.content);
@@ -386,8 +388,22 @@ export function stampStatusSubtext(msg: {
   }
   if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return msg.content;
   const payload = parsed as Record<string, unknown>;
-  if (Object.prototype.hasOwnProperty.call(payload, 'subtext')) return msg.content;
-  payload.subtext = subtext;
+  // Only the ledger names sources: a `sources` key from anywhere else is dropped, never rendered.
+  const hadSources = Object.prototype.hasOwnProperty.call(payload, 'sources');
+  delete payload.sources;
+  const unchanged = hadSources ? JSON.stringify(payload) : msg.content;
+
+  // Hydrate first: in the send_message subprocess nothing set this state in memory.
+  hydrateTurnStatus();
+  if (!isOwnConversation(msg.channel_type, msg.platform_id) && !isTaskOutput(msg.channel_type, msg.platform_id)) {
+    return unchanged;
+  }
+  const subtext =
+    statusSubtextEnabled() && !Object.prototype.hasOwnProperty.call(payload, 'subtext') ? formatStatusSubtext() : null;
+  const sources = sourcesFooterEnabled() ? summarizeSources(takeUncredited()) : null;
+  if (!subtext && !sources) return unchanged;
+  if (subtext) payload.subtext = subtext;
+  if (sources) payload.sources = sources;
   return JSON.stringify(payload);
 }
 

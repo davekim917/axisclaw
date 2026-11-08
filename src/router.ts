@@ -49,14 +49,15 @@ import {
 } from './db/channel-ingress-receipts.js';
 import { findSessionForAgent, markSessionEngaged } from './db/sessions.js';
 import { buildThreadContextBlock, withThreadContext } from './thread-context.js';
-import { cancelPendingGatesForSession, sessionHasActiveGates } from './modules/bash-gate/index.js';
+import { trackOpenedThread } from './thread-title.js';
+import { offerGateWithdraw, sessionHasActiveGates } from './modules/bash-gate/index.js';
 import { startTypingRefresh, stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
 import { resolveSession, sessionMessageExists, writeSessionMessageIfNew } from './session-manager.js';
 import { withExistingNanoclawOutbound } from './modules/mailbox/index.js';
+import { archiveTenancyOf } from './archive-tenancy.js';
 import { archiveMessage } from './message-archive.js';
 import { parseMessageFlags, formatFlagConfirmation, type FlagIntent } from './flag-parser.js';
-import { maybeRenameNewThread } from './topic-title.js';
 import { sessionStillActive } from './container-runner.js';
 import { requestWake } from './request-wake.js';
 import { getContainerConfig, resolveProviderName } from './db/container-configs.js';
@@ -341,6 +342,7 @@ interface ParsedContent {
   text?: string;
   sender?: string;
   senderId?: string;
+  author?: { isBot?: unknown };
   /** Present when chat-sdk-bridge downloaded files with the message. */
   attachments?: unknown[];
 }
@@ -959,31 +961,36 @@ async function evaluateEngage(
  * Mirror an inbound user message into archive.db (assistant replies are archived on delivery). An upsert, so both
  * paths may call it. The return value is a precondition for the non-engaged skip, not diagnostics.
  */
-function archiveInboundUserMessage(
+async function archiveInboundUserMessage(
   agent: MessagingGroupAgent,
   mg: MessagingGroup,
   event: InboundEvent,
   userId: string | null,
   parsedContent: ParsedContent,
   effectiveThreadId: string | null,
-): boolean {
+): Promise<boolean> {
   if (event.message.kind !== 'chat' && event.message.kind !== 'chat-sdk') return false;
   if (!parsedContent.text) return false;
   try {
-    archiveMessage({
-      id: messageIdForAgent(event.message.id, agent.agent_group_id),
-      agentGroupId: agent.agent_group_id,
-      messagingGroupId: mg.id,
-      channelType: event.channelType,
-      channelName: mg.name ?? null,
-      platformId: event.platformId,
-      threadId: effectiveThreadId,
-      role: 'user',
-      senderId: userId,
-      senderName: parsedContent.sender ?? null,
-      text: parsedContent.text,
-      sentAt: event.message.timestamp,
-    });
+    const tenancy = await archiveTenancyOf(agent.agent_group_id);
+    archiveMessage(
+      {
+        id: messageIdForAgent(event.message.id, agent.agent_group_id),
+        agentGroupId: agent.agent_group_id,
+        messagingGroupId: mg.id,
+        channelType: event.channelType,
+        channelName: mg.name ?? null,
+        platformId: event.platformId,
+        threadId: effectiveThreadId,
+        role: 'user',
+        senderId: userId,
+        senderName: parsedContent.sender ?? null,
+        senderIsBot: typeof parsedContent.author?.isBot === 'boolean' ? parsedContent.author.isBot : undefined,
+        text: parsedContent.text,
+        sentAt: event.message.timestamp,
+      },
+      tenancy,
+    );
     return true;
   } catch (err) {
     log.warn('Failed to archive inbound user message', {
@@ -1050,7 +1057,7 @@ async function deliverToAgent(
     effectiveThreadId !== null &&
     typeof adapter?.fetchThreadHistory === 'function' &&
     (await findSessionForAgent(agent.agent_group_id, mg.id, effectiveThreadId)) === undefined &&
-    archiveInboundUserMessage(agent, mg, event, userId, parsedContent, effectiveThreadId)
+    (await archiveInboundUserMessage(agent, mg, event, userId, parsedContent, effectiveThreadId))
   ) {
     log.debug('Skipped session creation for non-engaged thread message', {
       agentGroupId: agent.agent_group_id,
@@ -1080,18 +1087,17 @@ async function deliverToAgent(
     return;
   }
 
-  // A follow-up to a session with a pending bash/destructive gate implicitly rejects it so the turn can end.
-  if (!created && sessionHasActiveGates(session.id)) {
-    cancelPendingGatesForSession(session.id, 'Cancelled — user sent a follow-up message.').catch((err) => {
-      log.warn('cancelPendingGatesForSession failed', { sessionId: session.id, err });
+  if (!created && wake && parsedContent.author?.isBot !== true && sessionHasActiveGates(session.id)) {
+    offerGateWithdraw(session.id, userId).catch((err) => {
+      log.warn('offerGateWithdraw failed', { sessionId: session.id, err });
     });
   }
 
-  // Title freshly created Discord threads (src/topic-title.ts). Gated on `wake`: a non-engaging accumulate sibling
-  // must not clobber the engaged sibling's title.
+  // A thread this message opened gets its row (src/thread-title.ts). Gated on `wake`: the row names the bot that renames
+  // the thread, and that must be the engaged sibling, not a non-engaging accumulate one.
   if (created && wake) {
     const firstText = parsedContent.text ?? '';
-    if (firstText) await maybeRenameNewThread(event.channelType, effectiveThreadId, firstText, event.message.id);
+    if (firstText) await trackOpenedThread(event.channelType, effectiveThreadId, firstText, event.message.id);
   }
 
   const persistedContent = persistInboundAttachments(
@@ -1220,7 +1226,7 @@ async function deliverToAgent(
 
   // Archive BEFORE the session write: the pre-turn recall row resolves sender names from messages_archive, so a
   // thread's first sender would otherwise be unnamed until their second message.
-  archiveInboundUserMessage(agent, mg, event, userId, parsedContent, effectiveThreadId);
+  await archiveInboundUserMessage(agent, mg, event, userId, parsedContent, effectiveThreadId);
 
   const inserted = await writeSessionMessageIfNew(
     session.agent_group_id,

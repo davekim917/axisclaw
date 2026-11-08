@@ -151,6 +151,13 @@ describe('Discord secret intake', () => {
     expect(f.bodies()[0].data.content).toContain('"Client ID" is empty. Nothing was stored.');
   });
 
+  it('does not claim nothing was stored when a resubmit finds the request already stored', async () => {
+    const f = stubFetch();
+    const intake = hooks({ submit: async () => ({ ok: false, message: 'This secret request is already stored.' }) });
+    await handleForwardedEvent(submit('si-abc', []), gatewayAdapter(), setup(intake), 'bot');
+    expect(f.bodies()[0].data.content).toBe('This secret request is already stored.');
+  });
+
   it('leaves every other interaction to the existing handlers', async () => {
     const f = stubFetch();
     const intake = hooks();
@@ -230,5 +237,89 @@ describe('Discord secret intake', () => {
     expect(f.bodies()[0]?.type).toBe(9);
     release();
     await slow;
+  });
+});
+
+/** The Gateway listener sends a channel's next packet only once the local server has answered the previous one. */
+function orderedForwarder(url: string) {
+  let tail = Promise.resolve();
+  return (body: string) => {
+    tail = tail.then(
+      () =>
+        new Promise<void>((resolve, reject) => {
+          const req = http.request(url, { method: 'POST', headers: { 'x-discord-gateway-token': 'bot' } }, (res) => {
+            res.resume();
+            res.on('end', () => resolve());
+          });
+          req.on('error', reject);
+          req.end(body);
+        }),
+    );
+    return tail;
+  };
+}
+
+describe('Discord secret intake behind earlier packets of the same thread', () => {
+  it('answers a click while an earlier message of that thread is still being handled', async () => {
+    const f = stubFetch();
+    let release: (() => void) | undefined;
+    const handleWebhook = vi.fn(
+      () => new Promise<Response>((resolve) => (release = () => resolve(new Response('ok')))),
+    );
+    const url = await startLocalWebhookServer({ name: 'discord', handleWebhook } as never, setup(hooks()), 'bot');
+    const forward = orderedForwarder(url);
+
+    void forward(JSON.stringify({ type: 'GATEWAY_MESSAGE_CREATE', data: { channel_id: 'thread-1' } }));
+    const drained = forward(click('si-abc'));
+    await vi.waitFor(() => expect(handleWebhook).toHaveBeenCalledTimes(1));
+    try {
+      await vi.waitFor(() => expect(f.bodies()[0]?.type).toBe(9), { timeout: 1000 });
+    } finally {
+      release?.();
+      await drained;
+    }
+  });
+
+  it('still hands a thread’s messages to the adapter one at a time, in the order they were forwarded', async () => {
+    const releases: Array<() => void> = [];
+    const handleWebhook = vi.fn(
+      (_request: Request) => new Promise<Response>((resolve) => releases.push(() => resolve(new Response('ok')))),
+    );
+    const url = await startLocalWebhookServer({ name: 'discord', handleWebhook } as never, setup(), 'bot');
+    const forward = orderedForwarder(url);
+    const message = (id: string) => JSON.stringify({ type: 'GATEWAY_MESSAGE_CREATE', data: { id } });
+
+    void forward(message('m-1'));
+    const drained = forward(message('m-2'));
+    await drained;
+    expect(handleWebhook).toHaveBeenCalledTimes(1);
+    releases.shift()!();
+    await vi.waitFor(() => expect(handleWebhook).toHaveBeenCalledTimes(2));
+    releases.shift()!();
+    const ids = await Promise.all(
+      handleWebhook.mock.calls.map(async ([request]) => ((await request.json()) as { data: { id: string } }).data.id),
+    );
+    expect(ids).toEqual(['m-1', 'm-2']);
+  });
+
+  it('answers a second submit while Discord has not yet answered the first', async () => {
+    const answers: Array<() => void> = [];
+    const fetchMock = vi.fn(
+      (_input: unknown, _init?: RequestInit) =>
+        new Promise<Response>((resolve) => answers.push(() => resolve(new Response(null, { status: 204 })))),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    const url = await startLocalWebhookServer(gatewayAdapter(), setup(hooks()), 'bot');
+    const forward = orderedForwarder(url);
+
+    void forward(submit('si-abc', []));
+    const drained = forward(submit('si-abc', []));
+    try {
+      await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2), { timeout: 1000 });
+    } finally {
+      const answerAll = setInterval(() => answers.splice(0).forEach((answer) => answer()), 5);
+      await drained;
+      clearInterval(answerAll);
+    }
   });
 });

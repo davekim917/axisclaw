@@ -15,11 +15,18 @@ import { unguarded } from '../../guard/index.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { withExistingMailboxSession } from '../../session-manager.js';
 import { log } from '../../log.js';
-import { SessionDbMissingError, SessionDbUnopenableError } from '../mailbox/index.js';
+import { readSessionInbound, SessionDbMissingError, SessionDbUnopenableError } from '../mailbox/index.js';
+import { getAgentGroup } from '../../db/agent-groups.js';
+import { withCentralSync } from '../../db/central-lease.js';
+import { readContainerConfig } from '../../container-config.js';
+import { hasAdminPrivilege } from '../permissions/db/user-roles.js';
+import { resolveUserChannelType } from '../permissions/user-dm.js';
+import { getUser } from '../permissions/db/users.js';
 import type { PendingApproval, Session } from '../../types.js';
 import {
   deletePendingApproval,
   getApprovalByRequestId,
+  getPendingApproval,
   getPendingApprovalsByAction,
   getPendingApprovalsBySession,
   getSession,
@@ -44,18 +51,21 @@ const GATE_CARD_TITLE_MAX_CHARS = 140;
 // The card body (summary, command preview, footer) is budgeted in UTF-16 units so
 // that both the posted card and its approve/reject edit (title, body and resolution
 // line as one message) fit the platform's text limit; past it the footer, the
-// command's tail or the resolution line would be dropped silently. The limits are
-// the adapters' configured maxTextLength (Slack 2800, Discord 1900), copied because
-// adapters are skill-installed and may be absent; 1900 also covers any other platform.
-const SLACK_MESSAGE_MAX_UNITS = 2800;
-const OTHER_MESSAGE_MAX_UNITS = 1900;
+// command's tail or the resolution line would be dropped silently.
 const GATE_COMMAND_PREVIEW_MIN_UNITS = 600;
+
+const WITHDRAW_ACTION = 'gate-withdraw';
+/** Withdraw cards being posted, so two quick messages from one sender post one card. */
+const offering = new Set<string>();
+const WITHDRAW_OPTIONS = [
+  { label: 'Withdraw', selectedLabel: '↩️ Withdrawn', value: 'approve', style: 'danger' as const },
+];
 
 const pendingTimeouts = new Map<string, NodeJS.Timeout>();
 
 /**
- * Lets the router skip the cancel query in the common case. Not persisted, so after a host restart an adopted
- * container's open gate is missing here and a follow-up message does not cancel it.
+ * Lets the router skip the gate query in the common case. Not persisted, so after a host restart an adopted
+ * container's open gate is missing here and a follow-up offers no Withdraw.
  */
 const sessionsWithActiveGates = new Set<string>();
 
@@ -80,10 +90,11 @@ async function writeGateAck(
   requestId: string,
   outcome: 'approved' | 'rejected' | 'timeout',
   errorText?: string,
+  receipt: string | null = null,
 ): Promise<void> {
   await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) => {
     if (outcome === 'approved') {
-      mailbox.markDelivered(requestId, null);
+      mailbox.markDelivered(requestId, receipt);
     } else {
       mailbox.markDeliveryFailed(requestId, errorText ?? outcome);
     }
@@ -106,6 +117,15 @@ interface GateCategory {
   logPrefix: string;
   titleEmoji: string;
   kindNoun: string;
+  /** Owner or admin of the agent group only, though the card is posted in the thread. */
+  adminClickOnly?: boolean;
+  /** From a session with no conversation, the card goes to the group's `sends_as_user_id` instead of being refused. */
+  chatlessToSender?: boolean;
+  /**
+   * The request may carry `pureSend`, which the container's email gate sets only when the command is the send alone and
+   * its summary shows all of it. The card then leaves the command off.
+   */
+  summaryMayStandForCommand?: boolean;
 }
 
 function tailUnits(text: string, units: number): string {
@@ -124,16 +144,32 @@ function commandPreview(command: string, units: number): string {
   return headUnits(command, headLength) + marker + tailUnits(command, units - marker.length - headLength);
 }
 
-function cardBodyBudget(platformId: string | undefined, title: string): number {
+// The adapters' configured maxTextLength (Slack 2800, Discord 1900), copied because adapters are skill-installed and
+// may be absent; 1900 also covers any other platform.
+const SLACK_MESSAGE_MAX_UNITS = 2800;
+const OTHER_MESSAGE_MAX_UNITS = 1900;
+
+export function cardBodyBudget(platformId: string | undefined, title: string): number {
   const limit = platformId?.startsWith('slack:') ? SLACK_MESSAGE_MAX_UNITS : OTHER_MESSAGE_MAX_UNITS;
   // The edit is `title\n\nbody\n\nresolution`; Discord's post wraps the title as `**title**\n\n`, which is shorter.
   return limit - title.length - '\n\n\n\n'.length - APPROVAL_RESOLUTION_MAX_UNITS;
 }
 
-function buildCardBody(category: GateCategory, summary: string, command: string, budget: number): string {
+function buildCardBody(
+  category: GateCategory,
+  summary: string,
+  command: string,
+  budget: number,
+  pureSend: boolean,
+): string {
   const timeoutMinutes = BASH_GATE_TIMEOUT_MS / 60_000;
-  const footer = `_Reject, or no answer within ${timeoutMinutes} min, cancels the ${category.kindNoun.toLowerCase()}._`;
+  const who = category.adminClickOnly ? ' Only an owner or admin of this agent can approve.' : '';
+  const footer = `_Reject, or no answer within ${timeoutMinutes} min, cancels the ${category.kindNoun.toLowerCase()}.${who}_`;
   const separator = '\n\n';
+  if (pureSend) {
+    const card = [summary, footer].join(separator);
+    if (card.length <= budget) return card;
+  }
   const fence = (body: string) => '```\n' + body + '\n```';
   const fixed = footer.length + separator.length + (command ? fence('').length + separator.length : 0);
   const summaryUnits = budget - fixed - Math.min(GATE_COMMAND_PREVIEW_MIN_UNITS, command.length);
@@ -158,6 +194,84 @@ function buildCardTitle(category: GateCategory, label: string): string {
       .join('')
       .trimEnd() + '…'
   );
+}
+
+export const NOBODY_WATCHING =
+  'Refused, and retrying will not change it: this session has no conversation, so nobody is watching to approve ' +
+  'this. Hand the step to a person: say in your report exactly what needs to run and why, then stop.';
+const TASK_BRIEF_MAX_UNITS = 200;
+
+export function taskBrief(session: Session): string | null {
+  try {
+    const prompt = readSessionInbound(
+      { agentGroupId: session.agent_group_id, sessionId: session.id },
+      (mailbox) => mailbox.getLatestTaskEvent()?.prompt ?? null,
+    );
+    const line = prompt
+      ?.split('\n')
+      .find((l) => l.trim())
+      ?.trim();
+    if (!line) return null;
+    return line.length <= TASK_BRIEF_MAX_UNITS ? line : headUnits(line, TASK_BRIEF_MAX_UNITS - 1) + '…';
+  } catch (err) {
+    log.warn('Gate card could not read the task that asked', { sessionId: session.id, err });
+    return null;
+  }
+}
+
+export function chatlessCardBudget(dmChannelType: string | null, title: string): number {
+  return cardBodyBudget(dmChannelType?.startsWith('slack') ? 'slack:' : undefined, title);
+}
+
+function commandCarries(command: string, text: string): boolean {
+  return command.includes(text) || command.includes(JSON.stringify(text).slice(1, -1));
+}
+
+/** The group's `sends_as_user_id`, while that person is an owner or admin of the group; null otherwise. */
+export async function chatlessSender(session: Session): Promise<string | null> {
+  const group = await getAgentGroup(session.agent_group_id);
+  const approverUserId = group ? readContainerConfig(group.folder).sends_as_user_id : undefined;
+  if (!approverUserId) return null;
+  const allowed = await withCentralSync(
+    () => hasAdminPrivilege(approverUserId, session.agent_group_id),
+    'chat-less send approver',
+  );
+  return allowed ? approverUserId : null;
+}
+
+/**
+ * The card for a gate filed where nobody is watching, or the refusal the agent reads instead. Only a post goes to a
+ * person, and only to the one whose credentials it posts with; the card never cuts the command short, because that
+ * person has no thread around it to fill in what a preview leaves out.
+ */
+async function chatlessCard(
+  category: GateCategory,
+  session: Session,
+  title: string,
+  summary: string,
+  command: string,
+  sendParts: unknown,
+): Promise<string | { approverUserId: string; question: string }> {
+  if (!category.chatlessToSender) return NOBODY_WATCHING;
+  const approverUserId = await chatlessSender(session);
+  if (!approverUserId) return `${NOBODY_WATCHING} No one is set to approve posts from background sessions here.`;
+
+  const fence = (body: string) => '```\n' + body + '\n```';
+  const brief = taskBrief(session);
+  const footer = `_Reject, or no answer within ${BASH_GATE_TIMEOUT_MS / 60_000} min, cancels the ${category.kindNoun}._`;
+  const head = [`_Asked by a background task with no conversation${brief ? `: ${brief}` : ''}_`, summary];
+  const text = Array.isArray(sendParts) && typeof sendParts[0] === 'string' ? sendParts[0] : null;
+  if (text === null) return `${NOBODY_WATCHING} The post's text could not be read from the command to show on a card.`;
+  const dmChannel = await resolveUserChannelType(approverUserId);
+  const budget = chatlessCardBudget(dmChannel, title);
+  const card = (parts: string[]) => [...parts, 'Command:', fence(command), footer].join('\n\n');
+  const withText = card([...head, 'Text, exactly as it will post:', fence(text)]);
+  if (withText.length <= budget) return { approverUserId, question: withText };
+  // The command alone shows the text only when it carries it verbatim; `--data @file` does not.
+  if (commandCarries(command, text) && card(head).length <= budget) {
+    return { approverUserId, question: card(head) };
+  }
+  return `${NOBODY_WATCHING} The post is too long to show in full on a card.`;
 }
 
 function createGateHandler(category: GateCategory) {
@@ -191,6 +305,20 @@ function createGateHandler(category: GateCategory) {
       log.info('Gate request expired before it was posted', { sessionId: session.id, requestId });
       return { deferAck: true };
     }
+    const title = buildCardTitle(category, label);
+    let chatless: { approverUserId: string; question: string } | null = null;
+    if (!session.messaging_group_id) {
+      const decided = await chatlessCard(category, session, title, summary, command, content.sendParts);
+      if (typeof decided === 'string') {
+        await writeGateAck(session, requestId, 'rejected', decided);
+        log.info(`${category.logPrefix} gate refused: the session has no conversation`, {
+          sessionId: session.id,
+          requestId,
+        });
+        return { deferAck: true };
+      }
+      chatless = decided;
+    }
     await supersedeOrphanedGates(session);
     sessionsWithActiveGates.add(session.id);
 
@@ -215,7 +343,6 @@ function createGateHandler(category: GateCategory) {
       sessionId: session.id,
     };
 
-    const title = buildCardTitle(category, label);
     const platformId = session.messaging_group_id
       ? (await getMessagingGroup(session.messaging_group_id))?.platform_id
       : undefined;
@@ -226,11 +353,21 @@ function createGateHandler(category: GateCategory) {
       requestId,
       payload: payload as unknown as Record<string, unknown>,
       title,
-      question: buildCardBody(category, summary, command, cardBodyBudget(platformId, title)),
+      question:
+        chatless?.question ??
+        buildCardBody(
+          category,
+          summary,
+          command,
+          cardBodyBudget(platformId, title),
+          category.summaryMayStandForCommand === true && content.pureSend === true,
+        ),
       // In-thread: thread access IS the authority for work-level gates
-      // (response-handler.ts doesn't check clicker identity). Self-mod and
-      // credential approvals stay admin-DM.
-      deliveryTarget: 'thread',
+      // (response-handler.ts doesn't check clicker identity) unless the category
+      // is adminClickOnly. Self-mod and credential approvals stay admin-DM.
+      ...(chatless
+        ? { deliveryTarget: 'admin' as const, approverUserId: chatless.approverUserId }
+        : { deliveryTarget: 'thread' as const }),
     });
     if (!approvalDelivered) {
       clearPending(requestId);
@@ -279,6 +416,7 @@ function createApprovalHandler(logPrefix: string) {
     }
     clearPending(p.requestId);
     sessionsWithActiveGates.delete(p.sessionId);
+    await closeWithdrawOffers(ctx.approval.approval_id);
 
     const session = await getSession(p.sessionId);
     if (!session) {
@@ -305,6 +443,7 @@ const BASH_GATE: GateCategory = {
   logPrefix: 'Bash',
   titleEmoji: '⚠️',
   kindNoun: 'command',
+  summaryMayStandForCommand: true,
 };
 const DESTRUCTIVE_GATE: GateCategory = {
   deliveryAction: 'request_destructive_gate',
@@ -315,19 +454,41 @@ const DESTRUCTIVE_GATE: GateCategory = {
   titleEmoji: '🛑',
   kindNoun: 'destructive command',
 };
+const PROD_GATE: GateCategory = {
+  deliveryAction: 'request_prod_gate',
+  approvalAction: 'prod-gate',
+  defaultLabel: 'Change an owner or admin must approve',
+  defaultSummary: 'The agent wants to make a change that only an owner or admin can approve.',
+  logPrefix: 'Owner-or-admin',
+  titleEmoji: '🚨',
+  kindNoun: 'change',
+  adminClickOnly: true,
+};
+const SEND_GATE: GateCategory = {
+  deliveryAction: 'request_send_gate',
+  approvalAction: 'send-gate',
+  defaultLabel: 'Post in your name',
+  defaultSummary: 'The agent wants to post as you.',
+  logPrefix: 'Send',
+  titleEmoji: '✉️',
+  kindNoun: 'post',
+  adminClickOnly: true,
+  chatlessToSender: true,
+  summaryMayStandForCommand: true,
+};
+const GATE_CATEGORIES = [BASH_GATE, DESTRUCTIVE_GATE, PROD_GATE, SEND_GATE];
 
-registerDeliveryAction(
-  BASH_GATE.deliveryAction,
-  createGateHandler(BASH_GATE),
-  unguarded('request path only; execution waits for the registered bash-gate approval handler'),
-);
-registerApprovalHandler(BASH_GATE.approvalAction, createApprovalHandler(BASH_GATE.logPrefix));
-registerDeliveryAction(
-  DESTRUCTIVE_GATE.deliveryAction,
-  createGateHandler(DESTRUCTIVE_GATE),
-  unguarded('request path only; execution waits for the registered destructive-gate approval handler'),
-);
-registerApprovalHandler(DESTRUCTIVE_GATE.approvalAction, createApprovalHandler(DESTRUCTIVE_GATE.logPrefix));
+for (const category of GATE_CATEGORIES) {
+  registerDeliveryAction(
+    category.deliveryAction,
+    createGateHandler(category),
+    unguarded(`request path only; execution waits for the registered ${category.approvalAction} approval handler`),
+  );
+  registerApprovalHandler(category.approvalAction, createApprovalHandler(category.logPrefix), {
+    adminClickOnly: category.adminClickOnly,
+  });
+}
+registerApprovalHandler(WITHDRAW_ACTION, handleWithdraw);
 
 // A container polls for its gate's decision, and an agent's hook that stops waiting may run the command, so a
 // reject is written as soon as the approval layer reports it.
@@ -389,7 +550,7 @@ async function expireGate(
  */
 export async function expireOverdueGates(now: number = Date.now()): Promise<number> {
   let expired = 0;
-  for (const category of [BASH_GATE, DESTRUCTIVE_GATE]) {
+  for (const category of GATE_CATEGORIES) {
     for (const p of await getPendingApprovalsByAction(category.approvalAction)) {
       if (!p.session_id || pendingTimeouts.has(p.request_id)) continue;
       if (
@@ -438,6 +599,7 @@ export function _dropGateTimersForTesting(): void {
 }
 
 async function releaseActiveGate(sessionId: string, resolvedApprovalId: string): Promise<void> {
+  await closeWithdrawOffers(resolvedApprovalId);
   const siblings = (await getPendingApprovalsBySession(sessionId)).filter(
     (p) => isGateAction(p.action) && p.approval_id !== resolvedApprovalId,
   );
@@ -445,7 +607,7 @@ async function releaseActiveGate(sessionId: string, resolvedApprovalId: string):
 }
 
 function isGateAction(action: string): boolean {
-  return action === BASH_GATE.approvalAction || action === DESTRUCTIVE_GATE.approvalAction;
+  return GATE_CATEGORIES.some((category) => category.approvalAction === action);
 }
 
 /**
@@ -519,51 +681,135 @@ async function supersedeOrphanedGates(session: Session): Promise<void> {
       log.warn('Failed to edit superseded gate card', { approvalId: p.approval_id, err });
     }
     await deletePendingApproval(p.approval_id);
+    await closeWithdrawOffers(p.approval_id);
     log.info('Gate superseded by a restarted container', { approvalId: p.approval_id, requestId: p.request_id });
   }
 }
 
 /**
- * A follow-up message implicitly rejects the session's open gates so the
- * agent can answer it instead of staying blocked. Card edit is best-effort;
- * the pending_approvals row is deleted so a late click can't approve a
- * cancelled gate.
+ * Rejects one open gate outside the card: the waiting command reads `reason`, and the card shows `cardText`.
+ * False when the gate was already answered, or its decision could not be written (its timeout still applies).
  */
-export async function cancelPendingGatesForSession(sessionId: string, reason: string): Promise<void> {
-  const pending: PendingApproval[] = (await getPendingApprovalsBySession(sessionId)).filter((p) =>
-    isGateAction(p.action),
-  );
-  if (pending.length === 0) return;
+async function settleGate(
+  p: PendingApproval,
+  session: Session,
+  reason: string,
+  cardText: string,
+): Promise<'settled' | 'answered' | 'failed'> {
+  if (!(await transitionPendingApprovalStatus(p.approval_id, 'pending', 'rejected'))) return 'answered';
+  try {
+    // request_id is the gate's own outbound message id, which the container polls on.
+    await writeGateAck(session, p.request_id, 'rejected', reason);
+  } catch (err) {
+    await transitionPendingApprovalStatus(p.approval_id, 'rejected', 'pending');
+    log.warn('Failed to settle a gate; its timeout still applies', { approvalId: p.approval_id, err });
+    return 'failed';
+  }
+  clearPending(p.request_id);
+  try {
+    await editApprovalCard(p, cardText);
+  } catch (err) {
+    log.warn('Failed to edit a settled gate card', { approvalId: p.approval_id, err });
+  }
+  await deletePendingApproval(p.approval_id);
+  await releaseActiveGate(session.id, p.approval_id);
+  return 'settled';
+}
 
+interface WithdrawPayload {
+  gateApprovalId: string;
+  sender: string;
+}
+
+/**
+ * A message into a session whose turn waits on a gate leaves the gate open; the agent reads the message once the
+ * gate is answered or times out. A sender who cannot answer the gate gets a card only they can press to withdraw it,
+ * since nothing else they can do frees the turn before the timeout.
+ */
+export async function offerGateWithdraw(sessionId: string, sender: string | null): Promise<void> {
+  if (!sender) return;
   const session = await getSession(sessionId);
-  if (!session) {
-    log.warn('cancelPendingGatesForSession called for unknown session', { sessionId });
-    return;
+  if (!session) return;
+  // The response handler's import chain reaches the router, which imports this module.
+  const { canAnswerApproval } = await import('../approvals/response-handler.js');
+  for (const gate of await getPendingApprovalsBySession(sessionId)) {
+    if (!isGateAction(gate.action) || gate.status !== 'pending') continue;
+    const requestId = `withdraw:${gate.approval_id}:${sender}`;
+    if (offering.has(requestId)) continue;
+    offering.add(requestId);
+    try {
+      if (await canAnswerApproval(gate, sender)) continue;
+      if (await getApprovalByRequestId(requestId, sessionId, WITHDRAW_ACTION)) continue;
+      await postWithdraw(session, gate, sender, requestId);
+      // The gate may have been answered while the card was posted, after its settle closed the offers it could see.
+      if ((await getPendingApproval(gate.approval_id))?.status !== 'pending')
+        await closeWithdrawOffers(gate.approval_id);
+    } finally {
+      offering.delete(requestId);
+    }
   }
+}
 
-  log.info('Auto-cancelling in-flight gates', {
-    sessionId,
-    count: pending.length,
-    approvalIds: pending.map((p) => p.approval_id),
+async function postWithdraw(session: Session, gate: PendingApproval, sender: string, requestId: string): Promise<void> {
+  const name = (await getUser(sender))?.display_name || sender;
+  const payload: WithdrawPayload = { gateApprovalId: gate.approval_id, sender };
+  await requestApproval({
+    session,
+    agentName: session.agent_group_id,
+    action: WITHDRAW_ACTION,
+    requestId,
+    payload: payload as unknown as Record<string, unknown>,
+    title: headUnits(`↩️ Withdraw: ${gate.title}`, GATE_CARD_TITLE_MAX_CHARS),
+    question: `${name}, the agent reads your message once the card above is answered. Withdraw that card to stop it waiting now: nothing it asked for runs.`,
+    deliveryTarget: 'thread',
+    approverUserId: sender,
+    options: WITHDRAW_OPTIONS,
   });
+}
 
-  for (const p of pending) {
-    if (!(await transitionPendingApprovalStatus(p.approval_id, 'pending', 'rejected'))) continue;
+/** A Withdraw card whose gate was settled some other way is closed, so no live button is left behind. */
+async function closeWithdrawOffers(gateApprovalId: string): Promise<void> {
+  if (!gateApprovalId) return;
+  for (const offer of await getPendingApprovalsByAction(WITHDRAW_ACTION)) {
+    if (offer.status !== 'pending' || withdrawPayload(offer)?.gateApprovalId !== gateApprovalId) continue;
+    if (!(await transitionPendingApprovalStatus(offer.approval_id, 'pending', 'rejected'))) continue;
     try {
-      // request_id is the gate's own outbound message id, which the container polls on.
-      await writeGateAck(session, p.request_id, 'rejected', reason);
+      await editApprovalCard(
+        offer,
+        `${offer.title}\n\nThe card above is no longer waiting, so there is nothing to withdraw.`,
+      );
     } catch (err) {
-      await transitionPendingApprovalStatus(p.approval_id, 'rejected', 'pending');
-      log.warn('Failed to cancel a gate; its timeout still applies', { approvalId: p.approval_id, err });
-      continue;
+      log.warn('Failed to close a Withdraw card', { approvalId: offer.approval_id, err });
     }
-    clearPending(p.request_id);
-    try {
-      await editApprovalCard(p, `❌ *${p.title}* — cancelled\n\n${reason}`);
-    } catch (err) {
-      log.warn('Failed to edit cancelled approval card', { approvalId: p.approval_id, err });
-    }
-    await deletePendingApproval(p.approval_id);
+    await deletePendingApproval(offer.approval_id);
   }
-  await releaseActiveGate(sessionId, '');
+}
+
+function withdrawPayload(offer: PendingApproval): Partial<WithdrawPayload> | null {
+  try {
+    return JSON.parse(offer.payload) as Partial<WithdrawPayload>;
+    // eslint-disable-next-line no-catch-all/no-catch-all -- a corrupt payload names no gate, so it is never closed here
+  } catch {
+    return null;
+  }
+}
+
+async function handleWithdraw(ctx: ApprovalHandlerContext): Promise<void | ApprovalDeclined> {
+  const { gateApprovalId } = ctx.payload as unknown as WithdrawPayload;
+  const gate = typeof gateApprovalId === 'string' ? await getPendingApproval(gateApprovalId) : undefined;
+  const session = gate ? await getSession(gate.session_id ?? '') : undefined;
+  if (!gate || !session || !isGateAction(gate.action) || gate.status !== 'pending') {
+    return { declined: 'That card was already answered, so there was nothing to withdraw.' };
+  }
+  const name = (await getUser(ctx.userId))?.display_name || ctx.userId;
+  const settled = await settleGate(
+    gate,
+    session,
+    `Withdrawn by ${name}.`,
+    `↩️ *${gate.title}* — withdrawn\n\n${name} withdrew it before anyone answered. Nothing ran.`,
+  );
+  if (settled === 'answered') return { declined: 'That card was already answered, so there was nothing to withdraw.' };
+  if (settled === 'failed')
+    return { declined: 'It could not be withdrawn; the card above still times out on its own.' };
+  log.info('Gate withdrawn by its requester', { approvalId: gate.approval_id, userId: ctx.userId });
 }

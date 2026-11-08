@@ -17,6 +17,9 @@ import type { Session } from './types.js';
  */
 export const THREAD_CONTEXT_LIMIT = 50;
 
+/** A pairing link in a bot's DM replays here as the bot's own message, and its code would mint a key that never expires. */
+const CREDENTIAL_LINK_RE = /\/(pair|replies)#[A-Za-z0-9_-]{43}/g;
+
 export interface ThreadContextOptions {
   /** Its `engaged_at` is the rule; a "did this call create the row" flag lost messages when another path won. */
   session: Session;
@@ -53,8 +56,9 @@ export async function buildThreadContextBlock(opts: ThreadContextOptions): Promi
             return messageMs === null || messageMs > sinceMs;
           });
     if (relevant.length === 0) return null;
-    const header = sinceMs === null ? 'Thread context' : 'New in thread since last response';
-    return `[${header}]\n${relevant.map((m) => `${m.sender}: ${m.text}`).join('\n')}`;
+    const header = sinceMs === null ? FIRST_WAKE_HEADER : FOLLOW_UP_HEADER;
+    const lines = relevant.map((m) => `${m.sender}: ${m.text.replace(CREDENTIAL_LINK_RE, '/$1#[code removed]')}`);
+    return `[${header}]\n${lines.join('\n')}`;
   } catch (err) {
     log.warn('Thread-context fetch failed — proceeding without context', {
       sessionId: opts.session.id,
@@ -66,6 +70,8 @@ export async function buildThreadContextBlock(opts: ThreadContextOptions): Promi
 }
 
 const LATEST_MESSAGE_MARKER = '[Latest message]\n';
+const FIRST_WAKE_HEADER = 'Thread context';
+const FOLLOW_UP_HEADER = 'New in thread since last response';
 
 function join(block: string, text: string): string {
   return `${block}\n${LATEST_MESSAGE_MARKER}${text}`;
@@ -77,11 +83,22 @@ export function latestMessageText(text: string): string {
   return idx === -1 ? text : text.slice(idx + LATEST_MESSAGE_MARKER.length);
 }
 
+export function withoutReplayedThread(text: string): string {
+  const replayed = [FIRST_WAKE_HEADER, FOLLOW_UP_HEADER].some((header) => text.startsWith(`[${header}]\n`));
+  return replayed ? latestMessageText(text) : text;
+}
+
 export function withThreadContext(contentJson: string, block: string | null): string {
   if (block === null) return contentJson;
   const parsed = JSON.parse(contentJson) as Record<string, unknown>;
   parsed.text = join(block, typeof parsed.text === 'string' ? parsed.text : '');
   return JSON.stringify(parsed);
+}
+
+export function threadSoFar(text: string): string | null {
+  const start = `[${FIRST_WAKE_HEADER}]\n`;
+  const end = text.lastIndexOf(LATEST_MESSAGE_MARKER);
+  return text.startsWith(start) && end !== -1 ? text.slice(start.length, end) : null;
 }
 
 /** Takes raw text, not a JSON content string (that would embed the block as a literal); use `withThreadContext`. */
@@ -101,4 +118,17 @@ export function parseUtcTimestampMs(value: string | null | undefined): number | 
   if (!/(?:[zZ]|[+-]\d{2}:?\d{2})$/.test(normalized)) normalized += 'Z';
   const ms = Date.parse(normalized);
   return Number.isNaN(ms) ? null : ms;
+}
+
+/**
+ * Where a reply to a post counts: in its thread; for a post with none (a channel's top level, or a DM, which can't
+ * hold threads), beside it at the root or in the thread opened under it, encoded `<platform_id>:<post id>`.
+ */
+export function replyThreads(
+  platformId: string,
+  threadId: string | null,
+  platformMessageId: string | null,
+): Array<string | null> {
+  if (threadId) return [threadId];
+  return platformMessageId ? [null, `${platformId}:${platformMessageId}`] : [null];
 }

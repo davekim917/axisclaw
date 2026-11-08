@@ -56,6 +56,8 @@ interface StdioMcpServerConfig {
    * it and injects both env vars when building the provider's server map.
    */
   pluginRoot?: string;
+  /** Tool-call timeout in ms, past a provider's default (Codex 300s, OpenCode 60s); each renders its own setting. */
+  timeout?: number;
   /**
    * Name of the plugin that stamped this server. Ownership marker: plugin-owned
    * servers reject CLI/self-mod edits and are swapped wholesale on restamp
@@ -167,7 +169,7 @@ const LITERAL_HEADER_ALLOWLIST = new Set([
   'x-request-id',
 ]);
 /** The value the OneCLI gateway replaces at the proxy boundary. */
-const ONECLI_PLACEHOLDER = 'onecli-managed';
+export const ONECLI_PLACEHOLDER = 'onecli-managed';
 /**
  * The bare placeholder or one auth-scheme token before it. A substring test would accept
  * `Bearer real-secret onecli-managed`.
@@ -510,6 +512,8 @@ export interface ContainerConfig {
   outcomeReporting?: boolean;
   /** Model/effort subtext under replies; ON unless `false`. Read by the runner from the mounted file. */
   statusSubtext?: boolean;
+  /** A recorded-sources line under data replies; ON unless `false`. Read by the runner from the mounted file. */
+  sourcesFooter?: boolean;
   /** Physical channel addresses whose routine outcomes belong to an existing external reporter. */
   outcomeReportingExternalChannels?: string[];
   /** Host-enrolled wiki actors fail closed if their private policy is absent. */
@@ -658,6 +662,12 @@ export interface ContainerConfig {
     hideRooms?: string[];
   };
 
+  /**
+   * Extra hosts a browser takeover hands over, keyed by `--site`. Takes effect only here, where an operator sets it:
+   * the agent cannot write this file. Validated by `browserSsoHosts`, which is what refuses a bad entry.
+   */
+  browserSso?: Record<string, string[]>;
+
   /** Matches workgroups.id (shared by an agent and its codex sibling). */
   workgroup_id?: string;
 
@@ -666,6 +676,18 @@ export interface ContainerConfig {
    * under the `<group>-noslack` OneCLI identity with it withheld, unless listed in `also_allowed_in`.
    */
   slack_user_token?: SlackUserTokenConfig;
+
+  /**
+   * users.id of the person whose own Slack or mail credentials this group's agents post with. A post from a session
+   * with no conversation gets its card in this person's DM, and only they can answer it; unset refuses such posts.
+   */
+  sends_as_user_id?: string;
+
+  /**
+   * The group's agents post, edit and upload in the owner's Slack name only through the host's `post_as_owner` and
+   * `upload_as_owner` tools, which show the exact text to the owner first; unset leaves those tools refused.
+   */
+  post_as_owner?: boolean;
 }
 
 /** Per-agent Slack user-token scoping. The token never appears in this config. */
@@ -823,6 +845,7 @@ function materializeContainerConfig(raw: Partial<ContainerConfig>): ContainerCon
     outcomeReporting: raw.outcomeReporting,
     // Only an explicit `false` opts out; `undefined` keeps the key out of a rewritten container.json.
     statusSubtext: raw.statusSubtext === false ? false : undefined,
+    sourcesFooter: raw.sourcesFooter === false ? false : undefined,
     outcomeReportingExternalChannels: Array.isArray(raw.outcomeReportingExternalChannels)
       ? raw.outcomeReportingExternalChannels.filter((value): value is string => typeof value === 'string')
       : [],
@@ -864,16 +887,24 @@ function materializeContainerConfig(raw: Partial<ContainerConfig>): ContainerCon
     dailySummary: raw.dailySummary,
     backlogCanvas: raw.backlogCanvas,
     observatory: raw.observatory,
+    browserSso: raw.browserSso,
     onecliSecrets: raw.onecliSecrets,
     previewOnecliSecrets: raw.previewOnecliSecrets,
     workgroup_id: raw.workgroup_id,
     slack_user_token: raw.slack_user_token,
+    sends_as_user_id:
+      typeof raw.sends_as_user_id === 'string' && raw.sends_as_user_id ? raw.sends_as_user_id : undefined,
+    post_as_owner: raw.post_as_owner === true ? true : undefined,
   };
 }
 
 /** Only an explicit `false` opts out. Operator views must show this AND the stored value (unset ≠ explicitly on). */
 export function effectiveStatusSubtext(config: Pick<ContainerConfig, 'statusSubtext'>): boolean {
   return config.statusSubtext !== false;
+}
+
+export function effectiveSourcesFooter(config: Pick<ContainerConfig, 'sourcesFooter'>): boolean {
+  return config.sourcesFooter !== false;
 }
 
 /** Fleet default without materializing it into operator-owned container.json. */

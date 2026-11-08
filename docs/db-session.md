@@ -84,6 +84,8 @@ CREATE TABLE messages_in (
   repo_fence_original_trigger INTEGER      -- exact trigger value restored on release
 );
 CREATE INDEX idx_messages_in_series ON messages_in(series_id);
+CREATE INDEX idx_messages_in_status ON messages_in(status, id);
+CREATE INDEX idx_messages_in_recurring ON messages_in(status) WHERE recurrence IS NOT NULL;
 ```
 
 Content shapes: see [api-details.md §Session DB Schema Details](api-details.md#session-db-schema-details).

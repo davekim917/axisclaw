@@ -92,6 +92,7 @@ describe('L-3: startHostModules fires after the delivery adapter and before the 
  * callback itself is the only way to get an identity across that seam.
  */
 const EXPECTED_HOST_START_REGISTRANTS = [
+  'approvedRunInterruptedHostStart',
   'backlogCanvasHostStart',
   'commitScanHostStart',
   'dailySummaryHostStart',

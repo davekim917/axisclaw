@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# nanoclaw-codex-rotation-shim: `codex` for the front of PATH, routing exec and a
+# bare app-server through codex-exec.sh so they rotate Codex accounts.
+set -uo pipefail
+
+codex_exec="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../codex-exec.sh"
+real=$(bash "$codex_exec" --real-bin) || exit 127
+export CODEX_REAL_BIN="$real"
+# exec goes through codex-exec.sh, which completes a deferred plugin registration itself.
+ensure_home() {
+  [ -n "${NANOCLAW_CODEX_REGISTER:-}" ] || return 0
+  local home
+  home=$(bash "$codex_exec" --ensure-home) || exit 1
+  [ -n "$home" ] && export CODEX_HOME="$home"
+}
+
+case "${1:-}" in
+  exec | e)
+    shift
+    if [ -t 0 ] || [ ! -e /dev/stdin ]; then
+      exec bash "$codex_exec" -- "$@"
+    fi
+    exec bash "$codex_exec" --prompt-file - -- "$@"
+    ;;
+  app-server)
+    ensure_home
+    bare=1
+    args=("${@:2}")
+    i=0
+    while [ "$i" -lt "${#args[@]}" ]; do
+      case "${args[$i]}" in
+        -c | --config | --enable | --disable) i=$((i + 2)) ;;
+        -*) i=$((i + 1)) ;;
+        *) bare=0; break ;;
+      esac
+    done
+    if [ -z "${CODEX_HOME:-}" ] && [ "$bare" -eq 1 ]; then
+      start=$(bash "$codex_exec" --start-home -- "${@:2}")
+      [ -n "$start" ] && [ ! "$start" -ef "$HOME/.codex" ] && export CODEX_HOME="$start"
+    fi
+    exec "$real" "$@"
+    ;;
+  *)
+    ensure_home
+    exec "$real" "$@"
+    ;;
+esac

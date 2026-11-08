@@ -45,12 +45,8 @@ const EVENT_KEYS: Record<CodexHookEvent, string> = {
   Interrupt: 'interrupt',
 };
 
-export function isCodexHookEvent(name: string): name is CodexHookEvent {
+function isCodexHookEvent(name: string): name is CodexHookEvent {
   return Object.prototype.hasOwnProperty.call(EVENT_KEYS, name);
-}
-
-export function codexHookEventKey(event: CodexHookEvent): string {
-  return EVENT_KEYS[event];
 }
 
 /** Codex nulls the matcher for every other event before hashing, so a declared matcher there must not be hashed. */

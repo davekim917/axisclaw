@@ -1,6 +1,6 @@
 # Slack user token
 
-Lets an agent read (and, when you ask, write) your Slack from **your lens** — DMs, group DMs, channels you're in, threads, files — by calling the Slack Web API directly: `curl https://slack.com/api/<method>` from inside the container. No bot-invite-to-channel needed. The token is your personal Slack user-OAuth token (`xoxp-…`) stored in the OneCLI vault; the OneCLI gateway injects it at the proxy boundary, so the agent sends no auth header and never sees the token.
+Lets an agent read (and, when you ask, write) your Slack from **your lens**, as far as the token's scopes reach (the channels you're in, and with the full-lens profile your DMs, search and files), by calling the Slack Web API directly: `curl https://slack.com/api/<method>` from inside the container. No bot-invite-to-channel needed. The token is your personal Slack user-OAuth token (`xoxp-…`) stored in the OneCLI vault; the OneCLI gateway injects it at the proxy boundary, so the agent sends no auth header and never sees the token.
 
 There is no Slack MCP. The korotovsky `slack-mcp-server` that used to sit on top of this was removed: it failed to connect on every spawn, no agent ever called it, and its "failed to connect" notice led an agent to conclude Slack was unavailable when curl worked.
 
@@ -8,7 +8,7 @@ There is no Slack MCP. The korotovsky `slack-mcp-server` that used to sit on top
 
 | Where the agent runs | Default behavior | Override |
 |---|---|---|
-| Your 1:1 DM with the agent (primary↔you, helper↔you) | Token injected — agent can search/read your Slack | n/a (already the safe path) |
+| Your 1:1 DM with the agent (primary↔you, helper↔you) | Token injected — agent can read your Slack within the token's scopes | n/a (already the safe path) |
 | A shared channel the agent is invited to (`#engineering`, etc.) | Token **withheld** for that spawn | Add the channel's `messaging_groups.id` to `container.json` → `slack_user_token.also_allowed_in` |
 | A scheduled task | Judged by where the task delivers (`src/modules/permissions/task-slack-subject.ts`) | Same allow-list |
 
@@ -24,15 +24,10 @@ Slack doesn't let you generate arbitrary `xoxp-` tokens — you need a Slack App
 
 1. Go to <https://api.slack.com/apps> → **Create New App** → **From scratch**.
 2. App name: `<your-handle>-agent` (e.g., `operator-agent`). Workspace: pick the workspace.
-3. **OAuth & Permissions** → **User Token Scopes** → add:
-   - `search:read` — workspace search (most useful)
-   - `channels:history`, `channels:read` — public channels you're in
-   - `groups:history`, `groups:read` — private channels you're in
-   - `im:history`, `im:read` — 1:1 DMs
-   - `mpim:history`, `mpim:read` — group DMs
-   - `users:read` — user directory lookups
-   - `files:read` — file contents in channels you're in
-   - `chat:write` — only if you want the agent able to post as you when asked
+3. **OAuth & Permissions** → **User Token Scopes**. Pick a profile per workspace:
+   - **Channels only**, for a workspace where other people also talk to your agents: `channels:history`, `channels:read`, `groups:history`, `groups:read`, `users:read`, `search:read.public`, `search:read.private`. With no `im:*`, `mpim:*`, `search:read` or `files:read`, an agent can't read your DMs or search across them, so it can't pass their contents on to someone else. Channel search goes through `assistant.search.context` (`"channel_types": ["public_channel", "private_channel"]`), which works on a user token without Slack's assistant features turned on; `search.messages` needs the broader `search:read` and answers `missing_scope`.
+   - **Full lens**, for a workspace where only you talk to your agents: the above, plus `im:history`, `im:read`, `mpim:history`, `mpim:read` (your DMs and group DMs), `search:read` and `files:read`.
+   - **No** `chat:write` or `files:write` in either profile. Containers hold this token, and a write scope here lets any script in them post as you. Posting goes through `post_as_owner` and its own token (below).
 4. **Install to Workspace** → approve the prompts. Copy the **User OAuth Token** (`xoxp-…`).
 5. **Don't** add any Bot Token Scopes — this app is user-token-only and shouldn't be a bot.
 
@@ -58,7 +53,7 @@ In the OneCLI UI:
 2. **Auth method**: `Bearer` header.
 3. Same for `Slack-User-Token-ExampleRetail`.
 
-File bytes (`url_private`) live on `files.slack.com`, which the gateway matches separately. To let the agent download attachments, add a second vault entry with the same token, host `files.slack.com`, path `*`, and make sure it is withheld in the same sessions: give it `slack` and `user` in its name, **and if the group sets `slack_user_token.onecli_secret_names`, add this entry's name to that list too** — a non-empty list is authoritative and the naming convention is not consulted (`slackUserTokenSecrets`, `src/onecli-secrets.ts`), so an unlisted file credential would be injected into shared-channel sessions.
+File bytes (`url_private`) live on `files.slack.com`, which the gateway matches separately. To let the agent download attachments, the token needs `files:read` (the full-lens profile), plus a second vault entry with the same token, host `files.slack.com`, path `*`, and make sure it is withheld in the same sessions: give it `slack` and `user` in its name, **and if the group sets `slack_user_token.onecli_secret_names`, add this entry's name to that list too** — a non-empty list is authoritative and the naming convention is not consulted (`slackUserTokenSecrets`, `src/onecli-secrets.ts`), so an unlisted file credential would be injected into shared-channel sessions.
 
 ### 4. Assign secrets to workgroups
 
@@ -108,14 +103,24 @@ pnpm exec tsx scripts/q.ts data/v2.db \
 
 Add the id to `also_allowed_in`. `also_allowed_in` holds exact messaging-group ids, which belong to one adapter, so each sibling lists its own.
 
-**Don't add public/team channels** — anyone in those channels can ask the agent questions, and your Slack lens covers DMs they shouldn't see.
+**Don't add public/team channels** — anyone in those channels can ask the agent questions, and your Slack lens covers private channels they shouldn't see (and your DMs too, with the full-lens profile).
 
 ## How the agent uses it
 
 - Identity: `curl https://slack.com/api/auth.test`
 - A permalink `https://<ws>.slack.com/archives/C0123/p1789080120758779` is channel `C0123`, ts `1789080120.758779` (a dot before the last six digits); a `thread_ts` query parameter names the thread parent. Read it with `conversations.replies?channel=C0123&ts=<thread_ts, else that ts>`.
 - `conversations.history`, `search.messages`, `users.info`, `conversations.list` for everything else.
-- `chat.postMessage` (POST JSON with `channel`, `text`, optional `thread_ts`) posts **as you**, so the agent is told to use it only when asked. It needs the optional `chat:write` scope; a token minted without it answers `missing_scope`, and the agent is told to report that rather than retry.
+- Writes (`chat.*`, `files.*`, `reactions.*`) answer `missing_scope` on this token, whatever path spelling is used, because Slack checks the scope after it resolves the method. With `post_as_owner` on, the agent posts, edits and uploads through those tools instead.
+
+## Posting as the owner (`post_as_owner`)
+
+Slack scopes add up per app and can't be lowered, so the token that can post comes from a **second** Slack app in the workspace, with `chat:write` and `files:write` (plus the read scopes it needs). Its token never enters a container:
+
+```bash
+ncl secrets intake --reserved-for approved-run-slack-owner-<workgroup> --host-pattern slack.com --host-wide
+```
+
+The host names that agent from the posting group's workgroup (`ownerPostAgent`, `src/modules/post-as-owner/index.ts`), so `post_as_owner` needs a workgroup id of lowercase letters, digits and hyphens, at most 51 characters; any other id is refused before a card. `approved-run-*` agents are reserved (`src/reserved-secrets.ts`): their token can be granted to no other agent, and no container may run as one. Then set `post_as_owner: true` in the group's `container.json`.
 
 ## Smoke test
 
@@ -133,7 +138,7 @@ The agent should answer from the thread's content. In a channel that is not allo
 | `not_authed` in a shared channel | Working as designed — the session is not owner-safe | Add the channel to `also_allowed_in` only if it is genuinely private |
 | Host log `Slack user-token secret withheld for non-owner-safe session` for a session you expected to be owner-safe | Session isn't your 1:1 DM, or the channel id isn't in `also_allowed_in` | Check the logged `slackSafetyMessagingGroupId` against `container.json` |
 | Downloaded file is Slack's HTML login page | `files.slack.com` not wired | Second vault entry, step 3 |
-| Search returns nothing for known content | Token scopes missing (e.g., `search:read` not added) | Step 1 — reinstall the Slack app after adding the scope |
+| `missing_scope` on a DM, `search.messages` or file call | The channels-only profile leaves `im:*`, `mpim:*`, `search:read` and `files:read` out on purpose (channel search is `assistant.search.context`) | Nothing, if that is the boundary you want; otherwise switch that workspace to the full-lens profile and reinstall the app |
 
 ## Migrating off the Slack MCP
 

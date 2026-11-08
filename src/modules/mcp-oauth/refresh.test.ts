@@ -88,6 +88,7 @@ function row(over: Partial<McpOAuthIntegration> = {}): McpOAuthIntegration {
     agent_group_id: 'ag-1',
     mcp_url: 'https://mcp.dropbox.com/mcp',
     resource: 'https://mcp.dropbox.com/mcp',
+    grant_type: 'authorization_code',
     authorization_endpoint: 'https://www.dropbox.com/oauth2/authorize',
     token_endpoint: 'https://api.dropboxapi.com/oauth2/token',
     registration_endpoint: 'https://www.dropbox.com/oauth2/register',

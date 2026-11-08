@@ -12,11 +12,10 @@ import path from 'path';
 import { createHash, randomUUID } from 'crypto';
 
 import { readClaims } from '../claims-board.js';
-import { getChannelAdapter } from '../channels/channel-registry.js';
-import { dispatch } from '../cli/dispatch.js';
 import { getDb } from '../db/connection.js';
 import { log } from '../log.js';
 import { claimsBaseDir } from '../modules/claims/escalation.js';
+import { openThreadFor, startThreadTask, wiredChannelIdNamed, type OpenThreadError } from '../open-thread.js';
 import { refuseUnassignableInWorkgroup } from './assign.js';
 import { readReleaseState, threadPermalink, threadPlatformId } from './api/observatory.js';
 import type { AuthHandler } from './router.js';
@@ -113,8 +112,6 @@ async function wiredGroupForThread(
   );
 }
 
-const channelKey = (name: string): string => name.replace(/^#/, '').toLowerCase();
-
 /**
  * Adds only `thread_id`, preserving every other field (`claim.sh` owns the schema). Atomic write-then-rename because
  * the claim's agent may be writing the file concurrently, and a half-written claim reads as lost. Never throws: the
@@ -141,44 +138,25 @@ export function recordClaimThread(
   }
 }
 
-/**
- * Anchors a real thread in one of this agent's wired rooms. One implementation for claims and items so the wiring
- * check cannot drift.
- */
-async function openThreadFor(
+const OPEN_THREAD_STATUS: Record<OpenThreadError, number> = {
+  agent_not_wired_to_channel: 409,
+  channel_cannot_open_threads: 409,
+  thread_create_failed: 502,
+};
+
+async function openSteerThread(
   agentGroupId: string,
   channel: string,
   announcement: string,
   title: string,
   firstMessage: string,
 ): Promise<{ threadId: string; messagingGroupId: string } | { error: Response }> {
-  const wired = await getDb().all<{ id: string; name: string; platform_id: string; channel_type: string }>(
-    `SELECT mg.id, mg.name, mg.platform_id, mg.channel_type
-       FROM messaging_group_agents mga
-       JOIN messaging_groups mg ON mg.id = mga.messaging_group_id
-      WHERE mga.agent_group_id = ?`,
-    agentGroupId,
-  );
-  const target = wired.find((m) => channelKey(m.name) === channelKey(channel));
-  if (!target) return { error: json(409, { error: 'agent_not_wired_to_channel', channel }) };
-
-  const adapter = getChannelAdapter(target.channel_type);
-  if (!adapter || typeof adapter.postParent !== 'function' || typeof adapter.createThread !== 'function') {
-    return { error: json(409, { error: 'channel_cannot_open_threads', channel: target.name }) };
-  }
-
-  try {
-    const { messageId } = await adapter.postParent(target.platform_id, announcement);
-    const created = await adapter.createThread(target.platform_id, messageId, title.slice(0, 80), firstMessage);
-    // chat-sdk routes on the ENCODED thread id (`<platform_id>:<thread>`); createThread returns the bare one.
-    return {
-      threadId: created.threadId.includes(':') ? created.threadId : `${target.platform_id}:${created.threadId}`,
-      messagingGroupId: target.id,
-    };
-  } catch (err) {
-    log.warn('observatory steer: could not open a thread', { channel: target.name, err });
-    return { error: json(502, { error: 'thread_create_failed', channel: target.name }) };
-  }
+  const channelId = await wiredChannelIdNamed(agentGroupId, channel);
+  const opened = channelId
+    ? await openThreadFor(agentGroupId, channelId, announcement, title, firstMessage)
+    : ({ error: 'agent_not_wired_to_channel', channel } as const);
+  if (!('error' in opened)) return opened;
+  return { error: json(OPEN_THREAD_STATUS[opened.error], { error: opened.error, channel: opened.channel }) };
 }
 
 interface SteerBody {
@@ -251,7 +229,7 @@ export const observatorySteerHandler: AuthHandler = async (req, _params, ctx) =>
           }),
         };
       }
-      const opened = await openThreadFor(
+      const opened = await openSteerThread(
         agentGroupId,
         item.channel,
         `${item.id} — steered from the Observatory by ${who}`,
@@ -299,7 +277,7 @@ export const observatorySteerHandler: AuthHandler = async (req, _params, ctx) =>
           hint: 'name the room to open one — the server will not pick a channel for you',
         });
       }
-      const opened = await openThreadFor(
+      const opened = await openSteerThread(
         agentGroupId,
         body.channel,
         `${claim.slug} — steered from the Observatory by ${who}`,
@@ -320,30 +298,22 @@ export const observatorySteerHandler: AuthHandler = async (req, _params, ctx) =>
     `Act on that in THIS thread. If you cannot, say so here and name what blocks you — ` +
     `a steer that ends in silence is the failure this button exists to end.`;
 
-  const res = await dispatch(
-    {
-      id: `steer-${Date.now()}`,
-      command: 'tasks-create',
-      args: {
-        group: agentGroupId,
-        name: `steer ${targetId}`,
-        prompt,
-        process_after: new Date().toISOString(),
-        messaging_group: messagingGroupId,
-        thread_id: threadId,
-      },
-    },
-    { caller: 'host' },
-  );
+  const res = await startThreadTask({
+    agentGroupId,
+    messagingGroupId,
+    threadId,
+    name: `steer ${targetId}`,
+    prompt,
+  });
 
   if (!res.ok) {
-    log.warn('observatory steer: task create failed', { targetId, agentGroupId, error: res });
+    log.warn('observatory steer: task create failed', { targetId, agentGroupId, error: res.error });
     // A thread just opened is real whether or not the task landed; say so.
     return json(502, { error: 'task_create_failed', ...(threadCreated ? { threadId, threadCreated } : {}) });
   }
 
   recentSends.set(dedupeKey, Date.now());
-  const seriesId = (res.data as { series_id?: string } | null | undefined)?.series_id ?? null;
+  const seriesId = res.seriesId;
   log.info('observatory steer', { userId: ctx.user.id, targetId, agentGroupId, threadCreated, existing, seriesId });
   return json(200, {
     ok: true,

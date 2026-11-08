@@ -128,6 +128,44 @@ class PhaseDispatch(unittest.TestCase):
         self.assertEqual(self.c.effects.calls[-1]["dispatchEvent"], "initial-recovery-1")
         self.assertEqual(self.c.effects.calls[-1]["step"], "lanes")
 
+    def test_lanes_past_its_sla_alarms_only_once_its_owner_stops_writing(self):
+        # (label, step age s, newest owner write s ago, run dir layout, alarmed)
+        rows = (("writing", 10800 + 600, 300, "owner", False),
+                ("quiet", 10800 + 600, 1800, "owner", True),
+                ("writing past the ceiling", 21600 + 600, 300, "owner", True),
+                ("run dir unscannable", 10800 + 600, 300, "file", True),
+                ("only the controller's barrier is fresh", 10800 + 600, 1800, "barrier", True),
+                ("run dir is a symlink to a fresh tree", 10800 + 600, 300, "symlink", True))
+        start = self.c.now
+        for label, age, ago, layout, alarmed in rows:
+            with self.subTest(label), tempfile.TemporaryDirectory() as root:
+                self.setUp()
+                self.c.args.run_root = root
+                self.c.owner_step(RUN, "lanes", "lanes", False)
+                self.status("lanes", "busy")
+                self.c.now = start + dt.timedelta(seconds=age)
+                now = self.c.now.timestamp()
+                run = Path(root, RUN)
+                if layout == "file":
+                    run.write_text("not a directory\n")
+                else:
+                    tree = Path(root, "elsewhere") if layout == "symlink" else run
+                    owner = tree / "lanes" / "A1" / "notes.md"
+                    owner.parent.mkdir(parents=True)
+                    owner.write_text("lane notes\n")
+                    os.utime(owner, (now - ago, now - ago))
+                    if layout == "symlink":
+                        run.symlink_to(tree)
+                if layout == "barrier":
+                    barrier = run / "controller" / "barrier-lanes.json"
+                    barrier.parent.mkdir(parents=True)
+                    barrier.write_text("{}\n")
+                    os.utime(barrier, (now - 60, now - 60))
+                self.c.owner_step(RUN, "lanes", "lanes", False)
+                raised = [a for a in self.c.alarms if a[2] == "owner-dispatch:lanes"]
+                self.assertEqual(bool(raised), alarmed, raised)
+                self.assertEqual(len(self.c.effects.calls), 1)
+
     def test_changed_refusal_waits_for_worker_then_admits_new_event_in_same_phase(self):
         with tempfile.TemporaryDirectory() as root:
             self.c.args.run_root = root

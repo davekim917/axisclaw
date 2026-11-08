@@ -27,7 +27,7 @@ bridge died with `CONNECTION_CLOSED` on every spawn, until a human noticed and p
 | ---------------------------------------------- | ----------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Access token (the bearer)                      | OneCLI secret, injected at the proxy                        | The container never sees a credential; this is the existing model                                                                                                                                                                               |
 | Refresh token, client id/secret                | `data/mcp-oauth/<name>.json`, mode 0600 in a 0700 directory | OneCLI's API is **write-only** for secret values (see below), so a refresh token parked there could never be read back. The **access token is not here** — the exception covers what mints the next bearer, never a bearer that works right now |
-| Endpoints, scopes, secret name, expiry, status | `mcp_oauth_integrations` (migration 082)                    | Metadata only — no token material, so `ncl integrations list` is safe to read and to share                                                                                                                                                      |
+| Endpoints, scopes, secret name, expiry, status | `mcp_oauth_integrations` (migrations 082, 095)              | Metadata only — no token material, so `ncl integrations list` is safe to read and to share                                                                                                                                                      |
 
 **Why the refresh token is not in OneCLI.** Verified against the live gateway on 2026-09-17,
 `onecli@1.4.1`: `POST /api/secrets` → 201, `PATCH /api/secrets/{id}` with `{"value":…}` → 200
@@ -135,7 +135,8 @@ The bearer goes into a OneCLI secret named `<Name>-MCP-<Group>` by default
 `AmplitudeAnalytics-MCP-Analytics`). `--secret <name>` points it at a different one — use this to
 **adopt** a secret you already created by hand, which is the usual case when a server was previously
 wired up with a pasted token. Adopting updates the value in place and leaves the existing
-host/path/header matching rule alone.
+host/path/header matching rule alone, so a secret of that name on any other host is refused: the
+token would go to that host, and the integration's own host would get 401s.
 
 `complete` also declares the secret name on the group's **workgroup** (`workgroups.onecli_secrets`),
 so every sibling gets the integration, because that declaration is what actually grants it:
@@ -222,6 +223,32 @@ new access token, PATCHed over the same OneCLI secret.
 - **No `expires_in`** from the server falls back to refreshing every 12 hours.
 
 `ncl integrations refresh` runs the same pass on demand.
+
+## Client-credentials integrations
+
+Some APIs issue tokens for a client id and secret, with no browser login: OAuth `client_credentials`. Looker's
+`/api/4.0/login` is one. `ncl integrations add-client` registers one:
+
+```bash
+ncl integrations add-client --name looker-example --group <agent-group-id> \
+  --api-url https://example.cloud.looker.com \
+  --token-url https://example.cloud.looker.com/api/4.0/login \
+  --client-id-env LOOKER_CLIENT_ID_EXAMPLE --client-secret-env LOOKER_CLIENT_SECRET_EXAMPLE
+```
+
+- **Input.** The flags name two of the host's own env vars, never values, so nothing lands in argv, chat or logs.
+- **What it does.** The host mints a token first, which proves the pair, so a wrong pair leaves nothing behind. Then:
+  - the pair goes to `data/mcp-oauth/<name>.json` (0600);
+  - the token goes to a OneCLI secret on the API host as `Bearer {value}`, declared on the group's workgroup.
+- **After that, the env lines can go.** The bundle is what the refresher reads.
+- **Refresh.** The same sweep duty mints a new token inside the expiry margin. A refused pair (any 4xx but 408 and 429) moves the row to `needs_login` and is not retried until it gets a new pair. `login` and `complete` refuse a client-credentials integration.
+- **Rotation.** `ncl secrets intake --client-credentials <name>` posts a card whose form takes the new pair, with nothing passing through chat or `.env` ([secret-intake.md](secret-intake.md#a-client-credentials-pair)). `add-client --replace` does the same from named host env vars, which reach the host only at boot.
+- **Storage.** The row's `grant_type` is `client_credentials`; it has no authorization endpoint and no redirect URI (migration 095).
+
+Looker runs through it like this: the container holds only the instance URL. toolbox's Looker client ignores
+`HTTPS_PROXY`, so the runner's `looker-mcp.ts` starts it in client-OAuth mode against a loopback forwarder. The
+forwarder sends each call to that one origin through the gateway, which replaces the placeholder `Authorization`
+with the vaulted token.
 
 ## One group per integration
 

@@ -448,7 +448,7 @@ describe('createChatSdkBridge.deliver — ask_question cards', () => {
       supportsThreads: false,
     });
 
-    await bridge.deliver('slack:C123', 'slack:C123:1781317853.356239', {
+    await bridge.deliver('slack:C123', 'slack:C123:1790000000.000300', {
       kind: 'chat-sdk',
       content: {
         type: 'ask_question',

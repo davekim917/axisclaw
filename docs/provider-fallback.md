@@ -47,17 +47,60 @@ falling back to Claude.
 A Codex container can only learn that an account is at its quota by starting an
 app-server on it, so every fresh container used to start on the primary, read
 the wall, and start a second app-server on the next account. Rung 1 now reports
-the spent account to the host (`codex_account_exhausted`), and for the next hour
-the host starts every Codex container that mounts that account on the next one
-instead (`CODEX_START_HOME`).
+the spent account to the host (`codex_account_exhausted`, with the reset the
+app-server measured when it has one), and until then the host starts every Codex
+container that mounts that account on the next one instead (`CODEX_START_HOME`).
 
 The mark is keyed by the host Codex home, so groups that share an account share
-the mark. It carries no reset date: a quota can be reset early, so after an hour
-containers start on the account again, until one of them finds it still spent
-and renews the mark.
+the mark. It lasts until the reported reset, at most a week, or an hour when
+none was reported; then containers start on the account again, until one of
+them finds it still spent and renews the mark. Host-side `codex exec` runs keep
+their own marks in the same shape (`codex-exec.sh`, from the usage-limit
+message's "try again at" time).
 It lives in host memory (`src/codex-accounts.ts`); a host restart forgets
 it, which costs one extra app-server start. With every account marked, the
 container starts on the primary and the ladder above runs as usual.
+
+### Codex: a Claude or OpenCode agent's own `codex exec`
+
+A peer agent's shells (the Claude SDK's env and the OpenCode server's env, not
+the runner's own `process.env`) put the rotation shim from the skills mount
+first on PATH (`container/agent-runner/src/codex-shim-path.ts`), so its
+`codex exec` goes through `codex-exec.sh` like a host run: one rerun on the next
+`~/.codex-fallback-N` at a usage limit, only when the refused attempt took no
+action and the fallback dispatches every hook `~/.codex-runtime` does. The host
+stages a peer's fallback as a bare credential, so the runner gives each one the
+runtime home's config, generated guard chain and plugins under its own path
+(`setupCodexFallbackRuntimes`); one it cannot build is left for the wrapper to
+refuse. With no skills mount, PATH is left as it was and plain codex runs.
+
+Rollouts accumulate in every host Codex home, and a review that is not
+`--ephemeral` keeps its source bundle there, so a daily host sweep duty
+(`codex-rollout-prune`, `src/codex-rollout-prune.ts`) deletes rollouts last
+written over 30 days ago from each fallback home a group's account ring names.
+A primary home is never pruned: it is the operator's own Codex history. A
+provider=codex thread that rotated to a fallback and then sat idle past 30
+days loses its rollout, so a resume starts a fresh thread.
+
+### Claude: skipping a slot whose account is spent
+
+A Claude container rotates its OAuth ring on a refused turn, but a fresh
+container used to start on the primary even while its account sat at the
+weekly wall, so every new session spent its first turn on a refusal. When a
+slot is refused at an account-wide window (`five_hour` or `seven_day`; a
+model-scoped window leaves the account serving other models), the runner
+reports it (`claude_account_exhausted`, with the window's `resetAt`), and the
+host tells later containers that forward that token which slots are marked
+(`CLAUDE_SPENT_SLOTS`). A container restores its session's persisted slot
+unless that slot is marked, and otherwise starts on the first slot not marked.
+
+The mark is keyed by a hash of the token, so groups that share a token share
+the mark. It lasts until the reported reset, at most a week, or an hour when
+none was reported. It lives in host memory (`src/claude-accounts.ts`), and a
+wrong or lost mark costs one refused turn, after which the runner rotates as
+before. Each rotation posts a status row (`Claude credential rotating (…) →
+slot N/M`). A retry after a refusal that came before any tool call omits the
+instruction to check for side effects, since there are none.
 
 An app-server that does not answer `initialize` within 30 seconds is replaced
 once before the turn fails, because that failure reaches rung 3 and moves the
@@ -155,8 +198,13 @@ pending `-m` is claimed once, so it cannot drive a loop on its own.
 | `provider_turn_completed` handler   | `src/modules/provider-fallback/turn-completed.ts`          |
 | `codex_account_exhausted` handler   | `src/modules/provider-fallback/codex-account.ts`           |
 | Spent Codex accounts, start pick    | `src/codex-accounts.ts`                                    |
+| `claude_account_exhausted` handler  | `src/modules/provider-fallback/claude-account.ts`          |
+| Spent Claude accounts, start pick   | `src/claude-accounts.ts`                                   |
 
 The three provider actions are session-scoped and act only on the reporting
 session's own agent group: one records a window, the other two clear one.
 `codex_account_exhausted` accepts only a Codex home mounted into the reporting
 group, and its mark reaches every group that mounts the same host account.
+`claude_account_exhausted` accepts only the fingerprint of a token the
+reporting group still forwards, and its mark reaches every group that forwards
+the same token.

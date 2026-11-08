@@ -17,6 +17,8 @@ If no allowlist config exists, only the tracked set is published, exactly as bef
 - **Named account.** gws always runs with `GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE`, never the ambient default credential.
 - **Relative layout.** Drive paths mirror repo-relative paths under the `DRIVE_ROOT_NAME` folder. That variable has no default.
 - **State.** A TSV of path → Drive id and sha256 (`DRIVE_STATE_FILE`). An unchanged file costs no API call.
+- **Every file is hashed on every run, in one process.** Every file that already has a Drive copy is hashed by a single `node` process, not by per-file snapshots. It applies the same checks as the upload path: no symlink followed, no FIFO opened, a regular file whose `/proc/self/fd` path is `<repo>/<path>`, and reads bounded by the size cap. A file whose hash matches is skipped. Any other file takes the full snapshot path, where a failed check is reported. Metadata such as mtime is never trusted: a write through a shared memory mapping can change bytes without changing it.
+- **Per-file work runs in a small worker.** The snapshot, hash and gws calls for files that need them run in a coprocess forked before state is loaded. Fork cost grows with the forking shell's heap, which holds about 60k paths by then.
 - **Logs.** Everything goes to stderr. The only stdout output is the `--dry-run` report.
 
 ## Allowlist config

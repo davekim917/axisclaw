@@ -8,7 +8,7 @@ import { execFile } from 'child_process';
 import path from 'path';
 import { promisify } from 'util';
 
-import { checkAgentRunnerDepsDrift } from './agent-runner-image-check.js';
+import { checkAgentRunnerDepsDrift, isNoSuchImageError } from './agent-runner-image-check.js';
 import { CONTAINER_IMAGE, REPO_ROOT } from './config.js';
 import { CONTAINER_RUNTIME_BIN } from './container-runtime.js';
 import { log } from './log.js';
@@ -32,6 +32,12 @@ let notify: Notifier | null = null;
 let rebuildPromise: Promise<void> | null = null;
 let lastFailureAt: number | null = null;
 let lastNotifiedDetail: string | null = null;
+let inspectFailureRun: { count: number; lastAt: number; notifiedAt: number | null } | null = null;
+
+// One timeout is host load; a run of them is a wedged runtime with every spawn refused, which someone must hear about.
+// Refusals arrive about once a minute while it lasts, so a gap of a full cooldown means the run is over.
+export const INSPECT_FAILURES_BEFORE_NOTICE = 3;
+export const INSPECT_NOTICE_REPEAT_MS = 60 * 60_000;
 
 export function _resetWatcherStateForTest(): void {
   started = false;
@@ -39,6 +45,7 @@ export function _resetWatcherStateForTest(): void {
   rebuildPromise = null;
   lastFailureAt = null;
   lastNotifiedDetail = null;
+  inspectFailureRun = null;
 }
 
 /** Test-only: the in-flight rebuild attempt, so tests can await settlement. */
@@ -65,8 +72,10 @@ async function git(...args: string[]): Promise<string> {
 
 const short = (sha: string): string => sha.slice(0, 7);
 
-/** The image's `nanoclaw.commit` label (stamped by build.sh), or null when the image or label is missing. */
-async function imageCommitLabel(): Promise<string | null> {
+type CommitLabel = { kind: 'label'; value: string } | { kind: 'absent' } | { kind: 'inspect-error'; reason: string };
+
+/** The image's `nanoclaw.commit` label (stamped by build.sh). */
+async function imageCommitLabel(): Promise<CommitLabel> {
   try {
     const { stdout } = await execFileAsync(
       CONTAINER_RUNTIME_BIN,
@@ -74,15 +83,18 @@ async function imageCommitLabel(): Promise<string | null> {
       { timeout: 10_000 },
     );
     const label = stdout.trim();
-    return label && label !== '<no value>' ? label : null;
-  } catch {
-    return null;
+    return label && label !== '<no value>' ? { kind: 'label', value: label } : { kind: 'absent' };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return isNoSuchImageError(msg) ? { kind: 'absent' } : { kind: 'inspect-error', reason: msg };
   }
 }
 
 interface StalenessCheck {
   stale: boolean;
   reason: string;
+  /** The image could not be read, so neither answer is known. */
+  inspectFailed?: boolean;
 }
 
 /**
@@ -90,8 +102,10 @@ interface StalenessCheck {
  * refusal fires means something else is wrong; a rebuild from disk would only paper over it (and mislabel the image).
  */
 async function checkStaleness(): Promise<StalenessCheck> {
-  const [toSha, imageCommit] = await Promise.all([git('rev-parse', 'origin/main'), imageCommitLabel()]);
-  if (!imageCommit) return { stale: true, reason: 'no image or missing nanoclaw.commit label' };
+  const [toSha, label] = await Promise.all([git('rev-parse', 'origin/main'), imageCommitLabel()]);
+  if (label.kind === 'inspect-error') return { stale: false, inspectFailed: true, reason: label.reason };
+  if (label.kind === 'absent') return { stale: true, reason: 'no image or missing nanoclaw.commit label' };
+  const imageCommit = label.value;
   if (imageCommit === toSha) return { stale: false, reason: `image at HEAD (${short(imageCommit)})` };
   try {
     await git('merge-base', '--is-ancestor', toSha, imageCommit);
@@ -204,6 +218,12 @@ async function attemptRebuild(reason: string): Promise<void> {
     );
   }
 
+  // Usually a loaded host, the worst place to start a build. No cooldown: the next refusal asks again.
+  if (staleness.inspectFailed) {
+    await noteInspectFailure(staleness.reason);
+    return;
+  }
+  inspectFailureRun = null;
   if (!staleness.stale) {
     return fail(
       `Agent containers are being refused (${reason}) but the image already matches origin/main for container/ (${staleness.reason}) — rebuilding will not fix this, something else is wrong. Investigate on the host, then run ./container/build.sh once fixed.`,
@@ -238,6 +258,25 @@ async function attemptRebuild(reason: string): Promise<void> {
   }
   const headSha = await git('rev-parse', 'HEAD').catch(() => 'unknown');
   return succeed(headSha);
+}
+
+async function noteInspectFailure(reason: string): Promise<void> {
+  const now = Date.now();
+  const run =
+    inspectFailureRun && now - inspectFailureRun.lastAt < MIN_RETRY_INTERVAL_MS
+      ? inspectFailureRun
+      : { count: 0, lastAt: now, notifiedAt: null };
+  run.count += 1;
+  run.lastAt = now;
+  inspectFailureRun = run;
+  log.warn('Container-rebuild watcher: docker inspect failed, not rebuilding', { reason, inRun: run.count });
+  if (run.count < INSPECT_FAILURES_BEFORE_NOTICE) return;
+  if (run.notifiedAt !== null && now - run.notifiedAt < INSPECT_NOTICE_REPEAT_MS) return;
+  run.notifiedAt = now;
+  if (!notify) return;
+  await notify(
+    `❌ docker inspect of ${IMAGE_REF} has failed on ${run.count} refused spawns in a row, so agent containers cannot spawn and no rebuild can be judged. Check the container runtime on the host (docker info).`,
+  ).catch((err: unknown) => log.warn('Container-rebuild watcher notify failed', { err }));
 }
 
 /** Fire-and-forget; coalesces into an in-flight attempt, and is dropped silently within the failure cooldown. */

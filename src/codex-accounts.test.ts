@@ -5,6 +5,7 @@ import path from 'path';
 import { describe, expect, it } from 'vitest';
 
 import {
+  CODEX_ACCOUNT_MARK_MAX_MS,
   CODEX_ACCOUNT_RETRY_MS,
   codexAccountRing,
   codexStartHome,
@@ -54,6 +55,23 @@ describe('codex account health', () => {
     expect(isCodexAccountExhausted(accounts[0].hostHome, T0 + CODEX_ACCOUNT_RETRY_MS - 1)).toBe(true);
     expect(pickCodexStartHome(accounts, T0 + CODEX_ACCOUNT_RETRY_MS)).toBeNull();
     expect(isCodexAccountExhausted(accounts[0].hostHome, T0 + 1)).toBe(false);
+  });
+
+  it('holds a mark until the reported reset, at most a week, and an hour when the reset is missing or past', () => {
+    const reset = T0 + 3 * 24 * 60 * 60_000;
+    markCodexAccountExhausted('/host/reset/known', T0, new Date(reset).toISOString());
+    expect(isCodexAccountExhausted('/host/reset/known', reset - 1)).toBe(true);
+    expect(isCodexAccountExhausted('/host/reset/known', reset)).toBe(false);
+
+    markCodexAccountExhausted('/host/reset/far', T0, new Date(T0 + 30 * 24 * 60 * 60_000).toISOString());
+    expect(isCodexAccountExhausted('/host/reset/far', T0 + CODEX_ACCOUNT_MARK_MAX_MS - 1)).toBe(true);
+    expect(isCodexAccountExhausted('/host/reset/far', T0 + CODEX_ACCOUNT_MARK_MAX_MS)).toBe(false);
+
+    for (const resetAt of [new Date(T0 - 1000).toISOString(), 'next tuesday', null]) {
+      markCodexAccountExhausted('/host/reset/unknown', T0, resetAt);
+      expect(isCodexAccountExhausted('/host/reset/unknown', T0 + CODEX_ACCOUNT_RETRY_MS - 1)).toBe(true);
+      expect(isCodexAccountExhausted('/host/reset/unknown', T0 + CODEX_ACCOUNT_RETRY_MS)).toBe(false);
+    }
   });
 
   it('shares a mark between groups that mount the same host account', () => {

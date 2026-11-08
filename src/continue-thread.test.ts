@@ -88,20 +88,23 @@ function insertChat(sessionId: string, msgId: string, content: Record<string, un
 }
 
 function archiveRow(channelType: string, platformId: string, threadId: string): void {
-  archiveMessage({
-    id: `arch-${channelType}-${threadId}`,
-    agentGroupId: 'ag-1',
-    messagingGroupId: null,
-    channelType,
-    channelName: null,
-    platformId,
-    threadId,
-    role: 'user',
-    senderId: null,
-    senderName: 'operator',
-    text: 'the work in flight',
-    sentAt: now(),
-  });
+  archiveMessage(
+    {
+      id: `arch-${channelType}-${threadId}`,
+      agentGroupId: 'ag-1',
+      messagingGroupId: null,
+      channelType,
+      channelName: null,
+      platformId,
+      threadId,
+      role: 'user',
+      senderId: null,
+      senderName: 'operator',
+      text: 'the work in flight',
+      sentAt: now(),
+    },
+    { workgroupId: null },
+  );
 }
 
 function keyRows(): Promise<Array<{ thread_key: string; thread_platform_id: string }>> {
@@ -213,20 +216,23 @@ describe('delivery — continueThread adopts an existing thread for a new key', 
   });
 
   it('adopts a thread known only from the archive (the agent never engaged there)', async () => {
-    archiveMessage({
-      id: 'arch-1',
-      agentGroupId: 'ag-1',
-      messagingGroupId: 'mg-1',
-      channelType: 'telegram',
-      channelName: null,
-      platformId: 'telegram:123',
-      threadId: 'telegram:123:thr-archived',
-      role: 'user',
-      senderId: null,
-      senderName: 'operator',
-      text: 'the work in flight',
-      sentAt: now(),
-    });
+    archiveMessage(
+      {
+        id: 'arch-1',
+        agentGroupId: 'ag-1',
+        messagingGroupId: 'mg-1',
+        channelType: 'telegram',
+        channelName: null,
+        platformId: 'telegram:123',
+        threadId: 'telegram:123:thr-archived',
+        role: 'user',
+        senderId: null,
+        senderName: 'operator',
+        text: 'the work in flight',
+        sentAt: now(),
+      },
+      { workgroupId: null },
+    );
     const session = await taskSession();
     insertChat(session.id, 'out-1', {
       text: 'topic',

@@ -654,6 +654,33 @@ describe('runExport never reads again what an earlier run AI-held', () => {
     expect(w.pushes).toEqual([]);
   });
 
+  it('records a flag it cannot check against the file as unpinnable, and holds rather than failing the run', async () => {
+    const { w, deps } = nextRun({ aiHolds: [] });
+    deps.fileAt = () => {
+      throw new Error('object is corrupt');
+    };
+    w.judge = (shas) => ({ lastPassing: null, held: { sha: shas[0], reasons: [aiFlag], aiFindings: [finding] } });
+    expect(await runExport(deps)).toBe(2);
+    expect(w.workflows).toEqual(['export']);
+    expect(w.aiHolds).toEqual([record({ texts: null })]);
+    expect(w.status).toMatchObject({ status: 'held', held: { sha: 'leak' } });
+  });
+
+  it('reports a hold on a commit before the flagged one as that hold, not as the flag', async () => {
+    const w = world({ staging: ['s1'], remote: 's1', trees: { leak: leakyTree, sq: fixedTree }, aiHolds: [record()] });
+    const deps = harness(w, {
+      publicRemote: true,
+      copybara: (cw, workflow) => (workflow === 'export' ? adds('scanned', 'leak')(cw) : adds('sq')(cw)),
+      gate: holdOn('scanned'),
+    });
+    expect(await runExport(deps)).toBe(0);
+    expect(w.gated).toEqual([['scanned'], ['sq']]);
+    expect(w.status).toMatchObject({
+      perCommitHold: { sha: 'scanned', reasons: [{ source: 'scanner' }] },
+      squashReason: 'scanner-or-gate-hold',
+    });
+  });
+
   it('drops from the passing prefix a commit that carries the quote a later commit was flagged for', async () => {
     const w = world({
       staging: ['s1'],

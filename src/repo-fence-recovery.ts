@@ -7,6 +7,7 @@ import { wakeRepositoryMountSessions } from './container-restart.js';
 import { getAgentGroup, getAllAgentGroups } from './db/agent-groups.js';
 import { getMessagingGroup } from './db/messaging-groups.js';
 import { getActiveSessions, getSessionsByAgentGroup } from './db/sessions.js';
+import { yieldToEventLoop } from './event-loop-yield.js';
 import { log } from './log.js';
 import { SessionDbMissingError } from './modules/mailbox/index.js';
 import { withExistingMailboxSession } from './session-manager.js';
@@ -28,11 +29,6 @@ export interface OrphanedRepoFenceRecovery {
 
 function emptyRecovery(): OrphanedRepoFenceRecovery {
   return { scanned: 0, active: 0, released: 0, inFlight: 0, failed: 0, woken: 0 };
-}
-
-/** Thousands of synchronous DB opens in one block would starve every channel adapter. */
-async function yieldEventLoop(index: number): Promise<void> {
-  if (index > 0 && index % 100 === 0) await new Promise((resolve) => setImmediate(resolve));
 }
 
 /**
@@ -63,8 +59,8 @@ function repositoryTransitionInFlight(
 /** A mailbox that can't be read answers true, so doubt keeps the quiescing path. */
 export async function sessionsHoldRepoIngressFence(sessions: Session[], epochs: readonly string[]): Promise<boolean> {
   const wanted = new Set(epochs);
-  for (const [index, session] of sessions.entries()) {
-    await yieldEventLoop(index);
+  for (const session of sessions) {
+    await yieldToEventLoop();
     try {
       const held = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) => {
         const fence = mailbox.readRepoIngressFence();
@@ -95,8 +91,8 @@ export async function releaseOrphanedRepoIngressFences(
   }
 
   const wake: Session[] = [];
-  for (const [index, session] of sessions.entries()) {
-    await yieldEventLoop(index);
+  for (const session of sessions) {
+    await yieldToEventLoop();
     try {
       // Central reads happen BEFORE the session opens so the action below stays synchronous from fence read
       // to release. The wake happens after the loop, so no mailbox session is held across it.
@@ -169,23 +165,31 @@ export async function releaseOrphanedRepoIngressFencesAtStartup(): Promise<Orpha
 export const ORPHANED_REPO_FENCE_SCAN_INTERVAL_MS = 5 * 60 * 1000;
 
 let lastFullScanAtMs: number | null = null;
+let scanInFlight = false;
 
 export function _resetOrphanedRepoFenceScanForTesting(): void {
   lastFullScanAtMs = null;
+  scanInFlight = false;
 }
 
-/** Null on the ticks the throttle skips. */
+/** Null on the ticks the throttle skips, and while an earlier scan is still running. */
 export async function sweepOrphanedRepoIngressFences(
   sessions: Session[],
   nowMs: number = Date.now(),
 ): Promise<OrphanedRepoFenceRecovery | null> {
+  if (scanInFlight) return null;
   if (lastFullScanAtMs !== null && nowMs - lastFullScanAtMs < ORPHANED_REPO_FENCE_SCAN_INTERVAL_MS) return null;
   lastFullScanAtMs = nowMs;
-  const report = await releaseOrphanedRepoIngressFences('host sweep', sessions);
-  if (report.released > 0 || report.failed > 0) {
-    log.warn('Host sweep released orphaned repository ingress fences', { ...report });
+  scanInFlight = true;
+  try {
+    const report = await releaseOrphanedRepoIngressFences('host sweep', sessions);
+    if (report.released > 0 || report.failed > 0) {
+      log.warn('Host sweep released orphaned repository ingress fences', { ...report });
+    }
+    return report;
+  } finally {
+    scanInFlight = false;
   }
-  return report;
 }
 
 /**

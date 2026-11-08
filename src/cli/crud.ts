@@ -60,6 +60,7 @@ export interface CustomOperation {
   examples?: string[];
   /** Operator-only: never runnable from inside a container (see CommandDef.hostOnly). */
   hostOnly?: boolean;
+  groupScopeVerb?: boolean;
   handler: (args: Record<string, unknown>, ctx: CallerContext) => Promise<unknown>;
   /** Presentational renderer for human mode — see CommandDef.formatHuman. */
   formatHuman?: (data: unknown) => string;
@@ -474,9 +475,9 @@ export function validateArgs(
   for (const def of defs) {
     const flag = `--${def.name.replace(/_/g, '-')}`;
     const v = args[def.name];
-    if (v === undefined) {
+    if (v === undefined || v === null) {
       if (def.required) throw new Error(`${flag} is required`);
-      if (def.default !== undefined) out[def.name] = def.default;
+      if (v === undefined && def.default !== undefined) out[def.name] = def.default;
       continue;
     }
     if (def.multiple) {
@@ -513,6 +514,7 @@ export function validateArgs(
         break;
       }
       case 'string':
+        if (typeof v !== 'string' && typeof v !== 'number') throw new Error(`${flag} must be a string`);
         out[def.name] = String(v);
         break;
     }
@@ -610,6 +612,7 @@ export function registerResource(def: ResourceDef): void {
         description: op.description,
         access: op.access,
         hostOnly: op.hostOnly,
+        groupScopeVerb: op.groupScopeVerb,
         resource: def.plural,
         listArgs: (declared ?? []).filter((a) => a.multiple || a.type === 'json').map((a) => a.name),
         parseArgs: declared

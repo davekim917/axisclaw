@@ -105,6 +105,11 @@ function scannerReasons(report: RunReport, surface: 'tree' | 'message'): HoldRea
   return reasons;
 }
 
+/** Whether the scanner would pass `text` as a commit message, judged the way the gate judges one. */
+export function messageIsClean(report: RunReport): boolean {
+  return scannerReasons(report, 'message').length === 0;
+}
+
 interface AiVerdict {
   verdict: 'pass' | 'hold';
   findings: AiFinding[];

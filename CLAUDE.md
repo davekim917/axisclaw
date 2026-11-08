@@ -1,6 +1,6 @@
-# Anderton Agent
+# AxisClaw
 
-Personal AI agent fleet, built on NanoClaw. See [README.md](README.md) for what it is and how to install it. Architecture lives in `docs/`.
+An AI workforce you run yourself, from chat, built on NanoClaw. See [README.md](README.md) for what it is and how to install it. Architecture lives in `docs/`.
 
 Internal names are still NanoClaw's: the `ncl` CLI, `nanoclaw.sh`, the `nanoclaw-v2-<slug>` service and the `nanoclaw-agent-v2-<slug>` container image. Docs use them as they appear in the code.
 

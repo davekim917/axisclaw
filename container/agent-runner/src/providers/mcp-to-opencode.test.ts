@@ -42,6 +42,15 @@ describe('mcpServersToOpenCodeConfig', () => {
     });
   });
 
+  it('passes a stdio timeout through as the local entry timeout, and adds none otherwise', () => {
+    const mcp = mcpServersToOpenCodeConfig({
+      looker: { command: 'bun', timeout: 610_000 },
+      plain: { command: 'bun' },
+    });
+    expect(mcp.looker).toMatchObject({ type: 'local', timeout: 610_000 });
+    expect(mcp.plain).not.toHaveProperty('timeout');
+  });
+
   it('omits environment when env is empty', () => {
     const mcp = mcpServersToOpenCodeConfig({
       x: { command: 'true', args: [], env: {} },

@@ -841,6 +841,22 @@ describe('delivery-family lookups', () => {
     expect(capped.map((r) => r.content)).toEqual(['content c-new']);
   });
 
+  it('getEarliestInboundChats returns only chat rows, oldest first, capped at the limit', async () => {
+    const key = freshKey();
+    const mailbox = getAgentMailbox();
+    mailbox.prepare(key);
+    await mailbox.session(key, async (m) => {
+      await m.insertMessage(message('c-new', { kind: 'chat-sdk', timestamp: '2026-01-03T00:00:00.000Z' }));
+      await m.insertMessage(message('t-task', { kind: 'task', timestamp: '2026-01-01T00:00:00.000Z' }));
+      await m.insertMessage(message('c-old', { kind: 'chat', timestamp: '2026-01-02T00:00:00.000Z' }));
+    });
+
+    const all = await mailbox.session(key, (m) => fork(m).getEarliestInboundChats(10));
+    expect(all.map((r) => r.content)).toEqual(['content c-old', 'content c-new']);
+    const capped = await mailbox.session(key, (m) => fork(m).getEarliestInboundChats(1));
+    expect(capped.map((r) => r.content)).toEqual(['content c-old']);
+  });
+
   it('getChannelDestination resolves a channel by name and ignores other destination types', async () => {
     const key = freshKey();
     const mailbox = getAgentMailbox();
@@ -900,17 +916,26 @@ describe('delivery-family lookups', () => {
     mailbox.prepare(key);
     raw(dbPath(key, 'inbound'), (db) => {
       const stmt = db.prepare(
-        `INSERT INTO messages_in (id, seq, kind, timestamp, status, trigger, series_id, channel_type, platform_id, content)
-         VALUES (?, ?, 'task', ?, 'pending', 0, 'series-S', ?, ?, ?)`,
+        `INSERT INTO messages_in (id, seq, kind, timestamp, status, trigger, series_id, channel_type, platform_id, thread_id, content)
+         VALUES (?, ?, 'task', ?, 'pending', 0, 'series-S', ?, ?, ?, ?)`,
       );
-      stmt.run('routed', 2, '2026-01-01T00:00:00.000Z', 'slack', 'slack:C1', '{"prompt":"older but routed"}');
+      stmt.run(
+        'routed',
+        2,
+        '2026-01-01T00:00:00.000Z',
+        'slack',
+        'slack:C1',
+        'slack:C1:1700000000.000100',
+        '{"prompt":"older but routed"}',
+      );
       // Higher seq, but no route — must not shadow the routed row.
-      stmt.run('unrouted', 4, '2026-01-02T00:00:00.000Z', null, null, '{"prompt":"newer, no route"}');
+      stmt.run('unrouted', 4, '2026-01-02T00:00:00.000Z', null, null, null, '{"prompt":"newer, no route"}');
     });
 
     expect(await mailbox.session(key, (m) => fork(m).getLatestRoutedTaskRow('series-S'))).toEqual({
       channel_type: 'slack',
       platform_id: 'slack:C1',
+      thread_id: 'slack:C1:1700000000.000100',
       content: '{"prompt":"older but routed"}',
     });
     expect(await mailbox.session(key, (m) => fork(m).getLatestRoutedTaskRow('series-none'))).toBeNull();

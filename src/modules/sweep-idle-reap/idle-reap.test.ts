@@ -306,10 +306,6 @@ vi.mock('../../dashboard/session-title-sweep.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../dashboard/session-title-sweep.js')>()),
   runSessionTitleSweep: async () => undefined,
 }));
-vi.mock('../../topic-title.js', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('../../topic-title.js')>()),
-  retryPendingThreadTitles: async () => undefined,
-}));
 vi.mock('../../dashboard/db/dashboard-tokens.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../dashboard/db/dashboard-tokens.js')>()),
   pruneDashboardTokens: () => undefined,

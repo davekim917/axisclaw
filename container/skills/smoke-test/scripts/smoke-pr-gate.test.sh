@@ -92,6 +92,7 @@ case "$1" in
           echo "https://github.com/org/repo/pull/${STUB_NEW_PR_NUMBER:-1}"
         fi
         exit "${STUB_PR_CREATE_EXIT:-0}" ;;
+      close) [ -z "${STUB_PR_CLOSE_LOG:-}" ] || printf '%s\n' "$*" >> "$STUB_PR_CLOSE_LOG"; exit "${STUB_PR_CLOSE_EXIT:-0}" ;;
       *) echo '{}'; exit 0 ;;
     esac ;;
   api)
@@ -333,7 +334,7 @@ reset_stubs() {
         STUB_PARENT_BY_COMMIT STUB_PULL_HEADS STUB_BINDING_EXIT STUB_COMPARE_LOG \
         STUB_TREES_BY_SHA STUB_TREE_GET_EXIT STUB_TREE_GET_LOG STUB_TREES_FILE \
         STUB_STATE_PROBE STUB_STATE_PROBE_FILE STUB_SUSPEND_SLEEP STUB_REPO_VIEW_EXIT \
-        STUB_LEDGER_JQ_EMPTY_FILE STUB_SUSPEND_LOG \
+        STUB_LEDGER_JQ_EMPTY_FILE STUB_SUSPEND_LOG STUB_PR_CLOSE_LOG STUB_PR_CLOSE_EXIT \
         STUB_FRONTEND_HTML_EXIT STUB_FRONTEND_HTML STUB_BUNDLE_EXIT STUB_BUNDLE_JS \
         STUB_WAIT_CLOCK_FILE STUB_WAIT_CLOCK_COUNT STUB_WAIT_SLEEP_LOG \
         SMOKE_GATE_PUBLISH_FILE SMOKE_GATE_HOLD_FILE SMOKE_GATE_HANDOFF_LEDGER \
@@ -6541,6 +6542,70 @@ else
 fi
 chmod 600 "$G65_HOLD.lock"
 unset SMOKE_GATE_HOLD_LOCK_WAIT_SECONDS SMOKE_GATE_PUBLISH_FILE SMOKE_GATE_HOLD_FILE SMOKE_GATE_HANDOFF_LEDGER
+
+fi
+if smoke_case walk-prs; then
+# --- Walk PRs: a task run's own preview, never a campaign ------------------
+# smoke-freeze-pr.sh --walk branches are smoke/walk-*. Poll must not settle,
+# claim or alarm on one, and must close a draft one left open past
+# SMOKE_GATE_WALK_MAX_SECONDS, through the helper's close-walk.
+fresh_state
+WALK_SHA="$(sha c)"
+WALK_REF="smoke/walk-cccccccccccc-1a2b3c4d"
+WALK_NEW="$(date -u -d '-10 minutes' +%Y-%m-%dT%H:%M:%SZ)"
+WALK_OLD="$(date -u -d '-7 hours' +%Y-%m-%dT%H:%M:%SZ)"
+walk_row() { # <draft> <createdAt>
+  jq -cn --arg sha "$WALK_SHA" --arg ref "$WALK_REF" --argjson draft "$1" --arg at "$2" \
+    '{number:61,headRefOid:$sha,headRefName:$ref,isDraft:$draft,createdAt:$at}'
+}
+export STUB_PR_FILES='[{"filename":"api/src/foo.ts"}]'
+export STUB_RUN_LIST="[{\"headSha\":\"$WALK_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
+export STUB_SERVICES='[{"id":"srv-backend-pr-61","name":"WIDGET-API PR #61","serviceDetails":{"parentServer":{"id":"srv-backend-base"},"url":"https://widget-api-pr-61.onrender.com"}}]'
+export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$WALK_SHA\"}}]"
+export STUB_PR_VIEW="{\"number\":61,\"state\":\"OPEN\",\"isDraft\":true,\"headRefName\":\"$WALK_REF\"}"
+export STUB_PR_CLOSE_LOG="$STATE_DIR/close.log"
+export STUB_PR_LIST="[$(walk_row true "$WALK_NEW")]"
+WALK_OUT="$(bash "$GATE" poll)"
+jq -e '.wakeAgent == false and .data.trigger == "waiting_for_candidates" and .data.labeledPrCount == 0' <<<"$WALK_OUT" >/dev/null &&
+  [ ! -e "$STATE_DIR/pr-61-state.json" ] && [ ! -e "$STUB_PR_CLOSE_LOG" ] ||
+  { echo "walk-prs: poll treated a young walk PR as a candidate or closed it: $WALK_OUT" >&2; exit 1; }
+# Beside it, an ordinary PR settles exactly as it would alone.
+ORD_SHA="$(sha b)"
+export STUB_PR_LIST="[$(walk_row true "$WALK_NEW"),{\"number\":42,\"headRefOid\":\"$ORD_SHA\",\"headRefName\":\"feature/x\",\"isDraft\":false,\"createdAt\":\"$WALK_OLD\"}]"
+export STUB_RUN_LIST="[{\"headSha\":\"$ORD_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
+export STUB_SERVICES='[{"id":"srv-backend-pr-42","name":"WIDGET-API PR #42","serviceDetails":{"parentServer":{"id":"srv-backend-base"},"url":"https://widget-api-pr-42.onrender.com"}}]'
+export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$ORD_SHA\"}}]"
+WALK_OUT="$(bash "$GATE" poll)"
+jq -e '.wakeAgent == true and .data.trigger == "pr_build_settled" and .data.pr == 42' <<<"$WALK_OUT" >/dev/null &&
+  [ ! -e "$STATE_DIR/pr-61-state.json" ] ||
+  { echo "walk-prs: a walk PR beside an ordinary one changed the ordinary settle: $WALK_OUT" >&2; exit 1; }
+# Past the cap a draft walk PR is closed with its branch, and the attempt is recorded.
+export STUB_PR_LIST="[$(walk_row true "$WALK_OLD")]"
+bash "$GATE" poll >/dev/null
+grep -qx 'pr close 61 -R org/repo --delete-branch --comment .*' "$STUB_PR_CLOSE_LOG" &&
+  jq -se --arg opened "$WALK_OLD" 'length == 1 and .[0].pr == 61 and .[0].openedAt == $opened and
+    .[0].maxSeconds == 21600 and .[0].result == {ok:true,pr:61,closed:true,branch:"smoke/walk-cccccccccccc-1a2b3c4d"}' \
+    "$STATE_DIR/walk-closures.jsonl" >/dev/null ||
+  { echo "walk-prs: an expired walk PR was not closed and recorded: $(cat "$STUB_PR_CLOSE_LOG" "$STATE_DIR/walk-closures.jsonl" 2>&1)" >&2; exit 1; }
+# A close that fails wakes the coordinator once per walk head, with the
+# helper's own error, and keeps being attempted and recorded every poll.
+rm -f "$STATE_DIR/walk-closures.jsonl"
+export STUB_PR_CLOSE_EXIT=1
+WALK_OUT="$(bash "$GATE" poll)"
+jq -e --arg sha "$WALK_SHA" '.wakeAgent == true and .data.trigger == "pr_walk_close_failed" and .data.pr == 61 and
+  .data.sourceSha == $sha and .data.result.ok == false and (.data.result.error | test("still open"))' <<<"$WALK_OUT" >/dev/null ||
+  { echo "walk-prs: a failed close did not wake: $WALK_OUT" >&2; exit 1; }
+WALK_OUT="$(bash "$GATE" poll)"
+jq -e '.wakeAgent == false' <<<"$WALK_OUT" >/dev/null && [ "$(wc -l < "$STATE_DIR/walk-closures.jsonl")" -eq 2 ] ||
+  { echo "walk-prs: the failed-close alarm re-fired or the retry went unrecorded: $WALK_OUT" >&2; exit 1; }
+unset STUB_PR_CLOSE_EXIT
+# A non-draft PR on a walk-shaped branch is not ours to close.
+rm -f "$STUB_PR_CLOSE_LOG"
+export STUB_PR_LIST="[$(walk_row false "$WALK_OLD")]"
+bash "$GATE" poll >/dev/null
+[ ! -e "$STUB_PR_CLOSE_LOG" ] ||
+  { echo "walk-prs: poll closed a non-draft PR: $(cat "$STUB_PR_CLOSE_LOG")" >&2; exit 1; }
+unset STUB_PR_CLOSE_LOG
 
 fi
 smoke_cases_done

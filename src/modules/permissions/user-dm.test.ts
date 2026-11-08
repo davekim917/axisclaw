@@ -170,8 +170,9 @@ describe('ensureUserDm privacy-safe logging', () => {
   // T4 PR4 (§5 case 10): privacySafeLogs is a real observability trade — the
   // recommendation was to request it only where a resolution failure would
   // otherwise leak a stranger-facing platform handle: approval delivery
-  // (pickApprovalDelivery, both branches) and the dashboard-token-issue DM.
-  // Every other caller keeps the default detailed shape.
+  // (pickApprovalDelivery, both branches) and the DMs that carry a credential
+  // link: the dashboard token, a call link, the phone pairing link. Every
+  // other caller keeps the default detailed shape.
   it('privacy-safe logs are requested only at approval delivery and the DMs that carry a credential link', async () => {
     const fs2 = await import('node:fs');
     const path = await import('node:path');
@@ -201,6 +202,8 @@ describe('ensureUserDm privacy-safe logging', () => {
         'src/modules/approvals/primitive.ts',
         'src/dashboard/auth/dashboard-token-issue.ts',
         'src/modules/voice-call/service.ts',
+        'src/modules/voice-call/group/service.ts',
+        'src/modules/mobile/pairing.ts',
       ]),
     );
   });
@@ -211,9 +214,13 @@ describe('ensureUserDm privacy-safe logging', () => {
     const repoRoot = path.resolve(__dirname, '..', '..', '..');
     const dashboard = fs2.readFileSync(path.join(repoRoot, 'src/dashboard/auth/dashboard-token-issue.ts'), 'utf8');
     const onecli = fs2.readFileSync(path.join(repoRoot, 'src/modules/approvals/onecli-approvals.ts'), 'utf8');
+    const pairing = fs2.readFileSync(path.join(repoRoot, 'src/modules/mobile/pairing.ts'), 'utf8');
     // The warn that follows a null ensureUserDm must not log the invoker.
     expect(/refusing to mint'[\s\S]{0,300}?\}\);/.exec(dashboard)?.[0]).not.toMatch(/userId/);
     // The OneCLI auto-deny must log a count, never the approver handles.
     expect(/no DM channel for any approver'[\s\S]{0,300}?\}\);/.exec(onecli)?.[0]).not.toMatch(/\bapprovers,/);
+    expect(/pairing link could not be sent'[\s\S]{0,120}?\}\);/.exec(pairing)?.[0]).toBeDefined();
+    expect(/pairing link could not be sent'[\s\S]{0,120}?\}\);/.exec(pairing)?.[0]).not.toMatch(/userId/);
+    expect(/Could not open a DM[^\n]*/.exec(pairing)?.[0]).not.toMatch(/userId/);
   });
 });

@@ -11,10 +11,9 @@
  * A CHANNEL canvas keeps its first block forever (a standalone canvas does not), so the title lives there and
  * `renderBoard` emits NO heading.
  */
-import { OneCLI } from '@onecli-sh/sdk';
 import { EnvHttpProxyAgent, ProxyAgent, fetch as undiciFetch, type Dispatcher } from 'undici';
 
-import { ONECLI_API_KEY, ONECLI_URL, TIMEZONE } from './config.js';
+import { TIMEZONE } from './config.js';
 import { readClaims, renderClaims } from './claims-board.js';
 import { readContainerConfig } from './container-config.js';
 import { getAllAgentGroups } from './db/agent-groups.js';
@@ -23,6 +22,7 @@ import { extractSlackChannelId, loadSlackWorkspaces } from './channels/slack.js'
 import { slackPermalink } from './channels/slack-mentions.js';
 import { onHostShutdown, onHostStart } from './host-lifecycle.js';
 import { log } from './log.js';
+import { agentProxyUrl } from './onecli-agent-proxy.js';
 import { formatLocalTime } from './timezone.js';
 
 const TICK_INTERVAL_MS = 5 * 60 * 1000;
@@ -64,25 +64,6 @@ function getProxyDispatcher(): Dispatcher | null {
   return _envProxyDispatcher;
 }
 
-/** A URL without userinfo resolves to the Default Agent at the gateway, which is the 401 this path avoids. */
-export function carriesAgentIdentity(proxyUrl: string): boolean {
-  return /^\w+:\/\/[^@/]+@/.test(proxyUrl);
-}
-
-/**
- * Keep the agent identity, swap in the host's own proxy address: `getContainerConfig` returns the container's
- * (`host.docker.internal`), which does not resolve from the host.
- */
-export function hostReachableProxy(containerProxyUrl: string, env: NodeJS.ProcessEnv = process.env): string {
-  const userinfo = /^\w+:\/\/([^@/]+)@/.exec(containerProxyUrl)?.[1];
-  if (!userinfo) return containerProxyUrl;
-  const hostProxy = env['HTTPS_PROXY'] || env['https_proxy'] || env['HTTP_PROXY'] || env['http_proxy'] || '';
-  const hostPart = /^(\w+):\/\/(?:[^@/]+@)?([^/]+)/.exec(hostProxy);
-  // Better to try the container URL than silently drop to the Default Agent.
-  if (!hostPart) return containerProxyUrl;
-  return `${hostPart[1]}://${userinfo}@${hostPart[2]}`;
-}
-
 const agentDispatchers = new Map<string, Dispatcher | null>();
 /**
  * Dispatcher carrying this agent group's OneCLI identity (proxy userinfo): the host's own proxy is the Default
@@ -94,11 +75,7 @@ async function getAgentProxyDispatcher(agentGroupId: string): Promise<Dispatcher
   if (cached !== undefined) return cached;
   let dispatcher: Dispatcher | null = null;
   try {
-    const cfg = await new OneCLI({ url: ONECLI_URL, apiKey: ONECLI_API_KEY, timeout: 30_000 }).getContainerConfig({
-      agent: agentGroupId,
-    });
-    const url = cfg.env['HTTPS_PROXY'] || cfg.env['https_proxy'] || '';
-    if (url && carriesAgentIdentity(url)) dispatcher = new ProxyAgent(hostReachableProxy(url));
+    dispatcher = new ProxyAgent(await agentProxyUrl(agentGroupId));
   } catch (err) {
     log.warn('Backlog canvas: could not resolve agent proxy identity', { agentGroupId, err });
   }

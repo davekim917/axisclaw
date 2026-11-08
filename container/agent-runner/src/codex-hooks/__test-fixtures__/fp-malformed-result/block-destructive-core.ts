@@ -1,7 +1,7 @@
 /**
  * Benign destructive-guard core co-located with the malformed file-protection
  * fixture (codex #126 N3). The N3 test exercises a Write tool, so this guard
- * just allows — it exists only so NANOCLAW_DESTRUCTIVE_GUARD_CORE points into
+ * just allows — it exists only so setGuardCorePathsForTest({ destructive }) points into
  * this dir and loadFileProtectionCore resolves the sibling file-protection-core.ts.
  */
 export const IS_NANOCLAW = false;

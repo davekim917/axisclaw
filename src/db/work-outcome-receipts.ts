@@ -13,12 +13,16 @@ export interface WorkOutcomeReceipt {
   content: string;
   created_at: string;
   updated_at: string;
+  delivered_at: string | null;
   resolution: string | null;
 }
 
 /** Call only after delivery's ordinary destination authorization has succeeded. */
 export async function claimWorkOutcome(
-  input: Omit<WorkOutcomeReceipt, 'state' | 'platform_message_id' | 'created_at' | 'updated_at' | 'resolution'>,
+  input: Omit<
+    WorkOutcomeReceipt,
+    'state' | 'platform_message_id' | 'created_at' | 'updated_at' | 'delivered_at' | 'resolution'
+  >,
 ): Promise<{
   claimed: boolean;
   receipt: WorkOutcomeReceipt;
@@ -44,8 +48,9 @@ export async function claimWorkOutcome(
   // Only the original queued row retries after an operator verifies non-delivery.
   if (!claimed) {
     const retry = await db.run(
-      `UPDATE work_outcome_receipts SET state='sending',updated_at=?
+      `UPDATE work_outcome_receipts SET state='sending',thread_id=?,updated_at=?
       WHERE workgroup_id=? AND work_item=? AND message_id=? AND state='retry'`,
+      input.thread_id,
       now,
       input.workgroup_id,
       input.work_item,
@@ -68,12 +73,17 @@ export async function settleWorkOutcome(
   platformMessageId: string | undefined,
   failure?: string,
 ): Promise<void> {
+  const now = new Date().toISOString();
   await getDb().run(
-    `UPDATE work_outcome_receipts SET state=?,platform_message_id=?,updated_at=?,resolution=CASE WHEN ? IS NULL THEN resolution ELSE COALESCE(resolution, '') || ? END
+    `UPDATE work_outcome_receipts SET state=?,platform_message_id=?,updated_at=?,
+      delivered_at=CASE WHEN ? IS NULL THEN ? ELSE delivered_at END,
+      resolution=CASE WHEN ? IS NULL THEN resolution ELSE COALESCE(resolution, '') || ? END
     WHERE workgroup_id=? AND work_item=?`,
     failure !== undefined ? 'uncertain' : 'delivered',
     platformMessageId ?? null,
-    new Date().toISOString(),
+    now,
+    failure ?? null,
+    now,
     failure ?? null,
     failure === undefined
       ? null

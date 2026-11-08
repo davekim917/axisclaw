@@ -934,15 +934,34 @@ jr '[.[] | select(.kind=="gate")] | length == 0' | grep -qx true \
   || fail "an early GO must never short-cut the barriers: $(jr '[.[] | select(.kind=="gate")]')"
 
 # --- a silent owner is escalated once as a coordination decision -----------
+# The default owner SLA, on the intake step (no contract yet).
 
 new_case ownerlate
-claim; contract
+claim
 seed run claim enqueued 1 '{"pr":7}'
 step_ok 2026-09-18T10:00:00Z
+dq '[.[] | select(.type=="wake_owner" and .step=="intake")] | length == 1' | grep -qx true \
+  || fail "ownerlate: the intake owner step is the one in flight: $(dq '[.[] | select(.type=="wake_owner")]')"
 step_ok 2026-09-18T11:10:00Z
 step_ok 2026-09-18T11:20:00Z
 dq '[.[] | select(.type=="escalate" and .reason=="owner step overdue")] | length == 1' | grep -qx true \
   || fail "an overdue owner step escalates exactly once: $(dq '[.[] | select(.type=="escalate")]')"
+
+# A full campaign's lanes step walks every lane and runs for hours: it is not
+# overdue at 70 minutes, and is escalated once past the lanes SLA.
+new_case ownerlate-lanes
+claim 2026-09-18T15:00:00Z; contract
+seed run claim enqueued 1 '{"pr":7}'
+step_ok 2026-09-18T10:00:00Z
+dq '[.[] | select(.type=="wake_owner" and .step=="lanes")] | length == 1' | grep -qx true \
+  || fail "ownerlate-lanes: the lanes owner step is the one in flight: $(dq '[.[] | select(.type=="wake_owner")]')"
+step_ok 2026-09-18T11:10:00Z
+dq '[.[] | select(.type=="escalate")] | length == 0' | grep -qx true \
+  || fail "a lanes step at 70 minutes is not overdue: $(dq '[.[] | select(.type=="escalate")]')"
+step_ok 2026-09-18T13:10:00Z
+step_ok 2026-09-18T13:20:00Z
+dq '[.[] | select(.type=="escalate" and .reason=="owner step overdue")] | length == 1' | grep -qx true \
+  || fail "a lanes step past its SLA escalates exactly once: $(dq '[.[] | select(.type=="escalate")]')"
 
 # --- path containment (Codex r1 #1) -------------------------------------------
 

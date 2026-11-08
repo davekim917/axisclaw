@@ -6,6 +6,7 @@ import { describe, expect, it } from 'vitest';
 
 import { enforceHermeticity } from '../../test-hermeticity.js';
 import {
+  clientCredentialsToken,
   buildAuthorizeUrl,
   exchangeAuthorizationCode,
   isUnrecoverableGrantError,
@@ -192,6 +193,22 @@ describe('token grants', () => {
     expect((err as OAuthTokenError).code).toBe('invalid_grant');
     expect((err as OAuthTokenError).status).toBe(400);
     expect(isUnrecoverableGrantError(err)).toBe(true);
+  });
+
+  it('never follows a redirect with the form', async () => {
+    const seen: unknown[] = [];
+    const fetchImpl = (async (_url: string, init: RequestInit) => {
+      seen.push(init.redirect);
+      return new Response(JSON.stringify({ access_token: 'tok', token_type: 'Bearer' }), { status: 200 });
+    }) as unknown as typeof fetch;
+
+    await clientCredentialsToken(fetchImpl, {
+      tokenEndpoint: 'https://as.example.test/token',
+      clientId: 'client-id',
+      clientSecret: 'client-secret',
+    });
+
+    expect(seen).toEqual(['error']);
   });
 
   it('treats a 5xx as retryable, not as a dead grant', async () => {

@@ -18,6 +18,7 @@ import {
   GROUPS_DIR,
   INSTALL_SLUG,
 } from './config.js';
+import { REGENERABLE_SWEEP_DIR_NAMES } from './checkout-proof.js';
 import { runningContainerMounts as inspectRunningContainerMounts } from './container-mounts.js';
 import { CONTAINER_RUNTIME_BIN } from './container-runtime.js';
 import {
@@ -112,18 +113,6 @@ export const SESSION_ARTIFACT_IDLE_MS =
 const DEFAULT_REGENERABLE_SWEEP_DAYS = 2;
 const TOPICS_DIRNAME = 'v2-topics';
 const TOPIC_WORKTREES_DIRNAME = 'worktrees';
-// May we recursively delete this from a live checkout? A wrong entry destroys the only copy, so only names
-// whose contents are reconstructible from a version-controlled file belong here. Deliberately excluded: `dist`,
-// `build`, `.next`, `coverage` (often tracked, may hold uncommitted output), `.cache` (means anything), and
-// `.venv`/`venv` (an ad-hoc `pip install` venv is unique state; do not re-add it as "just a cache").
-// `__pycache__` qualifies: PEP 3147 bytecode is not importable without its `.py`, so it is never the only copy.
-export const REGENERABLE_SWEEP_DIR_NAMES: ReadonlySet<string> = new Set<string>([
-  'node_modules',
-  '.pnpm-store',
-  '.turbo',
-  '__pycache__',
-]);
-
 const PRUNABLE_DIR_NAMES = new Set(['node_modules', '.pnpm-store', '.turbo', '.cache']);
 const SKIP_DESCEND_DIR_NAMES = new Set(['.git']);
 
@@ -375,7 +364,13 @@ export interface StorageReportOptions {
 
 export interface StorageAdmissionResult {
   allowed: boolean;
-  reason: 'below-threshold' | 'cleanup-succeeded' | 'still-over-threshold' | 'disabled' | 'usage-unavailable';
+  reason:
+    | 'below-threshold'
+    | 'below-refuse-threshold'
+    | 'cleanup-succeeded'
+    | 'still-over-threshold'
+    | 'disabled'
+    | 'usage-unavailable';
   report: StorageReport;
 }
 
@@ -3101,8 +3096,8 @@ export function assertStorageAdmission(options: Omit<StorageReportOptions, 'mode
     return { allowed: true, reason: 'below-threshold', report };
   }
 
-  // Admission fires on every spawn, so without the cadence throttle usage in [threshold, refuse) turns spawn
-  // traffic into full scan+apply passes. At >= admissionRefusePct the throttle is bypassed upstream.
+  // Spawn admission reaches here only at >= admissionRefusePct on its own probe, where getStorageReport bypasses the
+  // cadence throttle. [threshold, refuse) means usage fell since that probe; the throttle keeps that race cheap.
   const report = getStorageReport({ ...options, policy, mode: 'apply', force: false, respectCadence: true });
   const afterPct = report.filesystem.after?.usagePct ?? before.usagePct;
   if (afterPct >= policy.admissionRefusePct) {

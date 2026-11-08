@@ -1,9 +1,19 @@
 import { EventEmitter } from 'node:events';
+import fs from 'node:fs';
 
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { BackgroundStorageMaintenance } from './storage-maintenance-worker.js';
+import {
+  assertStorageAdmissionInBackground,
+  BackgroundStorageMaintenance,
+  runStorageMaintenanceInBackground,
+} from './storage-maintenance-worker.js';
 import type { StorageReport } from './storage-manager.js';
+
+const sharedWorker = vi.hoisted(() => ({ current: null as null | { posted: Array<Record<string, unknown>> } }));
+vi.mock('./host-worker.js', () => ({
+  startHostWorker: () => sharedWorker.current,
+}));
 
 class FakeWorker extends EventEmitter {
   readonly posted: Array<Record<string, unknown>> = [];
@@ -12,6 +22,10 @@ class FakeWorker extends EventEmitter {
   postMessage(message: Record<string, unknown>): void {
     this.posted.push(message);
   }
+}
+
+function usageAt(pct: number): fs.StatsFs {
+  return { blocks: 100, bsize: 1, bfree: 100 - pct, bavail: 100 - pct } as fs.StatsFs;
 }
 
 function report(timestamp: string): StorageReport {
@@ -86,4 +100,42 @@ describe('BackgroundStorageMaintenance', () => {
     expect(factory).toHaveBeenCalledTimes(2);
     await runner.close();
   });
+});
+
+describe('assertStorageAdmissionInBackground', () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.restoreAllMocks();
+  });
+
+  it.each([
+    { usagePct: 70, waitsForPass: false },
+    { usagePct: 90, waitsForPass: true },
+  ])(
+    'with a maintenance pass running, admission at $usagePct% waits for it: $waitsForPass',
+    async (row) => {
+      vi.stubEnv('NANOCLAW_STORAGE_MANAGER_ENABLED', '1');
+      vi.stubEnv('NANOCLAW_STORAGE_CLEANUP_THRESHOLD_PCT', '65');
+      vi.stubEnv('NANOCLAW_STORAGE_ADMISSION_REFUSE_PCT', '90');
+      vi.spyOn(fs.promises, 'statfs').mockResolvedValue(usageAt(row.usagePct) as never);
+      sharedWorker.current ??= new FakeWorker();
+      const worker = sharedWorker.current;
+      void runStorageMaintenanceInBackground([]);
+      const postedBefore = worker.posted.length;
+      const queued = () => worker.posted.slice(postedBefore).map((m) => m.command);
+
+      const admission = assertStorageAdmissionInBackground([]);
+
+      if (row.waitsForPass) {
+        let settled = false;
+        void admission.then(() => (settled = true));
+        await vi.waitFor(() => expect(queued()).toEqual(['admission']));
+        expect(settled).toBe(false);
+      } else {
+        await expect(admission).resolves.toMatchObject({ allowed: true });
+        expect(queued()).toEqual([]);
+      }
+    },
+    2000,
+  );
 });

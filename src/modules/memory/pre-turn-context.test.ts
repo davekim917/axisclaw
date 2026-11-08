@@ -3,9 +3,12 @@ import path from 'path';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { TEST_ROOT, FAILURES, CAPABILITY_FIXTURE } = vi.hoisted(() => ({
+const { TEST_ROOT, FAILURES, CAPABILITY_FIXTURE, BEYOND_CANDIDATE_CUT, COPY_LOOKUP } = vi.hoisted(() => ({
   TEST_ROOT: uniqueTmpRoot('pre-turn-context-test'),
   FAILURES: { archive: false, exactLink: false, capabilities: false },
+  /** Archive ids the searches leave out, as their candidate limits do. */
+  BEYOND_CANDIDATE_CUT: new Set<string>(),
+  COPY_LOOKUP: { findsNothing: false },
   CAPABILITY_FIXTURE: { services: null as null | Array<Record<string, unknown>> },
 }));
 
@@ -36,12 +39,14 @@ vi.mock('../../message-archive.js', async (importOriginal) => {
     ...actual,
     searchArchiveEvidence: (...args: Parameters<typeof actual.searchArchiveEvidence>) => {
       if (FAILURES.archive) throw new Error('fixture archive failure');
-      return actual.searchArchiveEvidence(...args);
+      return actual.searchArchiveEvidence(...args).filter((row) => !BEYOND_CANDIDATE_CUT.has(row.id));
     },
     queryArchiveExactLinks: (...args: Parameters<typeof actual.queryArchiveExactLinks>) => {
       if (FAILURES.exactLink) throw new Error('fixture exact-link failure');
-      return actual.queryArchiveExactLinks(...args);
+      return actual.queryArchiveExactLinks(...args).filter((row) => !BEYOND_CANDIDATE_CUT.has(row.id));
     },
+    archiveCopiesOf: (...args: Parameters<typeof actual.archiveCopiesOf>) =>
+      COPY_LOOKUP.findsNothing ? args[0].messages.map(() => []) : actual.archiveCopiesOf(...args),
   };
 });
 
@@ -71,6 +76,7 @@ import {
 import { closeDb, getRawDb, initMigratedTestDb } from '../../db/index.js';
 import { log } from '../../log.js';
 import { upsertArchiveMessage } from '../../message-archive.js';
+import { tenancyNow } from '../../test-fixtures/archive-search.js';
 
 const FIXTURE = JSON.parse(
   fs.readFileSync(path.join(process.cwd(), 'tests/fixtures/workgroup-memory-recall.json'), 'utf8'),
@@ -152,6 +158,11 @@ function seedScope(): void {
   ).run('sess-shared', 'ag-a', null, null, null, 'active', 'stopped', null, '2026-01-01T00:00:00.000Z');
 }
 
+/** A preference file body under `ids:` frontmatter, the only way a file reaches a sender. */
+function withIds(ids: string, body: string): string {
+  return `---\nids: [${ids}]\n---\n${body}`;
+}
+
 function memoryFile(relative: string, content: string): void {
   const target = path.join(TEST_ROOT, 'workgroups', 'wg-a', 'memory', relative);
   fs.mkdirSync(path.dirname(target), { recursive: true });
@@ -165,20 +176,23 @@ function archive(
   sentAt: string,
   threadId = 'discord:guild:channel:thread',
 ): void {
-  upsertArchiveMessage({
-    id,
-    agentGroupId,
-    messagingGroupId: 'mg-a',
-    channelType: 'discord',
-    channelName: 'room',
-    platformId: 'discord:guild:channel',
-    threadId,
-    role: 'user',
-    senderId: 'discord:user',
-    senderName: 'Operator',
-    text,
-    sentAt,
-  });
+  upsertArchiveMessage(
+    {
+      id,
+      agentGroupId,
+      messagingGroupId: 'mg-a',
+      channelType: 'discord',
+      channelName: 'room',
+      platformId: 'discord:guild:channel',
+      threadId,
+      role: 'user',
+      senderId: 'discord:user',
+      senderName: 'Operator',
+      text,
+      sentAt,
+    },
+    tenancyNow(getRawDb(), agentGroupId),
+  );
 }
 
 beforeEach(async () => {
@@ -186,6 +200,8 @@ beforeEach(async () => {
   FAILURES.exactLink = false;
   FAILURES.capabilities = false;
   CAPABILITY_FIXTURE.services = null;
+  BEYOND_CANDIDATE_CUT.clear();
+  COPY_LOOKUP.findsNothing = false;
   fs.rmSync(TEST_ROOT, { recursive: true, force: true });
   fs.mkdirSync(TEST_ROOT, { recursive: true });
   // TEST_ROOT is a fixed path reused by every test in this file, so the
@@ -367,7 +383,7 @@ describe('bounded authoritative pre-turn retrieval', () => {
   it('test_core_conflicts_and_truncation_are_explicit', async () => {
     memoryFile(
       'preferences/operator.md',
-      `# Operator\nInitech DNS is managed in Wix. ${'Supabase detail '.repeat(400)}`,
+      withIds('discord:user', `# Operator\nInitech DNS is managed in Wix. ${'Supabase detail '.repeat(400)}`),
     );
     archive(
       'conflict',
@@ -382,7 +398,11 @@ describe('bounded authoritative pre-turn retrieval', () => {
       sessionId: 'sess-a',
       kind: 'chat',
       trigger: 1 as const,
-      normalizedContent: JSON.stringify({ text: 'Who manages Initech DNS?', sender: 'Operator' }),
+      normalizedContent: JSON.stringify({
+        text: 'Who manages Initech DNS?',
+        sender: 'Operator',
+        senderId: 'discord:user',
+      }),
     };
     const first = await withCentralSync(() => buildPreTurnContext(input), 'test');
     const second = await withCentralSync(() => buildPreTurnContext(input), 'test');
@@ -490,20 +510,23 @@ describe('bounded authoritative pre-turn retrieval', () => {
   it('enforces exact-link and lexical archive budgets independently', async () => {
     const exactCount = 2;
     for (let index = 0; index < exactCount; index++) {
-      upsertArchiveMessage({
-        id: `789:exact-${index}`,
-        agentGroupId: 'ag-a',
-        messagingGroupId: 'mg-a',
-        channelType: 'discord',
-        channelName: 'room',
-        platformId: 'discord:123:456',
-        threadId: 'discord:123:456:789',
-        role: 'user',
-        senderId: 'discord:user',
-        senderName: 'Operator',
-        text: `Exact linked deployment owner evidence ${index}.`,
-        sentAt: `2026-06-0${index + 1}T00:00:00.000Z`,
-      });
+      upsertArchiveMessage(
+        {
+          id: `789:exact-${index}`,
+          agentGroupId: 'ag-a',
+          messagingGroupId: 'mg-a',
+          channelType: 'discord',
+          channelName: 'room',
+          platformId: 'discord:123:456',
+          threadId: 'discord:123:456:789',
+          role: 'user',
+          senderId: 'discord:user',
+          senderName: 'Operator',
+          text: `Exact linked deployment owner evidence ${index}.`,
+          sentAt: `2026-06-0${index + 1}T00:00:00.000Z`,
+        },
+        tenancyNow(getRawDb(), 'ag-a'),
+      );
     }
     for (let index = 0; index < PRE_TURN_BOUNDS.archiveExcerpts + 7; index++) {
       archive(
@@ -778,7 +801,7 @@ describe('bounded authoritative pre-turn retrieval', () => {
   // recall enumerates per turn, so it is where that check has to hold.
   it('rejects an ancestor-directory symlink swap for the preferences directory', async () => {
     const memoryRoot = path.join(TEST_ROOT, 'workgroups', 'wg-a', 'memory');
-    memoryFile('preferences/operator.md', '# Operator\nJordan owns deployment.');
+    memoryFile('preferences/operator.md', withIds('discord:user', '# Operator\nJordan owns deployment.'));
     const checkedLeaf = path.join(memoryRoot, 'preferences', 'operator.md');
     const checkedAncestor = path.join(memoryRoot, 'preferences');
     const outsideDir = path.join(TEST_ROOT, 'outside-preferences');
@@ -833,14 +856,14 @@ describe('bounded authoritative pre-turn retrieval', () => {
   });
 
   it('degrades archive, exact-link, and capabilities independently', async () => {
-    memoryFile('preferences/operator.md', '# Operator\nJordan owns deployment.');
+    memoryFile('preferences/operator.md', withIds('discord:user', '# Operator\nJordan owns deployment.'));
     const input = {
       agentGroupId: 'ag-a',
       servicesCentral: SERVICES_CENTRAL_AG_A,
       sessionId: 'sess-a',
       kind: 'chat',
       trigger: 1 as const,
-      normalizedContent: '{"text":"Who owns deployment?","sender":"Operator"}',
+      normalizedContent: '{"text":"Who owns deployment?","sender":"Operator","senderId":"discord:user"}',
     };
 
     FAILURES.archive = true;
@@ -899,7 +922,7 @@ describe('bounded authoritative pre-turn retrieval', () => {
   });
 
   it('bootstraps capabilities and index once, then emits only unseen per-turn evidence', async () => {
-    memoryFile('preferences/operator.md', '# Operator\nJordan owns deployment.');
+    memoryFile('preferences/operator.md', withIds('discord:user', '# Operator\nJordan owns deployment.'));
     archive('owner-archive', 'ag-a', 'Jordan owns deployment.', '2026-07-20T00:00:00.000Z');
     const common = {
       agentGroupId: 'ag-a',
@@ -909,7 +932,7 @@ describe('bounded authoritative pre-turn retrieval', () => {
       trigger: 1 as const,
       provider: 'claude',
       contextEpoch: 4,
-      normalizedContent: '{"text":"Who owns deployment?","sender":"Operator"}',
+      normalizedContent: '{"text":"Who owns deployment?","sender":"Operator","senderId":"discord:user"}',
     };
 
     const bootstrap = await withCentralSync(() => buildPreTurnContext({ ...common, includeBootstrap: true }), 'test');
@@ -987,20 +1010,23 @@ describe('bounded authoritative pre-turn retrieval', () => {
   });
 
   it('does not suppress exact-link or correction evidence already seen in the context epoch', async () => {
-    upsertArchiveMessage({
-      id: '123456789000000007:ag-a',
-      agentGroupId: 'ag-a',
-      messagingGroupId: 'mg-a',
-      channelType: 'discord',
-      channelName: 'room',
-      platformId: 'discord:123456789000000002:123456789000000007',
-      threadId: 'discord:123456789000000002:123456789000000007',
-      role: 'user',
-      senderId: 'discord:user',
-      senderName: 'Operator',
-      text: 'Initech DNS is managed in Wix.',
-      sentAt: '2026-07-20T00:00:00.000Z',
-    });
+    upsertArchiveMessage(
+      {
+        id: '123456789000000007:ag-a',
+        agentGroupId: 'ag-a',
+        messagingGroupId: 'mg-a',
+        channelType: 'discord',
+        channelName: 'room',
+        platformId: 'discord:123456789000000002:123456789000000007',
+        threadId: 'discord:123456789000000002:123456789000000007',
+        role: 'user',
+        senderId: 'discord:user',
+        senderName: 'Operator',
+        text: 'Initech DNS is managed in Wix.',
+        sentAt: '2026-07-20T00:00:00.000Z',
+      },
+      tenancyNow(getRawDb(), 'ag-a'),
+    );
     const linkInput = {
       agentGroupId: 'ag-a',
       servicesCentral: SERVICES_CENTRAL_AG_A,
@@ -1053,7 +1079,7 @@ describe('bounded authoritative pre-turn retrieval', () => {
   it('keeps normal deltas within the approved evidence counts and size ceiling', async () => {
     memoryFile(
       'preferences/operator.md',
-      `# Operator\nBounded relevant detail. ${'bounded relevant detail '.repeat(200)}`,
+      withIds('discord:user', `# Operator\nBounded relevant detail. ${'bounded relevant detail '.repeat(200)}`),
     );
     for (let index = 0; index < 12; index++) {
       archive(
@@ -1112,20 +1138,23 @@ describe('per-person preference recall', () => {
     threadId = 'discord:guild:channel:thread',
     senderId = `discord:${senderName}`,
   ): void {
-    upsertArchiveMessage({
-      id,
-      agentGroupId: 'ag-a',
-      messagingGroupId: 'mg-a',
-      channelType: 'discord',
-      channelName: 'room',
-      platformId: 'discord:guild:channel',
-      threadId,
-      role: 'user',
-      senderId,
-      senderName,
-      text: `message from ${senderName}`,
-      sentAt,
-    });
+    upsertArchiveMessage(
+      {
+        id,
+        agentGroupId: 'ag-a',
+        messagingGroupId: 'mg-a',
+        channelType: 'discord',
+        channelName: 'room',
+        platformId: 'discord:guild:channel',
+        threadId,
+        role: 'user',
+        senderId,
+        senderName,
+        text: `message from ${senderName}`,
+        sentAt,
+      },
+      tenancyNow(getRawDb(), 'ag-a'),
+    );
   }
 
   function upsertUserRow(id: string, displayName: string | null): void {
@@ -1135,7 +1164,10 @@ describe('per-person preference recall', () => {
   }
 
   it('injects the trigger sender preference file deterministically, outside the ranked lane', async () => {
-    memoryFile('preferences/alex.md', '# Alex\nProduct altitude always. No file paths or code identifiers.');
+    memoryFile(
+      'preferences/alex.md',
+      withIds('discord:alex', '# Alex\nProduct altitude always. No file paths or code identifiers.'),
+    );
     const result = await withCentralSync(
       () =>
         buildPreTurnContext({
@@ -1144,7 +1176,11 @@ describe('per-person preference recall', () => {
           sessionId: 'sess-a',
           kind: 'chat-sdk',
           trigger: 1,
-          normalizedContent: JSON.stringify({ text: 'what shipped this week?', sender: 'Alex Stone' }),
+          normalizedContent: JSON.stringify({
+            text: 'what shipped this week?',
+            sender: 'Alex Stone',
+            senderId: 'discord:alex',
+          }),
         }),
       'test',
     );
@@ -1159,9 +1195,9 @@ describe('per-person preference recall', () => {
   });
 
   it('keys on recent conversation senders in the same thread only', async () => {
-    memoryFile('preferences/rowan.md', '# Rowan\nShort summaries, no tables.');
-    memoryFile('preferences/zed.md', '# Zed\nAlways include SQL.');
-    archiveFrom('m1', 'Rowan Vale', '2026-08-01T00:00:00.000Z');
+    memoryFile('preferences/carol.md', withIds('discord:Carol Vale', '# Carol\nShort summaries, no tables.'));
+    memoryFile('preferences/zed.md', withIds('discord:Zed Other', '# Zed\nAlways include SQL.'));
+    archiveFrom('m1', 'Carol Vale', '2026-08-01T00:00:00.000Z');
     archiveFrom('m2', 'Zed Other', '2026-08-01T01:00:00.000Z', 'discord:guild:channel:other-thread');
 
     const result = await withCentralSync(
@@ -1178,19 +1214,19 @@ describe('per-person preference recall', () => {
     );
 
     const paths = result.memoryEvidence.excerpts.map((row) => row.path);
-    expect(paths).toContain('preferences/rowan.md');
+    expect(paths).toContain('preferences/carol.md');
     expect(paths).not.toContain('preferences/zed.md');
   });
 
   it('suppresses an unchanged preference within an epoch and re-injects after a change', async () => {
-    memoryFile('preferences/alex.md', '# Alex\nProduct altitude always.');
+    memoryFile('preferences/alex.md', withIds('discord:alex', '# Alex\nProduct altitude always.'));
     const input = {
       agentGroupId: 'ag-a',
       servicesCentral: SERVICES_CENTRAL_AG_A,
       sessionId: 'sess-a',
       kind: 'chat-sdk',
       trigger: 1,
-      normalizedContent: JSON.stringify({ text: 'update?', sender: 'Alex Stone' }),
+      normalizedContent: JSON.stringify({ text: 'update?', sender: 'Alex Stone', senderId: 'discord:alex' }),
     } as const;
 
     const first = await withCentralSync(() => buildPreTurnContext(input), 'test');
@@ -1203,7 +1239,7 @@ describe('per-person preference recall', () => {
     );
     expect(second.memoryEvidence.excerpts.some((row) => row.path === 'preferences/alex.md')).toBe(false);
 
-    memoryFile('preferences/alex.md', '# Alex\nCode-level detail is fine now.');
+    memoryFile('preferences/alex.md', withIds('discord:alex', '# Alex\nCode-level detail is fine now.'));
     const third = await withCentralSync(
       () => buildPreTurnContext({ ...input, seenEvidenceFingerprints: [fingerprint!] }),
       'test',
@@ -1212,136 +1248,71 @@ describe('per-person preference recall', () => {
     expect(changed?.text).toContain('Code-level detail');
   });
 
-  it('matches a preference file on the canonical users.display_name after a platform rename', async () => {
-    // The archive row carries the post-rename per-message name; only the
-    // canonical display_name on the (stable) sender_id still matches the slug
-    // of the pre-existing preference file.
-    memoryFile('preferences/sam-rivera.md', '# Sam Rivera\nPrefers terse status updates.');
+  // Matching is by sender id only: display names change at will, and a name
+  // would hand one person's file to another of the same name.
+  async function preferencePathsFor(content: Record<string, unknown>): Promise<string[]> {
+    const result = await withCentralSync(
+      () =>
+        buildPreTurnContext({
+          agentGroupId: 'ag-a',
+          servicesCentral: SERVICES_CENTRAL_AG_A,
+          sessionId: 'sess-a',
+          kind: 'chat-sdk',
+          trigger: 1,
+          normalizedContent: JSON.stringify(content),
+        }),
+      'test',
+    );
+    return result.memoryEvidence.excerpts.map((row) => row.path);
+  }
+
+  it('a renamed sender keeps their file, because it is matched by id', async () => {
+    memoryFile('preferences/sam-rivera.md', withIds('slack:U1', '# Sam Rivera\nPrefers terse status updates.'));
     archiveFrom('m1', 'SR Renamed', '2026-08-01T00:00:00.000Z', 'discord:guild:channel:thread', 'slack:U1');
-    upsertUserRow('slack:U1', 'Sam Rivera');
+    upsertUserRow('slack:U1', 'Totally New Name');
 
-    const result = await withCentralSync(
-      () =>
-        buildPreTurnContext({
-          agentGroupId: 'ag-a',
-          servicesCentral: SERVICES_CENTRAL_AG_A,
-          sessionId: 'sess-a',
-          kind: 'chat-sdk',
-          trigger: 1,
-          normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
-        }),
-      'test',
-    );
-
-    const paths = result.memoryEvidence.excerpts.map((row) => row.path);
-    expect(paths).toContain('preferences/sam-rivera.md');
+    expect(await preferencePathsFor({ text: 'status?', sender: 'Pat Doe' })).toContain('preferences/sam-rivera.md');
   });
 
-  it('falls back to the message sender name with no crash when sender_id has no users row', async () => {
+  it('a file without ids reaches nobody, even a sender whose name matches it exactly', async () => {
     memoryFile('preferences/casey-doe.md', '# Casey Doe\nShort summaries.');
-    archiveFrom('m1', 'Casey Doe', '2026-08-01T00:00:00.000Z', 'discord:guild:channel:thread', 'slack:U-unknown');
+    archiveFrom('m1', 'Casey Doe', '2026-08-01T00:00:00.000Z', 'discord:guild:channel:thread', 'slack:U2');
+    upsertUserRow('slack:U2', 'Casey Doe');
 
-    const result = await withCentralSync(
-      () =>
-        buildPreTurnContext({
-          agentGroupId: 'ag-a',
-          servicesCentral: SERVICES_CENTRAL_AG_A,
-          sessionId: 'sess-a',
-          kind: 'chat-sdk',
-          trigger: 1,
-          normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
-        }),
-      'test',
+    expect(await preferencePathsFor({ text: 'status?', sender: 'Casey Doe', senderId: 'slack:U2' })).not.toContain(
+      'preferences/casey-doe.md',
     );
-
-    const paths = result.memoryEvidence.excerpts.map((row) => row.path);
-    expect(paths).toContain('preferences/casey-doe.md');
-    expect(result.notices.some((notice) => notice.code === 'sender-recall-failed')).toBe(false);
   });
 
-  it('falls back to the message sender name with no crash when the users row has a NULL display_name', async () => {
-    memoryFile('preferences/jordan-lee.md', '# Jordan Lee\nNo tables.');
-    archiveFrom('m1', 'Jordan Lee', '2026-08-01T00:00:00.000Z', 'discord:guild:channel:thread', 'slack:U2');
-    upsertUserRow('slack:U2', null);
+  it('two senders with the same display name each get only their own file', async () => {
+    memoryFile('preferences/jamie-a.md', withIds('slack:UA', '# Jamie A\nBe terse.'));
+    memoryFile('preferences/jamie-b.md', withIds('slack:UB', '# Jamie B\nBe verbose.'));
+    archiveFrom('m1', 'Jamie', '2026-08-01T00:00:00.000Z', 'discord:guild:channel:thread', 'slack:UA');
 
-    const result = await withCentralSync(
-      () =>
-        buildPreTurnContext({
-          agentGroupId: 'ag-a',
-          servicesCentral: SERVICES_CENTRAL_AG_A,
-          sessionId: 'sess-a',
-          kind: 'chat-sdk',
-          trigger: 1,
-          normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
-        }),
-      'test',
-    );
-
-    const paths = result.memoryEvidence.excerpts.map((row) => row.path);
-    expect(paths).toContain('preferences/jordan-lee.md');
-    expect(result.notices.some((notice) => notice.code === 'sender-recall-failed')).toBe(false);
+    const paths = await preferencePathsFor({ text: 'status?', sender: 'Pat Doe' });
+    expect(paths).toContain('preferences/jamie-a.md');
+    expect(paths).not.toContain('preferences/jamie-b.md');
   });
 
-  it('injects only the per-message-name file when files exist under both alias slugs', async () => {
-    // Both the pre-rename and post-rename preference file exist. Per-message
-    // precedence must win so only one — not both, conflicting — is injected.
-    memoryFile('preferences/jamie-frost.md', '# Jamie Frost\nBe terse.');
-    memoryFile('preferences/jamie-old.md', '# Jamie Old\nBe verbose.');
-    archiveFrom('m1', 'Jamie Frost', '2026-08-01T00:00:00.000Z', 'discord:guild:channel:thread', 'slack:U10');
-    upsertUserRow('slack:U10', 'Jamie Old');
+  it('two senders inject two files', async () => {
+    memoryFile('preferences/robin-vale.md', withIds('slack:UR', '# Robin Vale\nPrefers async updates.'));
+    memoryFile('preferences/jordan-lee.md', withIds('slack:UJ', '# Jordan Lee\nNo tables.'));
+    archiveFrom('m1', 'Robin Vale', '2026-08-01T00:00:00.000Z', 'discord:guild:channel:thread', 'slack:UR');
+    archiveFrom('m2', 'Jordan Lee', '2026-08-01T01:00:00.000Z', 'discord:guild:channel:thread', 'slack:UJ');
 
-    const result = await withCentralSync(
-      () =>
-        buildPreTurnContext({
-          agentGroupId: 'ag-a',
-          servicesCentral: SERVICES_CENTRAL_AG_A,
-          sessionId: 'sess-a',
-          kind: 'chat-sdk',
-          trigger: 1,
-          normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
-        }),
-      'test',
-    );
-
-    const paths = result.memoryEvidence.excerpts.map((row) => row.path);
-    expect(paths).toContain('preferences/jamie-frost.md');
-    expect(paths).not.toContain('preferences/jamie-old.md');
-  });
-
-  it('injects the canonical-slug file when only it exists (rename durability)', async () => {
-    memoryFile('preferences/robin-vale.md', '# Robin Vale\nPrefers async updates.');
-    archiveFrom('m1', 'RV New', '2026-08-01T00:00:00.000Z', 'discord:guild:channel:thread', 'slack:U11');
-    upsertUserRow('slack:U11', 'Robin Vale');
-
-    const result = await withCentralSync(
-      () =>
-        buildPreTurnContext({
-          agentGroupId: 'ag-a',
-          servicesCentral: SERVICES_CENTRAL_AG_A,
-          sessionId: 'sess-a',
-          kind: 'chat-sdk',
-          trigger: 1,
-          normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
-        }),
-      'test',
-    );
-
-    const paths = result.memoryEvidence.excerpts.map((row) => row.path);
+    const paths = await preferencePathsFor({ text: 'status?', sender: 'Pat Doe' });
     expect(paths).toContain('preferences/robin-vale.md');
+    expect(paths).toContain('preferences/jordan-lee.md');
   });
 
-  it('two groups inject two files; a group whose alias matches an already-selected file does not double-inject', async () => {
-    memoryFile('preferences/morgan-lee.md', '# Morgan Lee\nWants bullet points.');
-    memoryFile('preferences/taylor-fox.md', '# Taylor Fox\nWants prose.');
-    // Newest first: the direct Morgan Lee sender claims morgan-lee.md, then
-    // Taylor Fox claims taylor-fox.md, then a third sender whose canonical
-    // name also resolves to morgan-lee.md — already selected — contributes
-    // nothing.
-    archiveFrom('m1', 'Morgan Lee', '2026-08-01T00:02:00.000Z', 'discord:guild:channel:thread', 'slack:U12');
-    archiveFrom('m2', 'Taylor Fox', '2026-08-01T00:01:00.000Z', 'discord:guild:channel:thread', 'slack:U13');
-    archiveFrom('m3', 'MF Renamed', '2026-08-01T00:00:00.000Z', 'discord:guild:channel:thread', 'slack:U14');
-    upsertUserRow('slack:U14', 'Morgan Lee');
-
+  it('withholds lines that gate or authorize something, and says so', async () => {
+    memoryFile(
+      'preferences/alex.md',
+      withIds(
+        'discord:alex',
+        '# Alex\nShort replies, no greetings.\nProd changes need an explicit yes from Alex.\nNever merge without his sign-off.',
+      ),
+    );
     const result = await withCentralSync(
       () =>
         buildPreTurnContext({
@@ -1350,44 +1321,17 @@ describe('per-person preference recall', () => {
           sessionId: 'sess-a',
           kind: 'chat-sdk',
           trigger: 1,
-          normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
+          normalizedContent: JSON.stringify({ text: 'status?', sender: 'Alex Stone', senderId: 'discord:alex' }),
         }),
       'test',
     );
 
-    const paths = result.memoryEvidence.excerpts.map((row) => row.path);
-    expect(paths).toContain('preferences/morgan-lee.md');
-    expect(paths).toContain('preferences/taylor-fox.md');
-    expect(paths.filter((p) => p === 'preferences/morgan-lee.md')).toHaveLength(1);
-    expect(result.memoryEvidence.excerpts).toHaveLength(2);
-  });
-
-  it('resolves two same-display-name senders to their own files via differing canonical names', async () => {
-    // The first Sam claims sam.md; the second Sam's per-message alias hits
-    // that already-claimed file, which must fall through to their canonical
-    // alias instead of the group contributing nothing.
-    memoryFile('preferences/sam.md', '# Sam\nWants prose.');
-    memoryFile('preferences/sam-rivera.md', '# Sam Rivera\nWants bullet points.');
-    archiveFrom('m1', 'Sam', '2026-08-01T00:01:00.000Z', 'discord:guild:channel:thread', 'slack:U20');
-    archiveFrom('m2', 'Sam', '2026-08-01T00:00:00.000Z', 'discord:guild:channel:thread', 'slack:U21');
-    upsertUserRow('slack:U21', 'Sam Rivera');
-
-    const result = await withCentralSync(
-      () =>
-        buildPreTurnContext({
-          agentGroupId: 'ag-a',
-          servicesCentral: SERVICES_CENTRAL_AG_A,
-          sessionId: 'sess-a',
-          kind: 'chat-sdk',
-          trigger: 1,
-          normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
-        }),
-      'test',
-    );
-
-    const paths = result.memoryEvidence.excerpts.map((row) => row.path);
-    expect(paths).toContain('preferences/sam.md');
-    expect(paths).toContain('preferences/sam-rivera.md');
+    const text = result.memoryEvidence.excerpts.find((row) => row.path === 'preferences/alex.md')?.text ?? '';
+    expect(text).toContain('Short replies, no greetings.');
+    expect(text).not.toContain('explicit yes');
+    expect(text).not.toContain('sign-off');
+    const withheld = result.notices.find((notice) => notice.code === 'preference-lines-withheld');
+    expect(withheld?.detail).toContain('preferences/alex.md: withheld 2 lines');
   });
 
   it("matches an ids: frontmatter file via the bare form under the conversation's verified namespace, even when both name slugs miss", async () => {
@@ -1514,7 +1458,7 @@ describe('per-person preference recall', () => {
     expect(preference!.text).toContain('Prefers bullet points');
   });
 
-  it('treats malformed frontmatter (no closing fence) as body text and falls back to name matching', async () => {
+  it('a file whose frontmatter never closes declares no ids and reaches nobody', async () => {
     memoryFile('preferences/drew-lane.md', '---\nids: [U999]\nnot a closing fence\n# Drew Lane\nPrefers plain text.');
     archiveFrom('m1', 'Drew Lane', '2026-08-01T00:00:00.000Z', 'discord:guild:channel:thread', 'slack-x:U999');
 
@@ -1531,13 +1475,7 @@ describe('per-person preference recall', () => {
       'test',
     );
 
-    // Malformed frontmatter means the id "U999" was never indexed, so the
-    // file is reached (if at all) only via the name-matching fallback — and
-    // its "malformed frontmatter" content is treated as ordinary body text,
-    // not stripped.
-    const preference = result.memoryEvidence.excerpts.find((row) => row.path === 'preferences/drew-lane.md');
-    expect(preference).toBeDefined();
-    expect(preference!.text).toContain('---');
+    expect(result.memoryEvidence.excerpts.some((row) => row.path === 'preferences/drew-lane.md')).toBe(false);
   });
 
   it('an id match is terminal for its group: never falls through to a stale name match on a shared raw id declaration', async () => {
@@ -1693,7 +1631,10 @@ describe('per-person preference recall', () => {
     // A DIFFERENT person, also named "Pat Doe", already archived under a
     // different sender_id — and that person's own preference file, matched
     // by name.
-    memoryFile('preferences/pat-doe.md', '# Pat Doe (other)\nWants terse updates.');
+    memoryFile(
+      'preferences/pat-doe.md',
+      withIds('discord:U0TESTOTHERPERSON', '# Pat Doe (other)\nWants terse updates.'),
+    );
     // The trigger's OWN id-declared file, reachable only via the fallback
     // group's (namespaced) senderId hitting the raw-suffix map.
     memoryFile(
@@ -1898,12 +1839,9 @@ describe('per-person preference recall', () => {
     expect(preference?.text).toContain('New preferences');
   });
 
-  it('blacklists a duplicate bare id from id matching, reports one conflict notice, and still name-matches', async () => {
+  it('blacklists a duplicate bare id from id matching and reports one conflict notice', async () => {
     memoryFile('preferences/dup-a.md', '---\nids: [U0TESTDUP]\n---\n# Dup A\nFile A preferences.');
     memoryFile('preferences/dup-b.md', '---\nids: [U0TESTDUP]\n---\n# Dup B\nFile B preferences.');
-    // Name-slug file for the same sender, so the "name matching remains the
-    // fallback" half of the fix is exercised in the same test.
-    memoryFile('preferences/dup-person.md', '# Dup Person\nName-matched preferences.');
 
     const result = await withCentralSync(
       () =>
@@ -1921,7 +1859,6 @@ describe('per-person preference recall', () => {
     const paths = result.memoryEvidence.excerpts.map((row) => row.path);
     expect(paths).not.toContain('preferences/dup-a.md');
     expect(paths).not.toContain('preferences/dup-b.md');
-    expect(paths).toContain('preferences/dup-person.md');
 
     const conflicts = result.notices.filter((notice) => notice.code === 'preference-id-conflict');
     expect(conflicts).toHaveLength(1);
@@ -2064,7 +2001,10 @@ describe('bootstrap recall budget (B-AC1..B-AC4, incident 2026-08-13)', () => {
   function seedIncidentShape(): void {
     const sentence = 'Losophe is the streets-only dev tenant for the practice build losophe app project detail. ';
     memoryFile('index.md', `# Canon\n${sentence.repeat(30)}`);
-    memoryFile('preferences/operator.md', `# Operator — preferences\n${'Use plain language. '.repeat(40)}`);
+    memoryFile(
+      'preferences/operator.md',
+      withIds('discord:user', `# Operator — preferences\n${'Use plain language. '.repeat(40)}`),
+    );
     for (let index = 0; index < 4; index++) {
       archive(`losophe-${index}`, 'ag-a', `${sentence.repeat(10)} (row ${index})`, `2026-07-2${index}T00:00:00.000Z`);
     }
@@ -2077,7 +2017,7 @@ describe('bootstrap recall budget (B-AC1..B-AC4, incident 2026-08-13)', () => {
       sessionId: 'sess-a',
       kind: 'chat-sdk',
       trigger: 1 as const,
-      normalizedContent: JSON.stringify({ text: ASK, sender: 'Operator' }),
+      normalizedContent: JSON.stringify({ text: ASK, sender: 'Operator', senderId: 'discord:user' }),
       includeBootstrap: bootstrap,
     };
   }
@@ -2562,4 +2502,294 @@ it('test_sanitizer_passes_expiresAt_through_to_trustedCapabilities', async () =>
   } finally {
     CAPABILITY_FIXTURE.services = null;
   }
+});
+
+describe('sibling copies of one platform message', () => {
+  /** The copy a sibling bot archives of a message: its own id and messaging group, the message's channel, thread, time and text. */
+  function copyOf(
+    id: string,
+    agentGroupId: string,
+    text: string,
+    {
+      sentAt = '2026-07-20T00:00:00.000Z',
+      threadId = 'discord:guild:channel:thread',
+      sender = 'user',
+    }: { sentAt?: string; threadId?: string | null; sender?: string } = {},
+  ): void {
+    upsertArchiveMessage(
+      {
+        id,
+        agentGroupId,
+        messagingGroupId: agentGroupId === 'ag-a' ? 'mg-a' : 'mg-a-codex',
+        channelType: agentGroupId === 'ag-a' ? 'discord' : 'discord-codex',
+        channelName: 'room',
+        platformId: 'discord:guild:channel',
+        threadId,
+        role: 'user',
+        senderId: `${agentGroupId === 'ag-a' ? 'discord' : 'discord-codex'}:${sender}`,
+        senderName: 'Operator',
+        text,
+        sentAt,
+      },
+      tenancyNow(getRawDb(), agentGroupId),
+    );
+  }
+
+  const turn = (text: string, seenEvidenceFingerprints: string[] = [], sessionId = 'sess-a') =>
+    withCentralSync(
+      () =>
+        buildPreTurnContext({
+          agentGroupId: 'ag-a',
+          servicesCentral: SERVICES_CENTRAL_AG_A,
+          sessionId,
+          kind: 'chat',
+          trigger: 1,
+          includeBootstrap: false,
+          normalizedContent: JSON.stringify({ text }),
+          seenEvidenceFingerprints,
+        }),
+      'test',
+    );
+
+  const ids = (context: Awaited<ReturnType<typeof turn>>) => context.conversationEvidence.excerpts.map((row) => row.id);
+  const codes = (context: Awaited<ReturnType<typeof turn>>) => context.notices.map((notice) => notice.code);
+  const expectSuppressed = (context: Awaited<ReturnType<typeof turn>>) => {
+    expect(ids(context)).toEqual([]);
+    expect(codes(context)).toContain('evidence-already-delivered');
+    expect(codes(context)).not.toContain('archive-read-failed');
+  };
+
+  it('gives a message one excerpt, the current agent’s own copy, and the freed slot to the next message', async () => {
+    copyOf('x-1:ag-a-codex', 'ag-a-codex', 'The zeppelin hangar is owned by Quinlan.');
+    copyOf('x-2:ag-a', 'ag-a', 'The zeppelin hangar is owned by Quinlan.');
+    archive('y', 'ag-a', 'Zeppelin hangar inspections happen on Fridays.', '2026-07-19T00:00:00.000Z');
+    archive('z', 'ag-a', 'The zeppelin hangar keys are kept at the front desk.', '2026-07-18T00:00:00.000Z');
+
+    expect(ids(await turn('Who owns the zeppelin hangar?'))).toEqual(['x-2:ag-a', 'y', 'z']);
+  });
+
+  it('keeps the current agent’s own copy when the search cut it and kept a sibling’s', async () => {
+    copyOf('x:ag-a', 'ag-a', 'The zeppelin hangar is owned by Quinlan.');
+    copyOf('x:ag-a-codex', 'ag-a-codex', 'The zeppelin hangar is owned by Quinlan.');
+    BEYOND_CANDIDATE_CUT.add('x:ag-a');
+
+    const context = await turn('Who owns the zeppelin hangar?');
+
+    expect(context.conversationEvidence.excerpts.map((row) => [row.id, row.rank])).toEqual([
+      ['x:ag-a', 'current-thread'],
+    ]);
+  });
+
+  it('ranks the current agent’s fetched copy by its own messaging group, not the sibling’s', async () => {
+    getRawDb()
+      .prepare(
+        `INSERT INTO sessions
+           (id,agent_group_id,messaging_group_id,thread_id,agent_provider,status,container_status,last_active,created_at)
+         VALUES (?,?,?,?,?,?,?,?,?)`,
+      )
+      .run('sess-root', 'ag-a', 'mg-a', null, null, 'active', 'stopped', null, '2026-01-01T00:00:00.000Z');
+    copyOf('x:ag-a', 'ag-a', 'The zeppelin hangar is owned by Quinlan.', { threadId: null });
+    copyOf('x:ag-a-codex', 'ag-a-codex', 'The zeppelin hangar is owned by Quinlan.', { threadId: null });
+    BEYOND_CANDIDATE_CUT.add('x:ag-a');
+
+    const context = await turn('Who owns the zeppelin hangar?', [], 'sess-root');
+
+    expect(context.conversationEvidence.excerpts.map((row) => [row.id, row.rank, row.messagingGroupId])).toEqual([
+      ['x:ag-a', 'current-thread', 'mg-a'],
+    ]);
+  });
+
+  it('keeps the current agent’s copy from the candidates when the archive lookup returns none', async () => {
+    copyOf('a:ag-a-codex', 'ag-a-codex', 'The zeppelin hangar is owned by Quinlan.');
+    copyOf('z:ag-a', 'ag-a', 'The zeppelin hangar is owned by Quinlan.');
+    COPY_LOOKUP.findsNothing = true;
+
+    expect(ids(await turn('Who owns the zeppelin hangar?'))).toEqual(['z:ag-a']);
+  });
+
+  it('keeps the lowest id when none of the copies is the current agent’s', async () => {
+    getRawDb()
+      .prepare(`INSERT INTO agent_groups (id,name,folder,agent_provider,created_at,workgroup_id) VALUES (?,?,?,?,?,?)`)
+      .run('ag-a-opencode', 'A OpenCode', 'fixture-a-opencode', null, '2026-01-01T00:00:00.000Z', 'wg-a');
+    copyOf('x:ag-a-opencode', 'ag-a-opencode', 'The zeppelin hangar is owned by Quinlan.');
+    copyOf('x:ag-a-codex', 'ag-a-codex', 'The zeppelin hangar is owned by Quinlan.');
+    BEYOND_CANDIDATE_CUT.add('x:ag-a-codex');
+
+    expect(ids(await turn('Who owns the zeppelin hangar?'))).toEqual(['x:ag-a-codex']);
+  });
+
+  it('does not take an unrelated message the current agent archived at the same time', async () => {
+    copyOf('x:ag-a-codex', 'ag-a-codex', 'The zeppelin hangar is owned by Quinlan.');
+    copyOf('y:ag-a', 'ag-a', 'The zeppelin hangar opens at noon.');
+    BEYOND_CANDIDATE_CUT.add('y:ag-a');
+
+    expect(ids(await turn('Who owns the zeppelin hangar?'))).toEqual(['x:ag-a-codex']);
+  });
+
+  it('keeps the same short text two people sent in the same second as two messages', async () => {
+    copyOf('p-1:ag-a-codex', 'ag-a-codex', 'Approved, open the zeppelin hangar.', { sender: 'alice' });
+    copyOf('p-2:ag-a-codex', 'ag-a-codex', 'Approved, open the zeppelin hangar.', { sender: 'bea' });
+
+    expect(ids(await turn('Who approved the zeppelin hangar?')).sort()).toEqual(['p-1:ag-a-codex', 'p-2:ag-a-codex']);
+  });
+
+  it.each([
+    ['at another time', { sentAt: '2026-07-21T00:00:00.000Z' }],
+    ['in another thread', { threadId: 'discord:guild:channel:other-thread' }],
+  ])('keeps the same text sent %s as a message of its own', async (_label, differs) => {
+    copyOf('x-1:ag-a', 'ag-a', 'The zeppelin hangar is owned by Quinlan.');
+    copyOf('x-2:ag-a-codex', 'ag-a-codex', 'The zeppelin hangar is owned by Quinlan.', differs);
+
+    expect(ids(await turn('Who owns the zeppelin hangar?')).sort()).toEqual(['x-1:ag-a', 'x-2:ag-a-codex']);
+  });
+
+  it('gives a linked message one excerpt, and does not offer its copies again as lexical matches', async () => {
+    for (const agentGroupId of ['ag-a-codex', 'ag-a']) {
+      upsertArchiveMessage(
+        {
+          id: `789:${agentGroupId}`,
+          agentGroupId,
+          messagingGroupId: agentGroupId === 'ag-a' ? 'mg-a' : 'mg-a-codex',
+          channelType: agentGroupId === 'ag-a' ? 'discord' : 'discord-codex',
+          channelName: 'room',
+          platformId: 'discord:123:456',
+          threadId: 'discord:123:456:789',
+          role: 'user',
+          senderId: 'discord:user',
+          senderName: 'Operator',
+          text: 'The zeppelin hangar is owned by Quinlan.',
+          sentAt: '2026-07-20T00:00:00.000Z',
+        },
+        tenancyNow(getRawDb(), agentGroupId),
+      );
+    }
+
+    const context = await turn('https://discord.com/channels/123/456/789 who owns the zeppelin hangar?');
+
+    expect(context.conversationEvidence.excerpts.map((row) => [row.id, row.rank])).toEqual([
+      ['789:ag-a', 'exact-link'],
+    ]);
+
+    BEYOND_CANDIDATE_CUT.add('789:ag-a');
+    const cut = await turn('https://discord.com/channels/123/456/789 who owns the zeppelin hangar?');
+
+    expect(cut.conversationEvidence.excerpts.map((row) => [row.id, row.rank])).toEqual([['789:ag-a', 'exact-link']]);
+  });
+
+  it('resolves a link only in the workgroup its message was archived for, after the agent group that archived it moved', async () => {
+    upsertArchiveMessage(
+      {
+        id: '789:ag-a-codex',
+        agentGroupId: 'ag-a-codex',
+        messagingGroupId: 'mg-a-codex',
+        channelType: 'discord-codex',
+        channelName: 'room',
+        platformId: 'discord:123:456',
+        threadId: 'discord:123:456:789',
+        role: 'user',
+        senderId: 'discord-codex:user',
+        senderName: 'Operator',
+        text: 'The zeppelin hangar is owned by Quinlan.',
+        sentAt: '2026-07-20T00:00:00.000Z',
+      },
+      tenancyNow(getRawDb(), 'ag-a-codex'),
+    );
+    getRawDb().prepare(`UPDATE agent_groups SET workgroup_id = 'wg-b' WHERE id = 'ag-a-codex'`).run();
+    getRawDb()
+      .prepare(
+        `INSERT INTO sessions
+           (id,agent_group_id,messaging_group_id,thread_id,agent_provider,status,container_status,last_active,created_at)
+         VALUES ('sess-b','ag-b','mg-a','discord:guild:channel:thread',NULL,'active','stopped',NULL,?)`,
+      )
+      .run('2026-01-01T00:00:00.000Z');
+    const link = 'https://discord.com/channels/123/456/789 who owns the zeppelin hangar?';
+
+    const inOldWorkgroup = await turn(link);
+    const inNewWorkgroup = await withCentralSync(
+      () =>
+        buildPreTurnContext({
+          agentGroupId: 'ag-b',
+          servicesCentral: SERVICES_CENTRAL_AG_B,
+          sessionId: 'sess-b',
+          kind: 'chat',
+          trigger: 1,
+          includeBootstrap: false,
+          normalizedContent: JSON.stringify({ text: link }),
+        }),
+      'test',
+    );
+
+    expect(inOldWorkgroup.conversationEvidence.excerpts.map((row) => [row.id, row.rank])).toEqual([
+      ['789:ag-a-codex', 'exact-link'],
+    ]);
+    expect(ids(inNewWorkgroup)).toEqual([]);
+  });
+
+  it('settles a search hit only among its workgroup’s copies, though another workgroup holds the agent’s own copy', async () => {
+    const text = 'The zeppelin hangar is owned by Quinlan.';
+    getRawDb().prepare(`UPDATE agent_groups SET workgroup_id = 'wg-b' WHERE id = 'ag-a'`).run();
+    copyOf('x:ag-a', 'ag-a', text);
+    getRawDb().prepare(`UPDATE agent_groups SET workgroup_id = 'wg-a' WHERE id = 'ag-a'`).run();
+    copyOf('x:ag-a-codex', 'ag-a-codex', text);
+
+    const context = await turn('Who owns the zeppelin hangar?');
+
+    expect(
+      context.conversationEvidence.excerpts.map((row) => [
+        row.id,
+        row.messagingGroupId,
+        row.senderId,
+        row.provenance.archiveId,
+      ]),
+    ).toEqual([['x:ag-a-codex', 'mg-a-codex', 'discord-codex:user', 'x:ag-a-codex']]);
+  });
+
+  it('does not deliver a message again under another copy once one copy was delivered in the context epoch', async () => {
+    copyOf('x-1:ag-a-codex', 'ag-a-codex', 'The zeppelin hangar is owned by Quinlan.');
+    const first = await turn('Who owns the zeppelin hangar?');
+    expect(ids(first)).toEqual(['x-1:ag-a-codex']);
+
+    copyOf('x-2:ag-a', 'ag-a', 'The zeppelin hangar is owned by Quinlan.');
+    const again = await turn('Who owns the zeppelin hangar?', [first.conversationEvidence.excerpts[0]!.fingerprint]);
+
+    expect(ids(again)).toEqual([]);
+    expect(again.notices.some((notice) => notice.code === 'evidence-already-delivered')).toBe(true);
+  });
+
+  it('does not deliver the current agent’s copy again once the search cuts it and keeps a sibling’s', async () => {
+    copyOf('x:ag-a', 'ag-a', 'The zeppelin hangar is owned by Quinlan.');
+    copyOf('x:ag-a-codex', 'ag-a-codex', 'The zeppelin hangar is owned by Quinlan.');
+    const first = await turn('Who owns the zeppelin hangar?');
+    expect(ids(first)).toEqual(['x:ag-a']);
+
+    BEYOND_CANDIDATE_CUT.add('x:ag-a');
+    const again = await turn('Who owns the zeppelin hangar?', [first.conversationEvidence.excerpts[0]!.fingerprint]);
+
+    expectSuppressed(again);
+  });
+
+  it('does not deliver the current agent’s copy once a sibling’s was delivered and the search cut it', async () => {
+    copyOf('x:ag-a-codex', 'ag-a-codex', 'The zeppelin hangar is owned by Quinlan.');
+    const first = await turn('Who owns the zeppelin hangar?');
+    expect(ids(first)).toEqual(['x:ag-a-codex']);
+
+    copyOf('x:ag-a', 'ag-a', 'The zeppelin hangar is owned by Quinlan.');
+    BEYOND_CANDIDATE_CUT.add('x:ag-a-codex');
+    const again = await turn('Who owns the zeppelin hangar?', [first.conversationEvidence.excerpts[0]!.fingerprint]);
+
+    expectSuppressed(again);
+  });
+
+  it('does not deliver a message again when the agent group whose copy was delivered holds a second copy', async () => {
+    copyOf('z:ag-a-codex', 'ag-a-codex', 'The zeppelin hangar is owned by Quinlan.');
+    const first = await turn('Who owns the zeppelin hangar?');
+    expect(ids(first)).toEqual(['z:ag-a-codex']);
+
+    copyOf('a:ag-a-codex', 'ag-a-codex', 'The zeppelin hangar is owned by Quinlan.');
+    copyOf('x:ag-a', 'ag-a', 'The zeppelin hangar is owned by Quinlan.');
+    BEYOND_CANDIDATE_CUT.add('z:ag-a-codex');
+    const again = await turn('Who owns the zeppelin hangar?', [first.conversationEvidence.excerpts[0]!.fingerprint]);
+
+    expectSuppressed(again);
+  });
 });

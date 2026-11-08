@@ -127,6 +127,47 @@ describe('loadMountAllowlist', () => {
   });
 });
 
+describe('approved-run handoff tree', () => {
+  it('refuses a read-write mount aimed inside the handoff tree, directly or through a symlink', () => {
+    const handoffs = path.join(mockState.dataDir, 'approved-run', 'handoffs');
+    fs.mkdirSync(handoffs, { recursive: true });
+    const link = path.join(tmpDir, 'handoff-link');
+    fs.symlinkSync(handoffs, link);
+    writeAllowlist({ allowedRoots: [{ path: tmpDir, allowReadWrite: true }], blockedPatterns: [] });
+
+    for (const hostPath of [handoffs, path.join(mockState.dataDir, 'approved-run'), link]) {
+      const result = validateMount({ hostPath, readonly: false });
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toMatch(/approved-run handoff tree/);
+    }
+  });
+
+  it.each([
+    ['the handoff directory', () => path.join(mockState.dataDir, 'approved-run', 'handoffs')],
+    ['the tree itself', () => path.join(mockState.dataDir, 'approved-run')],
+    ['one connection file', () => path.join(mockState.dataDir, 'approved-run', 'connections', 'dpg-example.json')],
+  ])('refuses a read-only mount of %s too', (_name, target) => {
+    fs.mkdirSync(path.join(mockState.dataDir, 'approved-run', 'handoffs'), { recursive: true });
+    fs.mkdirSync(path.join(mockState.dataDir, 'approved-run', 'connections'), { recursive: true });
+    fs.writeFileSync(path.join(mockState.dataDir, 'approved-run', 'connections', 'dpg-example.json'), '{}');
+    writeAllowlist({ allowedRoots: [{ path: tmpDir, allowReadWrite: true }], blockedPatterns: [] });
+    const result = validateMount({ hostPath: target(), readonly: true });
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toMatch(/approved-run handoff tree/);
+  });
+
+  it('refuses a read-only mount of where the tree really lives when it is a symlink, before any file exists in it', () => {
+    const lane = path.join(tmpDir, 'lane');
+    fs.mkdirSync(lane, { recursive: true });
+    fs.mkdirSync(mockState.dataDir, { recursive: true });
+    fs.symlinkSync(lane, path.join(mockState.dataDir, 'approved-run'));
+    writeAllowlist({ allowedRoots: [{ path: tmpDir, allowReadWrite: true }], blockedPatterns: [] });
+    const result = validateMount({ hostPath: lane, readonly: true });
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toMatch(/approved-run handoff tree/);
+  });
+});
+
 describe('managed git-hooks tree containment (#666 review B9)', () => {
   function managedHooksScanDir(): string {
     const dir = path.join(mockState.dataDir, 'managed-git-hooks', 'scan');

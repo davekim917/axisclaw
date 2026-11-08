@@ -8,7 +8,9 @@
     "src/compact-instructions.ts",
     "src/memory/hook.ts",
     "src/codex-hooks/cli.ts",
+    "src/codex-plugin-registration.ts",
     "src/remote-mcp-bridge.ts",
+    "src/psql-record.ts",
     "src/granola-mcp-server.ts",
     "src/managed-git-guard-opencode.ts",
     "src/mcp-tools/memory-write-process-helper.ts"

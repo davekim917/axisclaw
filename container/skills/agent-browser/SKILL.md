@@ -201,9 +201,9 @@ above, not `click "text=<value>"`.
 
 Never ask anyone for a password or MFA code, and never type one you were given in chat.
 
-1. **Saved login first.** `ls /workspace/browser-state/` — if `<site>.json` is there, `agent-browser state load /workspace/browser-state/<site>.json`, open the app, and check you landed signed in, not on a login page.
-2. **Otherwise ask an owner to sign in.** `ncl browser takeover --url <the app's own page> --site <site>` — the app's URL, not the SSO login page: only the session for that host is handed back to you. They sign in to a separate browser you cannot see (SSO, MFA). Say in the conversation that you are waiting for them, then end your turn; they reply here when done.
-3. **Then collect it.** `ncl browser finish` saves their session to `/workspace/browser-state/<site>.json`; `state load` it and confirm you are signed in. That file is a live login shared with your workgroup's agents: never print, copy, attach, or commit it.
+1. **Saved login first.** `ls /workspace/browser-state-private/ /workspace/browser-state/` — if `<site>.json` is in either, `agent-browser state load` it (the private one first), open the app, and check you landed signed in, not on a login page.
+2. **Otherwise ask an owner to sign in.** `ncl browser takeover --url <the app's own page> --site <site>` — the app's URL, not the SSO login page: only the session for that host is handed back to you, plus any identity-provider hosts an operator listed for that site. They sign in to a separate browser you cannot see (SSO, MFA). Say in the conversation that you are waiting for them, then end your turn; they reply here when done.
+3. **Then collect it.** `ncl browser finish` prints where it saved their session, normally `/workspace/browser-state/<site>.json`; `state load` it and confirm you are signed in. That file is a live login shared with your workgroup's agents: never print, copy, attach, or commit it. A login under `/workspace/browser-state-private/` also holds an identity provider's sign-in, approved for you alone: use it only for the site it was approved for, and never move it to the shared directory.
 
 If the site refuses the browser itself ("this browser may not be secure"), report that instead of retrying.
 

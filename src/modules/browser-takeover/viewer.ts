@@ -20,11 +20,61 @@ export function textEdit(prev: string, cur: string): { deletes: number; inserts:
   return { deletes: p.length - i, inserts: c.slice(i).join('') };
 }
 
+/**
+ * The browser's own address for the streamed tab, null when a report names none, undefined when the message is not a
+ * report. A tab's title is the page's to set, so it never counts.
+ */
+export function reportedAddress(message: { type?: string; url?: unknown; tabs?: unknown }): unknown {
+  if (message.type === 'url') return message.url ?? null;
+  if (message.type !== 'tabs') return undefined;
+  return Array.isArray(message.tabs) ? (message.tabs.find((tab) => tab?.active === true)?.url ?? null) : null;
+}
+
+/** The whole host and no path, which the page can set. Only a plain-text sign-in is marked, by its scheme. */
+export function addressLine(address: unknown): string {
+  try {
+    const { protocol, host } = new URL(String(address));
+    if (protocol === 'https:') return `You are on ${host}`;
+    if (protocol === 'http:') return `You are on http://${host}`;
+  } catch {
+    return 'Address unknown';
+  }
+  return 'This page has no address';
+}
+
+const HOST_ANSWER_MS = 2000;
+const HOST_CHECK_MS = 1000;
+
+/**
+ * The stream gives no sign of a stalled host: frames stop, which a still page does too, and sent input waits in the
+ * socket to land all at once when the host resumes. Only asking the host shows it. A late answer still clears the
+ * stall, so a slow network costs a moment of ignored taps and not all of them.
+ */
+export async function watchHost(
+  ping: () => Promise<unknown>,
+  report: (stalled: boolean) => void,
+  pause: (ms: number) => Promise<unknown>,
+): Promise<void> {
+  for (;;) {
+    const answer = ping().then(
+      () => true,
+      () => false,
+    );
+    if (!(await Promise.race([answer, pause(HOST_ANSWER_MS).then(() => false)]))) report(true);
+    report(!(await answer));
+    await pause(HOST_CHECK_MS);
+  }
+}
+
 const SCRIPT =
-  `${virtualKeyCode.toString()}\n${textEdit.toString()}\n` +
+  `${virtualKeyCode.toString()}\n${textEdit.toString()}\n${watchHost.toString()}\n` +
+  `${reportedAddress.toString()}\n${addressLine.toString()}\n` +
+  `const HOST_ANSWER_MS = ${HOST_ANSWER_MS}, HOST_CHECK_MS = ${HOST_CHECK_MS};\n` +
   String.raw`
 const v = document.getElementById('v'), bar = document.getElementById('bar'), t = document.getElementById('t');
-let ws = null, vw = 0, vh = 0, prev = '', down = null, scrolling = false;
+const at = document.getElementById('at');
+let ws = null, vw = 0, vh = 0, prev = '', down = null, scrolling = false, stalled = false, status = 'Connecting…';
+const say = (text) => { status = text; if (!stalled) bar.textContent = text; };
 const SPECIAL = { Enter: { text: '\r', code: 13 }, Tab: { text: '\t', code: 9 }, Backspace: { text: '\b', code: 8 } };
 const send = (m) => { if (ws && ws.readyState === 1) ws.send(JSON.stringify(m)); };
 const keyPair = (base, text) => {
@@ -59,7 +109,7 @@ v.addEventListener('pointermove', (e) => {
   down.lastY = e.clientY;
 });
 v.addEventListener('pointerup', (e) => {
-  if (down && !scrolling) {
+  if (down && !scrolling && !stalled) {
     const p = point(e);
     mouse('mouseMoved', p);
     mouse('mousePressed', p, { button: 'left', clickCount: 1 });
@@ -99,20 +149,27 @@ async function connect() {
     if (!sessions.length) throw new Error('no browser yet');
     const port = (sessions.find((s) => s.session === 'default') || sessions[0]).port;
     ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/api/session/' + port + '/stream');
-    ws.onopen = () => { send({ type: 'config', maxFps: 15 }); bar.textContent = 'Tap the page to click. Type in the box below.'; };
+    ws.onopen = () => { send({ type: 'config', maxFps: 15 }); say('Tap the page to click. Type in the box below.'); };
     ws.onmessage = (e) => {
       let m;
       try { m = JSON.parse(e.data); } catch { return; }
       if (m.type === 'frame') v.src = 'data:image/jpeg;base64,' + m.data;
       else if (m.type === 'status') { if (m.viewportWidth) vw = m.viewportWidth; if (m.viewportHeight) vh = m.viewportHeight; }
+      const address = reportedAddress(m);
+      if (address !== undefined) at.textContent = addressLine(address);
     };
-    ws.onclose = () => { bar.textContent = 'Reconnecting…'; setTimeout(connect, 2000); };
+    ws.onclose = () => { at.textContent = addressLine(); say('Reconnecting…'); setTimeout(connect, 2000); };
   } catch (err) {
-    bar.textContent = 'Waiting for the browser (' + err.message + ')…';
+    say('Waiting for the browser (' + err.message + ')…');
     setTimeout(connect, 3000);
   }
 }
 connect();
+watchHost(
+  () => fetch('/alive', { cache: 'no-store' }),
+  (now) => { stalled = now; bar.textContent = now ? 'Connection stalled. Taps ignored until this clears.' : status; },
+  (ms) => new Promise((done) => setTimeout(done, ms)),
+);
 `;
 
 export const VIEWER_PAGE =
@@ -120,13 +177,14 @@ export const VIEWER_PAGE =
   '<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">' +
   '<title>Agent browser</title><style>' +
   'body{margin:0;font:15px system-ui;background:#111;color:#eee;display:flex;flex-direction:column;height:100dvh}' +
+  '#at{padding:8px 12px 0;font-weight:600;overflow-wrap:anywhere}' +
   '#bar{padding:8px 12px;font-size:13px;opacity:.85}' +
   '#wrap{flex:1;min-height:0;display:flex;justify-content:center}' +
   '#v{max-width:100%;max-height:100%;object-fit:contain;touch-action:none;user-select:none;-webkit-user-select:none}' +
   '#keys{display:flex;gap:6px;padding:8px 8px max(8px,env(safe-area-inset-bottom));background:#1b1b1b}' +
   '#t{flex:1;min-width:0;font:16px system-ui;padding:10px;border-radius:8px;border:1px solid #444;background:#000;color:#fff}' +
   'button{font:15px system-ui;padding:10px 12px;border-radius:8px;border:1px solid #444;background:#2a2a2a;color:#eee}' +
-  '</style><div id="bar">Connecting…</div><div id="wrap"><img id="v" alt="The agent\'s browser"></div>' +
+  '</style><div id="at">Address unknown</div><div id="bar">Connecting…</div><div id="wrap"><img id="v" alt="The agent\'s browser"></div>' +
   '<div id="keys"><input id="t" type="password" placeholder="Tap a field above, then type here" autocomplete="off" ' +
   'autocorrect="off" autocapitalize="none" spellcheck="false"><button id="hide">Show</button>' +
   '<button id="tab">Tab</button><button id="enter">Enter</button></div>' +

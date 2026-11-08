@@ -523,6 +523,16 @@ export async function getApprovalByRequestId(
   );
 }
 
+/** Replaces the row's `card_copies` JSON; false when the row is gone. Only the card pointer writes copies. */
+export async function updatePendingApprovalCardCopies(approvalId: string, cardCopiesJson: string): Promise<boolean> {
+  const result = await getDb().run(
+    'UPDATE pending_approvals SET card_copies = ? WHERE approval_id = ?',
+    cardCopiesJson,
+    approvalId,
+  );
+  return result.changes > 0;
+}
+
 export async function updatePendingApprovalMessageId(
   approvalId: string,
   platformMessageId: string | null,

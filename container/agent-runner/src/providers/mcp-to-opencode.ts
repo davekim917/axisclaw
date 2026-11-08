@@ -1,10 +1,13 @@
 import { cwdWrappedArgv } from './cwd-shim.js';
+import { usableToolTimeoutMs } from './mcp-tool-timeout.js';
 import type { McpServerConfig } from './types.js';
 
 type OpenCodeMcpLocal = {
   type: 'local';
   command: string[];
   environment?: Record<string, string>;
+  /** Milliseconds. OpenCode applies it to connect, tool listing and tool calls alike. */
+  timeout?: number;
   enabled: true;
 };
 
@@ -37,14 +40,13 @@ export function mcpServersToOpenCodeConfig(
       continue;
     }
     // OpenCode's local entry has no cwd field, so a declared cwd is wrapped through /bin/sh rather than ignored.
-    const command = cfg.cwd
-      ? cwdWrappedArgv(cfg.cwd, cfg.command, cfg.args ?? [])
-      : [cfg.command, ...(cfg.args ?? [])];
+    const command = cfg.cwd ? cwdWrappedArgv(cfg.cwd, cfg.command, cfg.args ?? []) : [cfg.command, ...(cfg.args ?? [])];
     const env = cfg.env;
     out[name] = {
       type: 'local',
       command,
       ...(env && Object.keys(env).length > 0 ? { environment: env } : {}),
+      ...(usableToolTimeoutMs(cfg.timeout) !== undefined ? { timeout: cfg.timeout } : {}),
       enabled: true,
     };
   }

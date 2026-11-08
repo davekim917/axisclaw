@@ -635,7 +635,8 @@ export function listDueTaskRows(db: Database.Database): HostGatedTaskRow[] {
     .prepare(
       `SELECT id, series_id, content FROM messages_in
         WHERE kind = 'task' AND status = 'pending' AND trigger = 0
-          AND (process_after IS NULL OR datetime(process_after) <= datetime('now'))`,
+          AND (process_after IS NULL OR datetime(process_after) <= datetime('now'))
+        ORDER BY seq`,
     )
     .all() as HostGatedTaskRow[];
 }

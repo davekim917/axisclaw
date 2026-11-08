@@ -172,14 +172,15 @@ function claimStateLine(claim: BoardClaim): string {
 }
 
 /**
- * Link back to the claim thread: an alert that lands top-level otherwise gets
- * answered under the alert, in a thread the owning agent isn't reading.
+ * The session cannot see where its post lands, and a reader told to go to the
+ * thread they are already in has been sent nowhere. The link is for a post sent
+ * elsewhere, whose reply would otherwise open a thread the owner isn't reading.
  * Resolved host-side because a Slack thread id carries no workspace URL.
  */
-function threadLinkLine(threadUrl: string | null | undefined): string {
+function landingLine(threadUrl: string | null | undefined): string {
   return threadUrl
-    ? `Include this link to the claim's thread in that message: ${threadUrl} — and ask them to reply THERE, where ` +
-        `the context is, not under your post. A reply to the alert itself starts a second thread on the same topic.\n`
+    ? `A post from this task lands in the claim's thread (${threadUrl}), and a reply to it lands there too, so just ` +
+        `ask. Only a post you send somewhere else needs that link and a request to reply THERE.\n`
     : '';
 }
 
@@ -201,11 +202,10 @@ export function buildNudgePrompt(claim: BoardClaim, origin: string, threadUrl?: 
     `3. SOMEONE ELSE — a human or another agent — owes you a decision or an action you cannot proceed without: ` +
     `\`${claimSh} park ${claim.slug} "waiting on <person-or-agent>: <what you asked>"\`, AND post ONE message that ` +
     `@-mentions whoever owes it. The mention is what delivers the ask — a notification to a human, a wake to an agent; ` +
-    `a plain name reaches neither. Write it to stand alone — say which claim, what is blocked, and who owes the answer; ` +
-    `it may land at the top of a channel rather than in the thread you are reading this in.\n` +
+    `a plain name reaches neither. Write it to stand alone — say which claim, what is blocked, and who owes the answer.\n` +
     `4. The work is still being worked in its own thread by a session that is not this one: leave the claim exactly ` +
     `as it is. Do not park, release, take over or re-thread it, and post nothing; that session moves it when it is done.\n` +
-    threadLinkLine(threadUrl) +
+    landingLine(threadUrl) +
     `\nPost NOTHING for 1, 2 or 4. The claims board and the Observatory already show claim state, so announcing a finish, ` +
     `a release or a park duplicates what a human can already see — and your standing instructions forbid it. Option 3 ` +
     `is the ONLY sanctioned post here, because a blocked hand-off is the one thing no board can show. Do not hedge by ` +
@@ -237,7 +237,7 @@ export function buildTakeoverPrompt(claim: BoardClaim, threadUrl?: string | null
     `Post nothing: the take rewrites the owner on the board, which is where anyone looking will read it.\n` +
     `2. Post ONE message saying why this should NOT be taken over (already done, superseded, blocked on a named human) ` +
     `— that reason is the one thing the board cannot show. If it is done, also release it: \`${claimSh} release ${claim.slug}\`.\n` +
-    threadLinkLine(threadUrl) +
+    landingLine(threadUrl) +
     `\n` +
     `Do not silently leave it: this is the last automatic step, and after it the claim just sits red on the board.`
   );
@@ -264,8 +264,8 @@ function buildHumanEscalationPrompt(claim: BoardClaim, threadUrl?: string | null
     `👉 @<person> — <the decision or action you need, and by when>\n` +
     `The @-mention is the whole point: it is what raises a notification. A plain name reaches nobody, and writing ` +
     `one is how this claim got here. Write the message to stand alone — name the claim, what is blocked, and what ` +
-    `you need — because it may land at the top of a channel rather than in the thread you are reading this in.\n` +
-    threadLinkLine(threadUrl) +
+    `you need.\n` +
+    landingLine(threadUrl) +
     `\nThis is the LAST automatic step for this claim. Nothing will ask again.`
   );
 }
@@ -515,6 +515,15 @@ async function defaultResolveSibling(
 }
 
 /**
+ * The thread a target's task runs in, which is also where its post lands: the
+ * prompt says so. For a task-series claim `null` means "the channel, no thread",
+ * not "fall back", and the claim's own thread is not linkable.
+ */
+function taskThreadId(target: SelfHealTarget, claim: BoardClaim): string | null {
+  return target.deliverThreadId !== undefined ? target.deliverThreadId : claim.threadId;
+}
+
+/**
  * `caller: 'host'` with explicit `messaging_group` + `thread_id` is the only
  * routing shape that doesn't need an existing session.
  */
@@ -530,8 +539,7 @@ async function defaultCreateTask(input: SelfHealTaskInput): Promise<boolean> {
         prompt: input.prompt,
         process_after: new Date().toISOString(),
         messaging_group: input.target.messagingGroupId,
-        // For a task-series claim `null` means "the channel, no thread", not "fall back".
-        thread_id: input.target.deliverThreadId !== undefined ? input.target.deliverThreadId : input.claim.threadId,
+        thread_id: taskThreadId(input.target, input.claim),
         ...NUDGE_TASK_QUIET_ARGS,
       },
     },
@@ -699,9 +707,8 @@ async function applyDecision(args: {
     return { ...base, applied: false, reason: decision.action === 'takeover' ? 'no-sibling' : 'owner-unresolved' };
   }
 
-  // A task-series claim's own thread is not linkable; `null` means channel-level.
-  const contextThread = target.deliverThreadId !== undefined ? target.deliverThreadId : claim.threadId;
-  const threadUrl = contextThread ? await args.resolveThreadUrl(contextThread) : null;
+  const taskThread = taskThreadId(target, claim);
+  const threadUrl = taskThread ? await args.resolveThreadUrl(taskThread) : null;
   const prompt =
     decision.action === 'takeover'
       ? buildTakeoverPrompt(claim, threadUrl)

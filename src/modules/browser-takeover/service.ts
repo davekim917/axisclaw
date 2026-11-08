@@ -6,12 +6,14 @@ import { promisify } from 'util';
 
 import { BROWSER_TAKEOVER_ORIGIN, EGRESS_LOCKDOWN } from '../../config.js';
 import { containerIdentityFor } from '../../container-runner.js';
+import { readContainerConfig } from '../../container-config.js';
 import { CONTAINER_RUNTIME_BIN } from '../../container-runtime.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
 import { replaceUntrustedFile } from '../../fs-safety.js';
 import { notifyOperators } from '../../operator-alert.js';
 import { DASHBOARD_CONTAINER_PORT } from './bridge.js';
-import { browserStateMount } from './state-dir.js';
+import { browserSsoHosts, refuseListedProvider } from './sso-hosts.js';
+import { browserStateMount, PRIVATE_BROWSER_STATE_CONTAINER_PATH, privateBrowserStateMount } from './state-dir.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -22,6 +24,11 @@ const DOCKER_TIMEOUT_MS = 60_000;
 const STATE_EXPORT_MAX_BYTES = 32 * 1024 * 1024;
 const MAX_REASON_CHARS = 200;
 const SITE_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+// `new URL` keeps backticks, asterisks and quotes in a hostname, and this one is printed to the owner as their check.
+const PRINTABLE_HOST_RE = /^(?:[a-z0-9._-]+|\[[0-9a-f:.]+\])$/;
+// A note passes through the secret scrubber and each channel's markdown converter on its way to the owner, and neither
+// keeps an enclosure intact. Words and plain punctuation leave no link, mention, entity or bare domain to protect against.
+const NOT_PLAIN_NOTE_RE = /[^\p{L}\p{M}\p{N} ,'?!-]+/gu;
 const SIDECAR_STATE_PATH = '/tmp/takeover-state.json';
 const SIDECAR_VIEWPORT = [430, 900] as const;
 
@@ -30,6 +37,9 @@ interface Sidecar {
   target: URL;
   site: string;
   workgroupKey: string;
+  folder: string;
+  /** Fixed when the owner is told: they approve what the DM and the page named, not what the file says at finish. */
+  extraHosts: string[];
   dashboardToken: string;
   expiresAt: number;
 }
@@ -63,28 +73,30 @@ interface StorageState {
 }
 
 /**
- * Keeps only what the browser would send to `target` and that origin's storage. Everything else the sign-in left
- * behind, above all the identity provider's own session, would hand the agent every app behind that SSO.
+ * Keeps only what the browser would send to `target` and that origin's storage, plus the same for each host an owner
+ * approved in `extraHosts`. Everything else the sign-in left behind, above all an identity provider's session nobody
+ * approved, would hand the agent every app behind that SSO.
  */
-function stateForTarget(raw: string, target: URL): StorageState {
+function stateForTarget(raw: string, target: URL, extraHosts: readonly string[]): StorageState {
   const state = JSON.parse(raw) as StorageState;
-  const host = target.hostname;
+  const hosts = [target.hostname, ...extraHosts];
+  const origins = new Set([target.origin, ...extraHosts.map((host) => `https://${host}`)]);
   // A server-set Domain cookie exports with a leading dot. A bare domain is matched as host-only, which can only drop a
   // cookie the export also writes bare (seen for a script-set one), never hand over one the browser would not send.
   const sentTo = (domain = '') => {
     const d = domain.toLowerCase();
-    return d.startsWith('.') ? host === d.slice(1) || host.endsWith(d) : host === d;
+    return hosts.some((host) => (d.startsWith('.') ? host === d.slice(1) || host.endsWith(d) : host === d));
   };
-  const sameOrigin = (origin = '') => {
+  const keptOrigin = (origin = '') => {
     try {
-      return new URL(origin).origin === target.origin;
+      return origins.has(new URL(origin).origin);
     } catch {
       return false;
     }
   };
   return {
     cookies: (state.cookies ?? []).filter((c) => sentTo(c.domain)),
-    origins: (state.origins ?? []).filter((o) => sameOrigin(o.origin)),
+    origins: (state.origins ?? []).filter((o) => keptOrigin(o.origin)),
   };
 }
 
@@ -156,6 +168,32 @@ async function startSidecar(agentContainer: string, url: string): Promise<{ cont
   }
 }
 
+function handedOver(host: string, extraHosts: readonly string[], agentName: string): string {
+  if (extraHosts.length === 0) return `only its session for ${host} is handed over.`;
+  return (
+    `${agentName} alone gets its session for ${host} and your sign-in at ${extraHosts.join(', ')}. ` +
+    `That sign-in can open other apps that use it, not only ${host}.`
+  );
+}
+
+/** Printed after the disclosure and labelled, so an agent's note cannot pass for what the host says is handed over. */
+function agentNote(reason: string): string {
+  return reason ? `\nThe agent's own note, unchecked: ${reason}` : '';
+}
+
+/** A container spawned before this group's `browserSso` entry has no such mount, and would never see the login. */
+async function assertPrivateStateMounted(agentContainer: string): Promise<void> {
+  const { stdout } = await docker(
+    'inspect',
+    '--format',
+    '{{range .Mounts}}{{println .Destination}}{{end}}',
+    agentContainer,
+  );
+  if (!stdout.split('\n').includes(PRIVATE_BROWSER_STATE_CONTAINER_PATH)) {
+    throw new Error("This container predates the group's browserSso entry. Restart it, then ask again.");
+  }
+}
+
 export interface TakeoverRequest {
   sessionId: string;
   agentGroupId: string;
@@ -179,10 +217,15 @@ export async function startBrowserTakeover(input: TakeoverRequest): Promise<{ ex
     throw new Error('--url must be an absolute http(s) URL.', { cause: err });
   }
   if (url.protocol !== 'https:' && url.protocol !== 'http:') throw new Error('--url must be an absolute http(s) URL.');
+  if (!PRINTABLE_HOST_RE.test(url.hostname)) throw new Error('--url must name a plain host.');
   const agentContainer = containerIdentityFor(input.sessionId)?.containerName;
   if (!agentContainer) throw new Error('This session has no running container.');
   const group = await getAgentGroup(input.agentGroupId);
   if (!group) throw new Error('Agent group not found.');
+  const containerConfig = readContainerConfig(group.folder);
+  const extraHosts = browserSsoHosts(containerConfig, input.site);
+  refuseListedProvider(containerConfig, extraHosts, url.hostname);
+  if (extraHosts.length > 0) await assertPrivateStateMounted(agentContainer);
 
   const previous = sidecars.get(input.sessionId);
   if (previous) await removeSidecar(input.sessionId, previous.containerName);
@@ -196,19 +239,25 @@ export async function startBrowserTakeover(input: TakeoverRequest): Promise<{ ex
     target: url,
     site: input.site,
     workgroupKey: group.workgroup_id ?? group.folder,
+    folder: group.folder,
+    extraHosts,
     dashboardToken: token,
     expiresAt: now + LINK_TTL_MS + BINDING_TTL_MS,
   });
   const linkToken = randomBytes(24).toString('base64url');
   links.set(linkToken, { sessionId: input.sessionId, expiresAt: now + LINK_TTL_MS });
 
-  const reason = (input.reason ?? '').replace(/\s+/g, ' ').trim().slice(0, MAX_REASON_CHARS);
+  const reason = (input.reason ?? '')
+    .replace(NOT_PLAIN_NOTE_RE, ' ')
+    .replace(/ +/g, ' ')
+    .trim()
+    .slice(0, MAX_REASON_CHARS);
   const reached = await notifyOperators(
-    `${group.name} needs you to sign in to ${url.host}${reason ? `: ${reason}` : ''}\n` +
+    `${group.name} needs you to sign in to ${url.host}\n` +
       `${BROWSER_TAKEOVER_ORIGIN}/t/${linkToken}\n` +
       `The link opens once and expires in ${LINK_TTL_MS / 60_000} minutes. You sign in to a separate browser the agent ` +
-      `cannot see; only its session for ${url.hostname} is handed over. Tell the agent in its conversation when you ` +
-      'are done.',
+      `cannot see; ${handedOver(url.hostname, extraHosts, group.name)} Tell the agent in its conversation when you ` +
+      `are done.${agentNote(reason)}`,
     { event: 'browser-takeover', agentGroupId: input.agentGroupId },
   );
   if (!reached) {
@@ -218,7 +267,7 @@ export async function startBrowserTakeover(input: TakeoverRequest): Promise<{ ex
   return { expiresAt: new Date(now + LINK_TTL_MS).toISOString() };
 }
 
-export async function finishBrowserTakeover(sessionId: string): Promise<{ path: string }> {
+export async function finishBrowserTakeover(sessionId: string): Promise<{ path: string; privateToAgent?: true }> {
   prune(Date.now());
   const sidecar = sidecars.get(sessionId);
   if (!sidecar)
@@ -226,19 +275,34 @@ export async function finishBrowserTakeover(sessionId: string): Promise<{ path: 
   try {
     await docker('exec', sidecar.containerName, 'agent-browser', 'state', 'save', SIDECAR_STATE_PATH);
     const { stdout } = await docker('exec', sidecar.containerName, 'cat', SIDECAR_STATE_PATH);
-    const state = stateForTarget(stdout, sidecar.target);
+    const state = stateForTarget(stdout, sidecar.target, sidecar.extraHosts);
     if (state.cookies?.length === 0 && state.origins?.length === 0) {
       throw new Error(
         `The sign-in left no session for ${sidecar.target.host}; start a new takeover with the app's own URL.`,
       );
     }
-    const mount = browserStateMount(sidecar.workgroupKey);
-    if (!mount) throw new Error(`Workgroup "${sidecar.workgroupKey}" has no browser-state directory.`);
+    const widened = sidecar.extraHosts.length > 0;
+    const mount = widened ? privateBrowserStateMount(sidecar.folder) : browserStateMount(sidecar.workgroupKey);
+    if (!mount) {
+      throw new Error(
+        widened
+          ? `Group "${sidecar.folder}" has no private browser-state directory.`
+          : `Workgroup "${sidecar.workgroupKey}" has no browser-state directory.`,
+      );
+    }
     replaceUntrustedFile(mount.hostPath, `${sidecar.site}.json`, JSON.stringify(state), 0o600);
-    return { path: `${mount.containerPath}/${sidecar.site}.json` };
+    const path = `${mount.containerPath}/${sidecar.site}.json`;
+    return widened ? { path, privateToAgent: true } : { path };
   } finally {
     await removeSidecar(sessionId, sidecar.containerName);
   }
+}
+
+export function describeTakeoverLink(linkToken: string): { host: string; extraHosts: string[] } | null {
+  const link = links.get(linkToken);
+  const sidecar = link && sidecars.get(link.sessionId);
+  if (!link || !sidecar || link.expiresAt <= Date.now()) return null;
+  return { host: sidecar.target.hostname, extraHosts: sidecar.extraHosts };
 }
 
 export function consumeTakeoverLink(linkToken: string): { bindingId: string; maxAgeSeconds: number } | null {

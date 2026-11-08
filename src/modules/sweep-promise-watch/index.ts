@@ -17,6 +17,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import { DATA_DIR } from '../../config.js';
+import { yieldToEventLoop } from '../../event-loop-yield.js';
 import { containerOwnsOutbound } from '../../container-runner.js';
 import { withCentralSync, withRawDb } from '../../db/central-lease.js';
 import { getSessionsActiveSince } from '../../db/sessions.js';
@@ -174,8 +175,6 @@ export function flaggedText(text: string): string {
 
 /** Decided message ids, so a candidate is asked about once per process, not every scan. */
 const decided = new Map<string, number>();
-
-const yieldToEventLoop = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
 
 export async function scanOnce(deps: ScanDeps): Promise<{ asked: number; promises: number; nudged: number }> {
   const now = deps.now();

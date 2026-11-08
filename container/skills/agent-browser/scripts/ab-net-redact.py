@@ -49,6 +49,7 @@ extensions (e.g. `_webSocketMessages`) fall back to the generic scrub (key-name
 + JWT/Bearer/query-param pattern match) rather than the body drop/allowlist
 policy above.
 """
+import functools
 import json
 import os
 import re
@@ -84,6 +85,7 @@ QUERY_PARAM_RE = re.compile(
 )
 
 
+@functools.lru_cache(maxsize=None)
 def _load_allow_patterns():
     """Fail-closed by construction: any read/parse problem, or no file at
     all, yields an empty pattern list — see gated_body, which drops every
@@ -106,11 +108,8 @@ def _load_allow_patterns():
     return patterns
 
 
-ALLOW_PATTERNS = _load_allow_patterns()
-
-
 def allow_match(url):
-    return any(p.search(url or "") for p in ALLOW_PATTERNS)
+    return any(p.search(url or "") for p in _load_allow_patterns())
 
 
 def scrub_str(s):

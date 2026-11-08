@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 L="${SMOKE_SEAT_LEASE_SCRIPT:-$SCRIPT_DIR/smoke-seat-lease.py}"
 T="$(mktemp -d)"
 trap 'rm -rf "$T"' EXIT
-unset SMOKE_GATE_SHARED_ROOT SMOKE_SEAT_LEASE_IDENTITY_FILE || true
+unset SMOKE_GATE_SHARED_ROOT SMOKE_SEAT_LEASE_IDENTITY_FILE SMOKE_SEAT_RUN || true
 . "$SCRIPT_DIR/smoke-case.sh"
 
 mkdir -p "$T/bin"
@@ -98,6 +98,47 @@ if smoke_case only-holder-transfers-or-releases; then
   expect_issue group-a "after release"
 fi
 
+if smoke_case run-lease-binds-one-run; then
+  fresh runbound
+  as group-a grant "$SEAT" --to group-a --until "$(future)" --run run-one
+  [ "$RC" = 0 ] || fail "run grant: rc=$RC $ERR"
+  [ "$(jq -r .run "$LEDGER/$SEAT.json")" = run-one ] || fail "lease file lacks the run"
+  SMOKE_SEAT_RUN=run-one expect_issue group-a "the run that holds it"
+  SMOKE_SEAT_RUN=run-two expect_refused group-a "a second run of the same group" leased-to-run
+  case "$ERR" in *"run=run-one"*) ;; *) fail "refusal does not name the holding run: $ERR" ;; esac
+  expect_refused group-a "same group with no run named" leased-to-run
+  SMOKE_SEAT_RUN=run-one expect_refused group-b "another group" leased-elsewhere
+  SMOKE_SEAT_RUN=run-two as group-a grant "$SEAT" --to group-a --until "$(future)" --run run-two
+  [ "$RC" = 3 ] || fail "second run taking a live lease: rc=$RC, want 3"
+  SMOKE_SEAT_RUN=run-two as group-a release "$SEAT"
+  [ "$RC" = 3 ] || fail "second run releasing: rc=$RC, want 3"
+  as group-a status "$SEAT"
+  [ "$(printf '%s' "$OUT" | jq -r .run)" = run-one ] || fail "status does not show the run: $OUT"
+  SMOKE_SEAT_RUN=run-one as group-a release "$SEAT"
+  [ "$RC" = 0 ] || fail "holding run releasing: rc=$RC $ERR"
+  SMOKE_SEAT_RUN=run-two expect_issue group-a "second run once the seat is free"
+fi
+
+if smoke_case transfer-keeps-the-run; then
+  fresh runtransfer
+  as group-a grant "$SEAT" --to group-a --until "$(future)" --run run-one
+  SMOKE_SEAT_RUN=run-two as group-a transfer "$SEAT" --to group-b --until "$(future)"
+  [ "$RC" = 3 ] || fail "second run transferring: rc=$RC, want 3"
+  SMOKE_SEAT_RUN=run-one as group-a transfer "$SEAT" --to group-b --until "$(future)"
+  [ "$RC" = 0 ] || fail "holding run transferring: rc=$RC $ERR"
+  [ "$(jq -r .holder "$LEDGER/$SEAT.json")" = group-b ] || fail "transfer did not move the seat"
+  SMOKE_SEAT_RUN=run-one expect_issue group-b "the holding run after the transfer"
+  SMOKE_SEAT_RUN=run-two expect_refused group-b "another run after the transfer" leased-to-run
+  expect_refused group-b "no run named after the transfer" leased-to-run
+fi
+
+if smoke_case lease-without-a-run-ignores-the-run-env; then
+  fresh runless
+  as group-a grant "$SEAT" --to group-a --until "$(future)"
+  SMOKE_SEAT_RUN=any-run expect_issue group-a "group lease with a run named"
+  expect_issue group-a "group lease with no run named"
+fi
+
 if smoke_case unreadable-lease-refuses; then
   fresh unreadable
   mkdir -p "$LEDGER"
@@ -107,6 +148,8 @@ if smoke_case unreadable-lease-refuses; then
   expect_refused group-a "lease naming another seat" unreadable-lease
   printf '{"seat":"%s","holder":"group-a","until":"soon"}' "$SEAT" >"$LEDGER/$SEAT.json"
   expect_refused group-a "unparseable until" unreadable-lease
+  printf '{"seat":"%s","holder":"group-a","until":"%s","run":7}' "$SEAT" "$(future)" >"$LEDGER/$SEAT.json"
+  expect_refused group-a "unusable run" unreadable-lease
   rm "$LEDGER/$SEAT.json"
   printf '{"seat":"%s","holder":"group-a","until":"%s"}' "$SEAT" "$(future)" >"$T/elsewhere.json"
   ln -s "$T/elsewhere.json" "$LEDGER/$SEAT.json"
@@ -219,6 +262,8 @@ if smoke_case arguments-are-validated; then
   [ "$RC" = 2 ] || fail "path-shaped group: rc=$RC, want 2"
   as group-a grant "$SEAT" --to group-b
   [ "$RC" = 2 ] || fail "grant without --until: rc=$RC, want 2"
+  as group-a grant "$SEAT" --to group-b --until "$(future)" --run "../x"
+  [ "$RC" = 2 ] || fail "path-shaped run: rc=$RC, want 2"
   [ ! -e "$LEDGER" ] || [ -z "$(ls -A "$LEDGER" | grep -v '^\.lock$')" ] || fail "a refused grant wrote a lease"
 fi
 

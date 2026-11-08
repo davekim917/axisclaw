@@ -5,6 +5,7 @@ import { CronExpressionParser } from 'cron-parser';
 
 import { GROUPS_DIR, REPO_ROOT, TIMEZONE } from '../../config.js';
 import { resolveGroupProvider, resolveGroupTimezone } from '../../container-config.js';
+import { isSessionContainerLive } from '../../container-runner.js';
 import { getAgentGroup, getAllAgentGroups } from '../../db/agent-groups.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import {
@@ -18,7 +19,7 @@ import {
 import { withCentralSync } from '../../db/central-lease.js';
 import { type TaskUpdate } from '../../modules/scheduling/db.js';
 import type { CliTaskRow, NanoclawMailboxSession } from '../../modules/mailbox/index.js';
-import { dispatchSeriesId, validateDispatchKey } from '../../modules/mailbox/index.js';
+import { dispatchSeriesId, isDispatchSeries, validateDispatchKey } from '../../modules/mailbox/index.js';
 import {
   enforceRecurrenceLimit,
   makeTaskId,
@@ -33,6 +34,7 @@ import { writeAudit } from '../../dashboard/api/scheduled-shared.js';
 import { moveTaskAsHost } from '../../dashboard/api/scheduled-move.js';
 import { resolveTaskSession, withExistingMailboxSession } from '../../session-manager.js';
 import { resolveEffectiveModel, vocabFor } from '../../flag-parser.js';
+import { yieldToEventLoop } from '../../event-loop-yield.js';
 import { log } from '../../log.js';
 import { registerResource } from '../crud.js';
 import { appendRunLog } from '../../modules/scheduling/run-log.js';
@@ -158,7 +160,12 @@ async function selectedSessions(args: Record<string, unknown>, ctx: CallerContex
 }
 
 /** Existing-only: listing or mutating must never create a mailbox. `undefined` means this session has none. */
-function withInbound<T>(session: ScopedSession, fn: (mailbox: NanoclawMailboxSession) => T): Promise<T | undefined> {
+async function withInbound<T>(
+  session: ScopedSession,
+  fn: (mailbox: NanoclawMailboxSession) => T,
+): Promise<T | undefined> {
+  // A host caller with no filter fans out over every active session, and each open is synchronous SQLite.
+  await yieldToEventLoop();
   return withExistingMailboxSession(session.agent_group_id, session.id, fn);
 }
 
@@ -354,16 +361,19 @@ async function dispatchTask(args: Record<string, unknown>, ctx: CallerContext) {
     withCentralSync(
       () =>
         withQuietInvalidationSync(session.id, () =>
-          mailbox.dispatchTaskEvent({
-            contextKey,
-            eventKey,
-            retryOf,
-            prompt,
-            originSessionId: ctx.caller === 'agent' ? ctx.sessionId : null,
-            ...routing,
-            muteChat: bool(args.mute_chat),
-            quietStatus: bool(args.quiet_status),
-          }),
+          mailbox.dispatchTaskEvent(
+            {
+              contextKey,
+              eventKey,
+              retryOf,
+              prompt,
+              originSessionId: ctx.caller === 'agent' ? ctx.sessionId : null,
+              ...routing,
+              muteChat: bool(args.mute_chat),
+              quietStatus: bool(args.quiet_status),
+            },
+            isSessionContainerLive(session),
+          ),
         ),
       'ncl tasks dispatch',
     ),
@@ -510,6 +520,7 @@ async function getTask(args: Record<string, unknown>, ctx: CallerContext) {
               settlement: mailbox.readTaskSettlement(
                 row.row_id,
                 settlementSession?.thread_id ?? null,
+                settlementSession === undefined || isSessionContainerLive(settlementSession),
                 bool(args.observer_settlement),
                 bool(args.future_inputs_settled),
               ),
@@ -526,6 +537,21 @@ async function getTask(args: Record<string, unknown>, ctx: CallerContext) {
   throw new Error(`task not found: ${id}`);
 }
 
+/**
+ * A route-less dispatch runs with its dispatcher's Slack subject (resolveSlackSafetyMessagingGroupId), and a running
+ * container takes a rewritten prompt without a respawn, so only the dispatcher may rewrite its work or delete the rows
+ * whose origin keeps a later dispatch into the same context from claiming it.
+ */
+function refuseForeignDispatchEdit(row: { series_id?: string | null; content: string }, ctx: CallerContext): void {
+  if (
+    ctx.caller === 'agent' &&
+    isDispatchSeries(row.series_id) &&
+    parseTaskContent(row.content).originSessionId !== ctx.sessionId
+  ) {
+    throw new Error('only the session that dispatched this task can change its prompt or script, or delete it');
+  }
+}
+
 async function mutateTask(
   args: Record<string, unknown>,
   ctx: CallerContext,
@@ -539,7 +565,9 @@ async function mutateTask(
       (await withInbound(session, (mailbox) =>
         withCentralSync(() => {
           // Probe first (see the invalidation note above).
-          if (!mailbox.getCliTaskRow(id)) return 0;
+          const row = mailbox.getCliTaskRow(id);
+          if (!row) return 0;
+          if (action === 'delete') refuseForeignDispatchEdit(row, ctx);
           return withQuietInvalidationSync(session.id, () => fn(mailbox, id));
         }, `ncl tasks ${action}`),
       )) ?? 0;
@@ -677,6 +705,8 @@ async function updateTaskCommand(args: Record<string, unknown>, ctx: CallerConte
         const before = mailbox.getCliTaskRow(id);
         // `before` doubles as the probe.
         if (!before) return { before, n: 0 };
+        if (sessionUpdate.prompt !== undefined || sessionUpdate.script !== undefined)
+          refuseForeignDispatchEdit(before, ctx);
         // An agent swapping the script on a host-flagged series would get its own script run on the host, so it is
         // rejected unless the same call clears the flag.
         if (

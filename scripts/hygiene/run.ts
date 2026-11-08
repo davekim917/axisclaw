@@ -9,6 +9,7 @@ import ts from 'typescript';
 
 import { vendoredEngineFiles } from '../../src/design-artifact-loop-vendor.js';
 import { CODEX_FAMILY_DEFAULTS, FAMILY_DEFAULTS } from '../../src/flag-parser.js';
+import { findAtImports, MISSING_PATH_CODES } from '../instruction-surface.js';
 import { scanComments } from './comments.js';
 
 export interface Finding {
@@ -323,6 +324,46 @@ export function modelNameFindings(
   return findings;
 }
 
+const INSTRUCTION_FILE_NAMES = new Set(['CLAUDE.md', 'AGENTS.md', 'CLAUDE.local.md']);
+
+/** Tracked instruction files, each read once through its real path, so a link and its target are one file. */
+function trackedInstructionFiles(root: string): string[] {
+  const listed = git(root, ['ls-files', '-z', '--', '*CLAUDE.md', '*AGENTS.md', '*CLAUDE.local.md']);
+  if (listed.error || listed.status !== 0) {
+    throw new Error(`git ls-files failed in ${root}: ${listed.error?.message ?? listed.stderr.trim()}`);
+  }
+  const rootReal = fs.realpathSync(root);
+  const files = new Map<string, string>();
+  for (const file of listed.stdout.split('\0').filter((f) => INSTRUCTION_FILE_NAMES.has(path.posix.basename(f)))) {
+    let real: string;
+    try {
+      real = fs.realpathSync(path.join(root, file));
+    } catch (err) {
+      if (MISSING_PATH_CODES.has((err as NodeJS.ErrnoException).code ?? '')) continue;
+      throw err;
+    }
+    const rel = path.relative(rootReal, real).split(path.sep).join('/');
+    if (!rel.startsWith('../') && !files.has(rel)) files.set(rel, real);
+  }
+  return [...files.keys()].sort();
+}
+
+/** An `@`-import in a hand-written instruction file reaches Claude expanded and Codex/OpenCode as literal text. */
+export function atImportFindings(root: string, exempt: Exempt): Finding[] {
+  return trackedInstructionFiles(root)
+    .filter((file) => !isExempt(exempt, file))
+    .flatMap((file) =>
+      findAtImports(fs.readFileSync(path.join(root, file), 'utf8'), path.dirname(path.join(root, file))).map(
+        ({ line, target }) => ({
+          check: 'instructions' as const,
+          kind: 'at-import',
+          location: `${file}:${line}`,
+          message: `@${target} is expanded by Claude only; link the doc in prose instead`,
+        }),
+      ),
+    );
+}
+
 const TEST_ROOTS = ['src', 'setup', 'scripts', 'container', 'dashboard', 'tests', '.claude/skills'];
 const TEST_FILE = /\.test\.[cm]?[jt]sx?$/;
 const MODULE_LOADERS = new Set([
@@ -455,6 +496,7 @@ export function hygieneFindings(root: string, exempt: Exempt): Finding[] {
       files.filter((file) => !isExempt(exempt, file)),
     ),
     ...modelNameFindings(root, exempt),
+    ...atImportFindings(root, exempt),
     ...testImportFindings(root),
   ];
 }

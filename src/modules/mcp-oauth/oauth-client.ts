@@ -161,6 +161,8 @@ async function postToken(fetchImpl: FetchLike, tokenEndpoint: string, form: URLS
     headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'application/json' },
     body: form.toString(),
     signal: AbortSignal.timeout(TOKEN_TIMEOUT_MS),
+    // A followed 307 re-sends this form, secret included, to whatever the redirect names.
+    redirect: 'error',
   });
   const text = await res.text();
   let parsed: Record<string, unknown> = {};
@@ -232,5 +234,19 @@ export async function refreshAccessToken(
   // some servers read an omitted scope as "none".
   if (input.scopes) form.set('scope', input.scopes);
   if (input.resource) form.set('resource', input.resource);
+  return postToken(fetchImpl, input.tokenEndpoint, form);
+}
+
+/** RFC 6749 §4.4, client credentials in the body: the shape Looker's `/api/4.0/login` takes. */
+export async function clientCredentialsToken(
+  fetchImpl: FetchLike,
+  input: { tokenEndpoint: string; clientId: string; clientSecret: string; scopes?: string },
+): Promise<TokenResponse> {
+  const form = new URLSearchParams({
+    grant_type: 'client_credentials',
+    client_id: input.clientId,
+    client_secret: input.clientSecret,
+  });
+  if (input.scopes) form.set('scope', input.scopes);
   return postToken(fetchImpl, input.tokenEndpoint, form);
 }

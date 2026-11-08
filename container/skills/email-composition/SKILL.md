@@ -47,12 +47,22 @@ human mail looks like this.
 - **Greeting**: `Hi <first names>,` — the names they actually go by (Dana, not
   Danielle, if that is how they sign). Skip `Dear`.
 - **No sign-off block.** No "Best," no name, no title, no "— sent by an AI
-  assistant." The sending account appends its own signature, so yours would be
-  a second one, and an agent signing with its own name is the loudest tell
-  there is. Sign with a human's name only when that human asked you to send as
-  them.
-- **Allowed inside**: `<a href="…">`, and `<ul><li>` only when the content is
-  genuinely a list of parallel items. That is it.
+  assistant." The account's own Gmail signature is the sign-off (see
+  Signature, below), so yours would be a second one, and an agent signing with
+  its own name is the loudest tell there is. Sign with a human's name only
+  when that human asked you to send as them.
+- **Allowed inside**: `<br>` within a paragraph, `<a href="https://…">text</a>`,
+  and `<ul><li>` only when the content is genuinely a list of parallel items.
+  That is it.
+- **Keep it exactly this shape** and the approval card shows the email as the
+  recipient reads it, with no command: the wrapper `<div>` with this style
+  string unchanged; inside it only `<p>` paragraphs and `<ul>` lists; `<br>`
+  and `<a href="https://…">plain text</a>` only inside a paragraph; list items
+  plain text only; and `&amp; &lt; &gt; &quot; &#39;` as the only entities.
+  Any other tag, attribute, entity (`&nbsp;`), style, or a link inside a list
+  item puts the raw command on the card instead. So does text the approver's
+  chat would restyle: `*`, `_`, backticks, brackets, `:emoji:` codes, or a
+  line starting with `#` or a number and a period.
 - **Leave out** `<table>` layouts, background colors, buttons, images, tracking
   pixels, web fonts, and headings. Every one of them is a marketing-template
   signal — recipients read them as bulk mail before they read a word. The dark
@@ -69,7 +79,7 @@ does not cover a new revision.
 What `humanizer` cannot know is what belongs in an email at all. That part is
 here:
 
-- **Lead with the thing.** "Attached is the May baseline from Northwind." No
+- **Lead with the thing.** "Attached is the May baseline from Acme." No
   runway before it.
 - **Caveats go inline as plain facts**, never in a `Note:` block. "The current
   forecast was too large to attach alongside it, so it follows in a second
@@ -123,8 +133,8 @@ Concrete and specific, sentence case, no `Re:` unless it is a real reply.
 Number a split so the recipient knows what is coming.
 
 ```
-Northwind extracts (1 of 2): May baseline
-Northwind extracts (2 of 2): current forecast
+Acme extracts (1 of 2): May baseline
+Acme extracts (2 of 2): current forecast
 ```
 
 Not: `Requested data`, `Following up`, `Your files`.
@@ -143,37 +153,51 @@ a disclosure decision the human makes, not you; a named Drive share only works
 if the recipient's domain is on Google.
 
 Name files so they mean something a month later:
-`Northwind_May2026_Baseline.xlsx`, not `export_final.xlsx`.
+`Acme_May2026_Baseline.xlsx`, not `export_final.xlsx`.
 
 ## Sending
 
-Sends are approval-gated — a human sees the recipients, subject, body, and the
-exact command before it runs. Compose the whole thing first, then issue **one**
-send command. Keep it readable; the human is reading it in a chat card.
+Outside scheduled tasks, sends are approval-gated — a human sees the
+recipients, subject, body, and the command before it runs. Compose the whole
+thing first, then run the send as **its own Bash command**: the `export`, the
+`BODY`, and the `gws gmail` call, nothing else. A send that shares its command
+with any other step (a `mkdir`, a draft file, a second command) is refused; do
+those in a separate Bash call first. Values go in plainly: no globs, `~`,
+`$'…'`, escapes or other variables.
 
-Put the HTML in a single-quoted shell variable so its double quotes survive,
-then pass it with `--html`:
+Put the HTML in `BODY` with a quoted heredoc, so its quotes and apostrophes
+survive, then pass it with `--html`:
 
 ```bash
 export GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE=/home/node/.config/gws/accounts/<account>.json
-BODY='<div style="font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;font-size:14px;line-height:1.5;color:#222">
+BODY=$(cat <<'EOF'
+<div style="font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;font-size:14px;line-height:1.5;color:#222">
 <p>Hi Dana, Ray,</p>
 <p>…</p>
-</div>'
-gws gmail +send \
-  --to "dana@example.com,ray@example.com" \
-  --cc "chris@example.com" \
-  --subject "Northwind extracts (1 of 2): May baseline" \
-  --body "$BODY" --html \
-  -a /workspace/agent/send/Northwind_May2026_Baseline.xlsx \
-  --format json 2>&1 | tail -8
+</div>
+EOF
+)
+gws gmail +send --to "dana@example.com,ray@example.com" --cc "chris@example.com" --subject "Acme extracts (1 of 2): May baseline" --body "$BODY" --html -a /workspace/agent/send/Acme_May2026_Baseline.xlsx --format json 2>&1 | tail -8
 ```
 
-The `export` line is required — without it `gws` reports `auth_method: none`
-even with credentials mounted. Which account to send from is a group decision;
+Keep the `gws gmail` call on one line: a `\` line continuation is refused like
+any other escape. The `export` line is required — without it `gws` reports
+`auth_method: none` even with credentials mounted. Which account to send from is a group decision;
 check the group's own instructions before assuming. `--html` takes fragment
 tags only, no `<html>`/`<body>` wrapper. Add `--draft` when the human asked to
 eyeball it in Gmail before it goes out — it saves instead of delivering.
+
+### Signature
+
+Gmail does not add the account's signature to mail sent through `gws`. When
+the group's instructions say to include it, use the copy the host keeps for
+the sending account at
+`/workspace/.host/email-signatures/<account>.signature.html` (refreshed daily
+from Gmail; the file is absent when the account has no signature). Read it in
+its own Bash call first, then paste it into `BODY` exactly as it is, on the
+line after the wrapper's closing `</div>`. Change nothing in it: the approval
+card names the signature instead of showing it only when it matches that copy
+byte for byte. Don't fetch the signature from Gmail yourself.
 
 If this install uses a different mail tool (Resend, a mail MCP), everything
 above still applies except the command — the body shape and voice are the skill.
@@ -185,7 +209,7 @@ Check the Sent folder and confirm recipients, subject, and attachments:
 
 ```bash
 gws gmail users messages list \
-  --params '{"userId":"me","q":"in:sent subject:\"Northwind extracts\"","maxResults":5}'
+  --params '{"userId":"me","q":"in:sent subject:\"Acme extracts\"","maxResults":5}'
 gws gmail users messages get \
   --params '{"userId":"me","id":"<ID>","format":"full"}' | grep -o '"filename":"[^"]*"'
 ```
@@ -202,11 +226,11 @@ scheduling note, a support reply, or a vendor chase uses the same wrapper, the
 same two-to-four paragraphs, and the same delete test. Read these for the
 register, not as a template for one email type.
 
-**Subject:** `Northwind extracts (1 of 2): May baseline`
+**Subject:** `Acme extracts (1 of 2): May baseline`
 
 > Hi Dana, Ray,
 >
-> Attached is the May baseline from Northwind, pulled from production this
+> Attached is the May baseline from Acme, pulled from production this
 > morning. It is the May 2026 generation: January to April closed, May
 > projected, June to December forecast. Approved 15 June.
 >
@@ -215,11 +239,11 @@ register, not as a template for one email type.
 >
 > Figures are units shipped, not net revenue.
 
-**Subject:** `Northwind extracts (2 of 2): current forecast`
+**Subject:** `Acme extracts (2 of 2): current forecast`
 
 > Hi Dana, Ray,
 >
-> Second of two. Attached is the current Northwind forecast, the July 2026
+> Second of two. Attached is the current Acme forecast, the July 2026
 > generation: January to June closed, July projected, August onward forecast.
 >
 > One difference to watch if you line the two files up. The baseline file is

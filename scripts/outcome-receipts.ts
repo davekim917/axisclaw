@@ -43,12 +43,15 @@ export function reconcileOutcome(
       if (input.action === 'confirm-delivered' && !input.value?.trim())
         throw new Error('Confirmed platform message ID is required');
       db.prepare(
-        `UPDATE work_outcome_receipts SET state=?,platform_message_id=?,updated_at=?,resolution=COALESCE(resolution,'')||?
+        `UPDATE work_outcome_receipts SET state=?,platform_message_id=?,updated_at=?,
+          delivered_at=CASE WHEN ? = 'delivered' THEN updated_at ELSE delivered_at END,
+          resolution=COALESCE(resolution,'')||?
         WHERE workgroup_id=? AND work_item=?`,
       ).run(
         input.action === 'confirm-delivered' ? 'delivered' : 'retry',
         input.action === 'confirm-delivered' ? input.value : null,
         timestamp,
+        input.action === 'confirm-delivered' ? 'delivered' : 'retry',
         note,
         input.workgroup,
         key,

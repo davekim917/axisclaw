@@ -196,6 +196,29 @@ describe('channel registry — instance keying', () => {
     expect(reg.getActiveAdapters()).toHaveLength(2);
   });
 
+  it('refuses a delete through an offline instance instead of reporting it done', async () => {
+    const reg = await import('./channel-registry.js');
+    reg.registerChannelAdapter('slack-tester', { factory: () => createMockAdapter('slack', 'slack-tester') });
+    await reg.initChannelAdapters(mockSetup);
+
+    await expect(
+      reg.createChannelDeliveryAdapter().deleteMessage!('slack', 'slack:C1', null, 'm1', 'slack-offline'),
+    ).rejects.toBeInstanceOf(reg.MissingChannelAdapterError);
+  });
+
+  it("hands the host's workstream flag to the adapter", async () => {
+    const reg = await import('./channel-registry.js');
+    const adapter = createMockAdapter('discord');
+    const deliver = vi.spyOn(adapter, 'deliver').mockResolvedValue('m1');
+    reg.registerChannelAdapter('discord', { factory: () => adapter });
+    await reg.initChannelAdapters(mockSetup);
+    const bridge = reg.createChannelDeliveryAdapter();
+
+    await bridge.deliver('discord', 'discord:g:c', null, 'chat', '{"text":"x"}', undefined, undefined, true);
+
+    expect(deliver.mock.calls[0][2]).toMatchObject({ workstreamThread: true });
+  });
+
   it('resolves channelType to the default-instance adapter when one exists, else first-registered', async () => {
     const reg = await import('./channel-registry.js');
     const named = createMockAdapter('slack', 'slack-tester');

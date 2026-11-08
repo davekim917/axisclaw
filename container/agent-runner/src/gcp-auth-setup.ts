@@ -5,7 +5,12 @@
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 
+let activationAttempted = false;
+
+/** Once per process: the early task gate activates before a pre-task script, and the full boot must not repeat it. */
 export function activateGcpServiceAccount(log: (msg: string) => void): void {
+  if (activationAttempted) return;
+  activationAttempted = true;
   const keyFile = process.env.GOOGLE_APPLICATION_CREDENTIALS;
   if (!keyFile) return;
   if (!fs.existsSync(keyFile)) {
@@ -39,4 +44,8 @@ export function activateGcpServiceAccount(log: (msg: string) => void): void {
     const detail = err instanceof Error ? err.message : String(err);
     log(`gcloud: service-account activation failed — CLIs may need manual auth (client libs unaffected): ${detail}`);
   }
+}
+
+export function resetGcpActivationForTesting(): void {
+  activationAttempted = false;
 }

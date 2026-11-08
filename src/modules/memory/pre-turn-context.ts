@@ -11,9 +11,12 @@ import {
   type SessionServicesCentral,
   type SessionServicesSnapshot,
 } from '../../capabilities.js';
+import { archiveTenantKey } from '../../archive-search-index.js';
 import { type RawStatements, withRawDb } from '../../db/central-lease.js';
 import { log } from '../../log.js';
 import {
+  archiveCopiesOf,
+  archiveMessageKey,
   queryArchiveExactLinks,
   recentConversationSenders,
   searchArchiveEvidence,
@@ -24,7 +27,7 @@ import { USER_BY_ID_SQL } from '../permissions/db/users.js';
 import { workgroupMemoryDir } from '../workgroup/shared-dirs.js';
 
 export const PRE_TURN_BOUNDS = Object.freeze({
-  // Per-file read cap. Only index.md and matched preferences/<slug>.md are read
+  // Per-file read cap. Only index.md and id-matched preferences/<name>.md are read
   // per turn; nothing walks the tree.
   markdownFileBytes: 65_536,
   // index.md, injected whole on a bootstrap turn: the map the agent navigates
@@ -154,18 +157,20 @@ export interface PreTurnContext {
 const CORE_PATHS = ['index.md'] as const;
 const PREFERENCES_DIR = 'preferences/';
 
-function preferenceSlug(name: string): string {
-  return name
-    .toLocaleLowerCase('en-US')
-    .normalize('NFKD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '');
-}
+// Who may approve, what needs a yes, and what gets merged, deployed or shipped are decided by roles and guards,
+// never by a preference file; a line about them is withheld so a stale or planted one can't act as a rule.
+const NON_COMMUNICATION_LINE =
+  /\b(?:approv\w*|sign(?:s|ed)?[- ]?off|go-ahead|permission\w*|authori[sz]\w*|prod(?:uction)?|deploy\w*|merg(?:e|es|ed|ing)|gated?|gates|needs? (?:a |an |my |his |her |their |an explicit |explicit )?(?:yes|ok|okay|go))\b/i;
 
-/** Equal, or hyphen-prefix either way ("alex" <-> "alex-stone"). */
-function preferenceStemMatches(stem: string, senderSlug: string): boolean {
-  return stem === senderSlug || senderSlug.startsWith(`${stem}-`) || stem.startsWith(`${senderSlug}-`);
+/** A preference file's body without the lines that gate or authorize something. */
+function communicationLinesOf(body: string): { body: string; withheld: number } {
+  let withheld = 0;
+  const kept = body.split('\n').filter((line) => {
+    if (!NON_COMMUNICATION_LINE.test(line)) return true;
+    withheld += 1;
+    return false;
+  });
+  return { body: kept.join('\n'), withheld };
 }
 
 export interface PreferenceFrontmatter {
@@ -972,26 +977,13 @@ function readMemoryEvidence(
     }
   }
 
-  // Per-person preference lane, never lexically ranked. Tiers: (1) explicit
-  // `ids:` frontmatter, (2) per-message display name, (3) canonical display
-  // name. ONE FILE PER PERSON: a rename must not inject both the old and new
-  // file. Name aliases are tried in order; one hitting a file another group
-  // claimed falls through to the next alias. An id match is TERMINAL for its
-  // group (claims the file or contributes nothing) and never falls through to
-  // name matching, or a person declared under two ids picks up a stale second
-  // file. Read before the ranked scan so the shared budget can't starve it.
+  // Per-person preference lane, never lexically ranked. A file reaches a sender
+  // only through its `ids:` frontmatter: display names change at will, and a
+  // name prefix would hand one person's file to another of the same name.
+  // Read before the ranked scan so the shared budget can't starve it.
   const preferenceExcerpts: MemoryEvidenceExcerpt[] = [];
   if (involvedSenders.length > 0) {
     const preferenceStems = listDirectMarkdownStems(root, PREFERENCES_DIR, notices);
-    // Exact slug wins, else the longest prefix-compatible stem; matching every
-    // prefix would add `alex.md` alongside `alex-stone.md`.
-    const matchStem = (slug: string): string | undefined => {
-      if (preferenceStems.includes(slug)) return slug;
-      const compatible = preferenceStems
-        .filter((stem) => preferenceStemMatches(stem, slug))
-        .sort((a, b) => b.length - a.length || compareCodepoint(a, b));
-      return compatible[0];
-    };
     // Each file is read AT MOST ONCE per turn, which also keeps a read failure
     // from silently succeeding on a second attempt and hiding its notice.
     const preferenceFileReads = new Map<string, { content: string } | { error: unknown }>();
@@ -1102,26 +1094,9 @@ function readMemoryEvidence(
           }
         }
       }
-      if (idRelative !== undefined) {
-        // Terminal either way: never fall through to name matching.
-        if (!selectedRelatives.has(idRelative)) {
-          selectedRelatives.add(idRelative);
-          matched.push(idRelative);
-        }
-        continue;
-      }
-
-      for (const alias of group.aliases) {
-        const slug = preferenceSlug(alias);
-        if (slug.length === 0) continue;
-        const stem = matchStem(slug);
-        if (stem === undefined) continue;
-        const relative = `${PREFERENCES_DIR}${stem}.md`;
-        // Another group's claimed file belongs to that person: try the next alias.
-        if (selectedRelatives.has(relative)) continue;
-        selectedRelatives.add(relative);
-        matched.push(relative);
-        break; // one file per group: stop at the first alias that claimed a file
+      if (idRelative !== undefined && !selectedRelatives.has(idRelative)) {
+        selectedRelatives.add(idRelative);
+        matched.push(idRelative);
       }
     }
     for (const relative of matched.slice(0, PRE_TURN_BOUNDS.preferenceExcerpts)) {
@@ -1131,7 +1106,16 @@ function readMemoryEvidence(
         reportReadFailure(relative, read.error);
         continue;
       }
-      const { body } = parsePreferenceFrontmatter(read.content);
+      const { body: declared } = parsePreferenceFrontmatter(read.content);
+      const { body, withheld } = communicationLinesOf(declared);
+      if (withheld > 0) {
+        notices.push({
+          source: 'markdown',
+          status: 'degraded',
+          code: 'preference-lines-withheld',
+          detail: `${relative}: withheld ${withheld} line${withheld === 1 ? '' : 's'} that gate or authorize something; a preference file holds only how a person wants to be talked to`,
+        });
+      }
       const text = boundedText(body, PRE_TURN_BOUNDS.preferenceExcerptChars, TRUNCATED_MARKDOWN_EXCERPT);
       preferenceExcerpts.push({
         path: relative,
@@ -1224,6 +1208,59 @@ function archiveExcerpt(row: ArchiveEvidenceRow, score: number, passageText?: st
     fingerprint: evidenceFingerprint('host-message-archive', row.agentGroupId, `${row.id}\0${sha256(text)}`, row.text),
     provenance: { authority: 'host-message-archive', archiveId: row.id },
   };
+}
+
+interface PlatformMessage<T> {
+  key: string;
+  kept: T;
+  copies: T[];
+}
+
+function collapseSiblingCopies<T>(ranked: readonly T[], rowOf: (item: T) => ArchiveEvidenceRow): PlatformMessage<T>[] {
+  const messages = new Map<string, PlatformMessage<T>>();
+  for (const item of ranked) {
+    const row = rowOf(item);
+    const key = archiveMessageKey(row);
+    const message = messages.get(key);
+    if (!message) {
+      messages.set(key, { key, kept: item, copies: [item] });
+      continue;
+    }
+    message.copies.push(item);
+  }
+  return [...messages.values()];
+}
+
+/**
+ * The agent's own copy is preferred so the excerpt's ids name its own messaging group. Copies are read from the archive
+ * as well as the candidates, because a search's candidate cut can drop the agent's own copy or the copy delivered
+ * earlier.
+ */
+function settleCopies<T>(
+  messages: PlatformMessage<T>[],
+  rowOf: (item: T) => ArchiveEvidenceRow,
+  adopt: (copy: ArchiveEvidenceRow, like: T) => T,
+  scope: {
+    agentGroupId: string;
+    tenantKey: string;
+    currentMessagingGroupId: string | null;
+    currentThreadId: string | null;
+  },
+): void {
+  const archived = archiveCopiesOf({ ...scope, messages: messages.map((message) => rowOf(message.kept)) });
+  messages.forEach((message, index) => {
+    const like = message.kept;
+    message.copies.push(
+      ...(archived[index] ?? [])
+        .filter((copy) => archiveMessageKey(copy) === message.key)
+        .map((copy) => adopt(copy, like)),
+    );
+    const rows = message.copies.map(rowOf);
+    const chosen =
+      rows.find((row) => row.agentGroupId === scope.agentGroupId) ??
+      rows.reduce((lowest, row) => (compareCodepoint(lowest.id, row.id) <= 0 ? lowest : row));
+    if (chosen.id !== rowOf(like).id) message.kept = adopt(chosen, like);
+  });
 }
 
 type CapabilityService = CapabilityRosterEntry;
@@ -1554,18 +1591,29 @@ export function buildPreTurnContext(input: PreTurnContextInput): PreTurnContext 
 
   const queryTokens = tokenizeForRecall(query);
   const conversationRows: ConversationEvidenceExcerpt[] = [];
-  const seenArchiveIds = new Set<string>();
+  const seenMessages = new Set<string>();
+  const tenantKey = archiveTenantKey(scope.workgroup_id, input.agentGroupId);
+  const copyScope = { agentGroupId: input.agentGroupId, tenantKey, currentMessagingGroupId, currentThreadId };
   try {
-    const exactRows = queryArchiveExactLinks({
-      memberAgentGroupIds,
-      normalizedContent: query,
-      candidateLimit: PRE_TURN_BOUNDS.exactLinkCandidates,
-    });
-    for (const row of exactRows.slice(0, PRE_TURN_BOUNDS.exactLinkExcerpts)) {
-      seenArchiveIds.add(row.id);
-      conversationRows.push(archiveExcerpt(row, Number.MAX_SAFE_INTEGER));
+    const exactMessages = collapseSiblingCopies(
+      queryArchiveExactLinks({
+        tenantKey,
+        normalizedContent: query,
+        candidateLimit: PRE_TURN_BOUNDS.exactLinkCandidates,
+      }),
+      (row) => row,
+    );
+    settleCopies(
+      exactMessages,
+      (row) => row,
+      (copy) => ({ ...copy, rank: 'exact-link' as const }),
+      copyScope,
+    );
+    for (const { key, kept } of exactMessages.slice(0, PRE_TURN_BOUNDS.exactLinkExcerpts)) {
+      seenMessages.add(key);
+      conversationRows.push(archiveExcerpt(kept, Number.MAX_SAFE_INTEGER));
     }
-    if (exactRows.length > PRE_TURN_BOUNDS.exactLinkExcerpts) {
+    if (exactMessages.length > PRE_TURN_BOUNDS.exactLinkExcerpts) {
       notices.push({
         source: 'exact-link',
         status: 'truncated',
@@ -1588,7 +1636,7 @@ export function buildPreTurnContext(input: PreTurnContextInput): PreTurnContext 
       rankByBestPassage(
         scoreTokens,
         searchArchiveEvidence({
-          memberAgentGroupIds,
+          tenantKey,
           query: searchQuery,
           currentMessagingGroupId,
           currentThreadId,
@@ -1604,18 +1652,25 @@ export function buildPreTurnContext(input: PreTurnContextInput): PreTurnContext 
       candidates = rankArchive(`${query} ${expansion.join(' ')}`, tokenizeForRecall(`${query} ${expansion.join(' ')}`));
       if (candidates.length > 0) markExpansionUsed(notices);
     }
-    const lexicalCandidates = candidates.filter((candidate) => {
-      if (seenArchiveIds.has(candidate.candidate.id)) return false;
-      if (bypassDedupe) return true;
-      const fingerprint = archiveExcerpt(
-        candidate.candidate,
-        candidate.passage.score,
-        candidate.passage.text,
-      ).fingerprint;
-      return !seenEvidenceFingerprints.has(fingerprint);
-    });
-    const eligibleCandidates = candidates.filter((candidate) => !seenArchiveIds.has(candidate.candidate.id));
-    const suppressed = eligibleCandidates.length - lexicalCandidates.length;
+    const eligibleMessages = collapseSiblingCopies(candidates, (ranked) => ranked.candidate).filter(
+      (message) => !seenMessages.has(message.key),
+    );
+    settleCopies(
+      eligibleMessages,
+      (ranked) => ranked.candidate,
+      (copy, like) => ({ ...like, candidate: copy }),
+      copyScope,
+    );
+    const lexicalMessages = eligibleMessages.filter(
+      (message) =>
+        bypassDedupe ||
+        !message.copies.some((copy) =>
+          seenEvidenceFingerprints.has(
+            archiveExcerpt(copy.candidate, copy.passage.score, copy.passage.text).fingerprint,
+          ),
+        ),
+    );
+    const suppressed = eligibleMessages.length - lexicalMessages.length;
     if (suppressed > 0) {
       notices.push({
         source: 'context',
@@ -1624,17 +1679,17 @@ export function buildPreTurnContext(input: PreTurnContextInput): PreTurnContext 
         detail: `suppressed ${suppressed} unchanged archive excerpt${suppressed === 1 ? '' : 's'} in this context epoch`,
       });
     }
-    const selectedLexical = lexicalCandidates.slice(0, PRE_TURN_BOUNDS.archiveExcerpts);
-    for (const candidate of selectedLexical) {
-      seenArchiveIds.add(candidate.candidate.id);
-      conversationRows.push(archiveExcerpt(candidate.candidate, candidate.passage.score, candidate.passage.text));
+    const selectedLexical = lexicalMessages.slice(0, PRE_TURN_BOUNDS.archiveExcerpts);
+    for (const { key, kept } of selectedLexical) {
+      seenMessages.add(key);
+      conversationRows.push(archiveExcerpt(kept.candidate, kept.passage.score, kept.passage.text));
     }
-    if (lexicalCandidates.length > selectedLexical.length) {
+    if (lexicalMessages.length > selectedLexical.length) {
       notices.push({
         source: 'archive',
         status: 'truncated',
         code: 'archive-excerpt-limit',
-        detail: `selected ${selectedLexical.length} of ${lexicalCandidates.length} lexical archive rows`,
+        detail: `selected ${selectedLexical.length} of ${lexicalMessages.length} lexical archive rows`,
       });
     }
   } catch (error) {

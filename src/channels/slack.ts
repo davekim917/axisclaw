@@ -591,6 +591,7 @@ export function registerSlackWorkspace(ws: SlackWorkspace): void {
         // Headings become bold so tables stay on the `markdown` path (table-block conversion only fires for markdown
         // input). The subtext rides on the body until installSlackSubtextBlocks rewrites the payload.
         renderSubtext: (body, subtext) => ({ ...body, subtext }),
+        subtextMarkup: 'slack-mrkdwn',
         transformOutboundMarkdown: (text) => {
           // A bot echoing a raw bot `<@id>` (the inbound wire form) would reach humans as literal text, so known bot
           // ids become plain @name BEFORE mention resolution: literal inside code spans, a proper mention in prose.

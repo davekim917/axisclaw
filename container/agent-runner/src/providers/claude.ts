@@ -1,7 +1,7 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 
 import { z } from 'zod';
 import {
@@ -53,7 +53,9 @@ import { attachTurnEffort } from './turn-effort.js';
 import { formatBlockquoteLabel, thinkingForwardingEnabled, truncate } from './thinking-labels.js';
 import { registerProvider, registerProviderConfigSchema } from './provider-registry.js';
 import { MCP_HEADER_ONLY_SECRET_VARS } from './secret-env.js';
+import { oauthCredentialRing, type CredentialSlot } from './claude-credential-ring.js';
 import {
+  isCredentialRejection,
   QUOTA_EMBEDDED_RE,
   QUOTA_RESULT_RE,
   SUBSCRIPTION_BLOCKED_EMBEDDED_RE,
@@ -75,6 +77,8 @@ import type {
   TurnUsageInfo,
 } from './types.js';
 import { autoCommitDirtyWorktrees } from '../worktree-autosave.js';
+import { withCodexShimPath } from '../codex-shim-path.js';
+import { guardCorePaths } from '../guard-core-paths.js';
 import { createManagedGitMaintenanceHook } from '../managed-git-guard.js';
 import { readResumedModelUsage } from './claude-cost-state.js';
 import { transcriptContainsUserText } from './claude-transcript-prompt.js';
@@ -638,6 +642,9 @@ const OAUTH_FALLBACK_RE = /^CLAUDE_CODE_OAUTH_TOKEN_(\d+)$/;
 const RETRYABLE_ERROR_RE =
   /429|rate[\s_-]?limit|overloaded|upstream_error|External provider returned|subscription_quota_exhausted|subscription_access_disabled/i;
 
+/** Thrown unprefixed, unlike the markers above: when the ring cannot recover, this text reaches chat as the error. */
+const CREDENTIAL_REJECTED = 'credential_rejected';
+
 // The SDK surfaces the thinking-signature 400 as result text, not a thrown error, so isSessionInvalid never fires on
 // its own. Re-thrown with the original text so STALE_SESSION_RE matches and the continuation is cleared.
 export const POISONED_CONTINUATION_RE = /invalid `?signature`? in `?thinking`? block/i;
@@ -911,10 +918,8 @@ function denyBash(reason: string) {
 type CommandEvaluator = (command: string) => { action: 'allow' | 'block'; reason?: string };
 
 // Resolved per call so a test's override is seen even after an earlier default-path miss was cached.
-const DEFAULT_GUARD_CORE_PATH =
-  '/workspace/plugins/bootstrap/plugins/workflow-agents/hooks/guards/block-destructive-core.ts';
 function guardCorePath(): string {
-  return process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE || DEFAULT_GUARD_CORE_PATH;
+  return guardCorePaths().destructive;
 }
 
 // Keyed by path so an override swap re-imports. undefined = not yet attempted, null = unavailable.
@@ -1021,58 +1026,62 @@ export const GWS_EMAIL_SEND_RE =
   /\bgws\s+gmail\s+(?:\+(?:send|reply|reply-all|forward)|users\s+(?:messages|drafts)\s+send)\b/;
 /** Inline mirror of email-gate-core.ts (the fail-closed fallback cannot import it); keep in sync. */
 const EMAIL_BYPASS_FLAGS = new Set(['--dry-run', '--draft', '--help', '-h']);
-// `#` and newlines included: the bypass check runs on the WHOLE command, so a `--dry-run\n<real send>` decoy must
-// fail closed rather than read the decoy's flag as real argv. Mirrors the core's SHELL_METACHAR_RE.
-const EMAIL_SHELL_METACHAR_RE = /[<>|;&$`(){}#\n\r]/;
+// Any character that could make bash do more than run one command with these exact words: separators, pipes,
+// redirects, every kind of expansion, globs, history, tilde, comments, escapes, and any break but a space.
+const EMAIL_NOT_A_PLAIN_COMMAND = /[;&|`$()<>{}[\]*?!~#\\\n\t\r\0]/;
+// gws gmail options that take no value, so a flag after one is still an option rather than that option's value.
+const EMAIL_GWS_BOOLEAN_OPTIONS = new Set([
+  '--html',
+  '--dry-run',
+  '--draft',
+  '--help',
+  '-h',
+  '--no-original-attachments',
+]);
 
-// A sentinel, not a space, preserves bash word concatenation: `--body 'x'--dry-run` is one word with no real flag.
-const EMAIL_QUOTED_SPAN_SENTINEL = '\x00';
-const EMAIL_LEADING_ASSIGNMENT_RE = /^[A-Za-z_][A-Za-z0-9_]*=/;
 /**
- * A bypass flag counts only as a real argv token of a SIMPLE, DIRECT gws command, in option position. Quoted spans
- * are stripped, and any unbalanced quote, unquoted backslash or shell metacharacter fails closed, so the remaining
- * tokens equal bash's argv words. Mirrors the core's bypassFlagIsRealArgvToken; every step only makes bypass less
- * likely.
+ * True when the command is one gws call with literal words and a real `--dry-run`, `--draft`, `--help` or `-h` option.
+ * It reasons about no shell syntax: a command holding any character that could make bash do more is never excused.
+ * Mirrors the core's sendsNothing.
  */
-function emailBypassIsRealArgvToken(gwsSegment: string): boolean {
-  // Command substitution still runs inside expanding quotes (`"…"`, `$"…"`), so `$(` or a backtick there refuses
-  // the bypass before the sentinel hides it. Bare `$VAR` is only expansion, so `--body "cost is $5"` still bypasses.
-  const safeStripped = gwsSegment
-    .replace(/\$'(?:[^'\\]|\\.)*'/g, EMAIL_QUOTED_SPAN_SENTINEL)
-    .replace(/'[^']*'/g, EMAIL_QUOTED_SPAN_SENTINEL);
-  const expandingQuoteRe = /\$?"((?:[^"\\]|\\.)*)"/g;
-  for (let m = expandingQuoteRe.exec(safeStripped); m !== null; m = expandingQuoteRe.exec(safeStripped)) {
-    if (m[1].includes('$(') || m[1].includes('`')) return false; // command substitution in expanding quotes → don't bypass
-  }
-  const unquoted = safeStripped
-    .replace(/\$"(?:[^"\\]|\\.)*"/g, EMAIL_QUOTED_SPAN_SENTINEL)
-    .replace(/"(?:[^"\\]|\\.)*"/g, EMAIL_QUOTED_SPAN_SENTINEL);
-  if (unquoted.includes("'") || unquoted.includes('"')) return false;
-  if (unquoted.includes('\\')) return false; // unquoted backslash escape → don't bypass
-  if (EMAIL_SHELL_METACHAR_RE.test(unquoted)) return false;
-  const tokens = unquoted.split(/[ \t\n]+/).filter((t) => t.length > 0); // bash IFS, not JS \s
+function emailSendsNothing(command: string): boolean {
+  if (EMAIL_NOT_A_PLAIN_COMMAND.test(command)) return false;
+  const tokens: Array<{ text: string; quoted: boolean }> = [];
   let i = 0;
-  while (i < tokens.length && EMAIL_LEADING_ASSIGNMENT_RE.test(tokens[i])) i++; // skip VAR=value
-  if (tokens[i] !== 'gws') return false; // direct gws invocation only, no wrapper
-  for (let j = i + 1; j < tokens.length; j++) {
-    if (!EMAIL_BYPASS_FLAGS.has(tokens[j])) continue;
-    const prev = tokens[j - 1];
-    const prevConsumesValue = prev.startsWith('-') && !prev.includes('='); // bare -x/--opt eats next word
-    if (!prevConsumesValue) return true;
+  while (i < command.length) {
+    if (command[i] === ' ') {
+      i++;
+      continue;
+    }
+    let end: number;
+    if (command[i] === "'" || command[i] === '"') {
+      end = command.indexOf(command[i], i + 1);
+      const inner = end < 0 ? '' : command.slice(i + 1, end);
+      if (end < 0 || /['"]/.test(inner)) return false;
+      tokens.push({ text: inner, quoted: true });
+      end++;
+    } else {
+      end = i;
+      while (end < command.length && command[end] !== ' ') {
+        if (command[end] === "'" || command[end] === '"') return false;
+        end++;
+      }
+      tokens.push({ text: command.slice(i, end), quoted: false });
+    }
+    // A quoted pair joined to more text (`'x'--dry-run`) is one word to bash, not the flag.
+    if (end < command.length && command[end] !== ' ') return false;
+    i = end;
+  }
+  if (tokens[0]?.quoted !== false || tokens[0].text !== 'gws') return false;
+  // bash removes the quotes, so a quoted `--` or option is the same word to gws; only an unquoted flag counts.
+  for (let k = 1; k < tokens.length; k++) {
+    const { text, quoted } = tokens[k];
+    if (text === '--') return false;
+    if (quoted || !EMAIL_BYPASS_FLAGS.has(text)) continue;
+    const prev = tokens[k - 1].text;
+    if (!prev.startsWith('-') || prev.includes('=') || EMAIL_GWS_BOOLEAN_OPTIONS.has(prev)) return true;
   }
   return false;
-}
-
-// Read-only help probe: optional exports, one direct gws call, then only `2>&1 | head -N`. The argv verifier still
-// proves help is a real gws option.
-const EMAIL_SAFE_HELP_PROBE_RE =
-  /^(?:export\s+(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&|<>\x60$(){}#'"]+)(?:\s+[A-Za-z_][A-Za-z0-9_]*=[^\s;&|<>\x60$(){}#'"]+)*\s+&&\s+)?((?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&|<>\x60$(){}#'"]+\s+)*gws\s+gmail\s+(?:\+(?:send|reply|reply-all|forward)|users\s+(?:messages|drafts)\s+send)(?:\s+[^\s;&|<>\x60$(){}#'"]+)*)\s+2>&1\s*\|\s*head\s+-\d+\s*$/;
-
-function emailSafeHelpProbeIsReadOnly(command: string): boolean {
-  const match = command.match(EMAIL_SAFE_HELP_PROBE_RE);
-  if (!match) return false;
-  const gwsSegment = match[1];
-  return /(?:^|[ \t])(?:--help|-h)(?:$|[ \t])/.test(gwsSegment) && emailBypassIsRealArgvToken(gwsSegment);
 }
 
 /** Envelope of the raw-API `--json '{"raw":"<base64url>"}'` form, for the approval card; {} on any failure. */
@@ -1119,27 +1128,61 @@ export function envelopeFromJsonRaw(segment: string): {
 }
 
 // Mirrors email-gate-core.ts EmailGateVerdict.
-type EmailGateVerdict = { action: 'allow' | 'gate'; label?: string; summary?: string; reason?: string };
+type EmailGateVerdict = {
+  action: 'allow' | 'gate';
+  label?: string;
+  summary?: string;
+  reason?: string;
+  sendParts?: string[];
+  deny?: string;
+  pureSend?: boolean;
+  /** The stored draft the card showed; the approval covers only that version of it. */
+  draft?: unknown;
+};
 type EmailGateEvaluator = (command: string, env: { isScheduledTask: boolean }) => EmailGateVerdict;
+/** Null when the draft is still the version the card showed, else the refusal to give the agent. */
+type DraftChangeCheck = (binding: unknown) => string | null;
+type EmailGateCore = { evaluate: EmailGateEvaluator; draftChangedSince: DraftChangeCheck | null };
 
-const DEFAULT_EMAIL_GATE_CORE_PATH =
-  '/workspace/plugins/bootstrap/plugins/workflow-agents/hooks/guards/email-gate-core.ts';
 function emailGateCorePath(): string {
-  return process.env.NANOCLAW_EMAIL_GATE_CORE || DEFAULT_EMAIL_GATE_CORE_PATH;
+  return guardCorePaths().emailGate;
 }
 // Memo keyed by resolved path so an override swap re-imports.
-const _emailGateEvaluators: Record<string, EmailGateEvaluator | null | undefined> = {};
+const _emailGateCores: Record<string, EmailGateCore | null | undefined> = {};
 
-async function loadEmailGateEvaluator(): Promise<EmailGateEvaluator | null> {
+async function loadEmailGateCore(): Promise<EmailGateCore | null> {
   const corePath = emailGateCorePath();
-  if (_emailGateEvaluators[corePath] !== undefined) return _emailGateEvaluators[corePath]!;
+  if (_emailGateCores[corePath] !== undefined) return _emailGateCores[corePath]!;
   try {
-    const core = (await import(corePath)) as { evaluateEmailSend?: EmailGateEvaluator };
-    _emailGateEvaluators[corePath] = typeof core.evaluateEmailSend === 'function' ? core.evaluateEmailSend : null;
+    const core = (await import(corePath)) as { evaluateEmailSend?: unknown; draftChangedSince?: unknown };
+    _emailGateCores[corePath] =
+      typeof core.evaluateEmailSend === 'function'
+        ? {
+            evaluate: core.evaluateEmailSend as EmailGateEvaluator,
+            draftChangedSince:
+              typeof core.draftChangedSince === 'function' ? (core.draftChangedSince as DraftChangeCheck) : null,
+          }
+        : null;
   } catch {
-    _emailGateEvaluators[corePath] = null;
+    _emailGateCores[corePath] = null;
   }
-  return _emailGateEvaluators[corePath]!;
+  return _emailGateCores[corePath]!;
+}
+
+const DRAFT_UNCHECKED =
+  'Email send refused: the approved draft could not be re-read to confirm it is the version that was approved. ' +
+  'Ask for approval again with the same command.';
+
+/** Re-read an approved draft before its send runs. A binding that can't be checked refuses: it can't be confirmed. */
+function approvedDraftRefusal(verdict: EmailGateVerdict, check: DraftChangeCheck | null): string | null {
+  if (verdict.draft === undefined) return null;
+  if (!check) return DRAFT_UNCHECKED;
+  try {
+    const refusal = check(verdict.draft);
+    return refusal === null ? null : typeof refusal === 'string' && refusal ? refusal : DRAFT_UNCHECKED;
+  } catch {
+    return DRAFT_UNCHECKED;
+  }
 }
 
 /**
@@ -1149,10 +1192,7 @@ async function loadEmailGateEvaluator(): Promise<EmailGateEvaluator | null> {
 function evaluateEmailSendInline(command: string, env: { isScheduledTask: boolean }): EmailGateVerdict {
   if (!command || !GWS_EMAIL_SEND_RE.test(command)) return { action: 'allow' };
 
-  // Bypass only when the WHOLE command is one simple send with a real bypass flag: checking the whole command makes
-  // a `: gws gmail +send --dry-run; <real send>` decoy hit the metacharacter check, even with an obfuscated send.
-  // The bounded read-only help probe is the only shell-operator exception.
-  if (emailSafeHelpProbeIsReadOnly(command) || emailBypassIsRealArgvToken(command)) return { action: 'allow' };
+  if (emailSendsNothing(command)) return { action: 'allow' };
 
   // Scheduled tasks bypass so automated email reports aren't gated on every run.
   if (env.isScheduledTask) return { action: 'allow' };
@@ -1225,11 +1265,11 @@ export function createEmailGateHook(opts?: {
     const evalCommand = command;
 
     const isScheduledTask = process.env.NANOCLAW_IS_SCHEDULED_TASK === '1';
-    const coreEvaluator = await loadEmailGateEvaluator();
+    const core = await loadEmailGateCore();
     let verdict: EmailGateVerdict;
-    if (coreEvaluator) {
+    if (core) {
       try {
-        const v = coreEvaluator(evalCommand, { isScheduledTask });
+        const v = core.evaluate(evalCommand, { isScheduledTask });
         // A malformed core verdict is untrusted: without the shape check `{}` or `{action:'bogus'}` would ALLOW a
         // real send unapproved.
         verdict = isWellFormedEmailVerdict(v) ? v : evaluateEmailSendInline(evalCommand, { isScheduledTask });
@@ -1241,6 +1281,7 @@ export function createEmailGateHook(opts?: {
     }
 
     if (verdict.action !== 'gate') return {};
+    if (typeof verdict.deny === 'string' && verdict.deny) return denyBash(verdict.deny);
 
     const action = emailActionVerb(evalCommand);
     const label = verdict.label ?? `Email ${action}`;
@@ -1259,7 +1300,7 @@ export function createEmailGateHook(opts?: {
     // adapter gates the raw one, so a command-keyed claim would give each its own card.
     const claimKey =
       claimApi && typeof toolUseId === 'string' && toolUseId
-        ? claimApi.gateClaimKey(toolUseId, 'request_bash_gate')
+        ? claimApi.gateClaimKey(toolUseId, 'request_send_gate')
         : null;
     if (claimKey && claimApi) {
       const claim = claimApi.claimGateRequest(claimKey);
@@ -1271,7 +1312,10 @@ export function createEmailGateHook(opts?: {
             `Email ${action} blocked: timed out waiting for admin approval. Do not retry — ask the user.`,
           );
         }
-        if (peerAck.status === 'delivered') return {};
+        if (peerAck.status === 'delivered') {
+          const refusal = approvedDraftRefusal(verdict, core?.draftChangedSince ?? null);
+          return refusal === null ? {} : denyBash(refusal);
+        }
         return denyBash(
           `Email ${action} blocked: ${peerAck.error ?? 'admin declined'}. Do not retry — acknowledge briefly.`,
         );
@@ -1292,10 +1336,14 @@ export function createEmailGateHook(opts?: {
         channel_type: routing?.channel_type ?? null,
         thread_id: routing?.thread_id ?? null,
         content: JSON.stringify({
-          action: 'request_bash_gate',
+          action: 'request_send_gate',
           requestId,
           label,
           summary,
+          ...(Array.isArray(verdict.sendParts) && verdict.sendParts.every((p) => typeof p === 'string')
+            ? { sendParts: verdict.sendParts }
+            : {}),
+          ...(verdict.pureSend === true ? { pureSend: true } : {}),
           // The host previews a bounded head+tail and keeps the full command in the approval record.
           command: evalCommand,
         }),
@@ -1311,7 +1359,8 @@ export function createEmailGateHook(opts?: {
       return denyBash(`Email ${action} blocked: timed out waiting for admin approval. Do not retry — ask the user.`);
     }
     if (ack.status === 'delivered') {
-      return {};
+      const refusal = approvedDraftRefusal(verdict, core?.draftChangedSince ?? null);
+      return refusal === null ? {} : denyBash(refusal);
     }
     return denyBash(`Email ${action} blocked: ${ack.error ?? 'admin declined'}. Do not retry — acknowledge briefly.`);
   };
@@ -1731,15 +1780,19 @@ export class ClaudeProvider implements AgentProvider {
   private nextFallback = 0;
 
   /**
-   * OAuth fallback tokens (CLAUDE_CODE_OAUTH_TOKEN_N). If ANTHROPIC_API_KEY is also set, API-key rotation is used
-   * instead: it is the only credential the SDK uses then.
+   * OAuth tokens (CLAUDE_CODE_OAUTH_TOKEN, _N). If ANTHROPIC_API_KEY is also set, API-key rotation is used instead: it
+   * is the only credential the SDK uses then. Circular [primary, ...fallbacks]: wrapping back to the primary means a
+   * transient blip can't strand the container on a worse credential. Position is sticky across turns; the per-turn
+   * cycle budget resets each turn.
    */
-  private fallbackOauth: Array<{ name: string; value: string }>;
-  // Circular ring [primary, ...fallbacks]: wrapping back to the primary means a transient blip can't strand the
-  // container on a worse credential. Position is sticky across turns; the per-turn cycle budget resets each turn.
-  private oauthRing: Array<{ name: string; value: string }> = [];
+  private oauthRing: CredentialSlot[] = [];
   private oauthRingPos = 0;
   private oauthRotationsThisCycle = 0;
+  /** Names of slots the API refused. Env is fixed for the container's life, so a refused token stays refused. */
+  private readonly rejectedOauthSlots = new Set<string>();
+  private attemptActed = false;
+  /** The slot rotated onto and not yet proven: saved only once it serves a turn, so a respawn never resumes a dead one. */
+  private unprovenOauthSlot: string | undefined;
   private memorySessionHook?: MemorySessionHookRegistration;
 
   constructor(options: ProviderOptions = {}) {
@@ -1772,35 +1825,23 @@ export class ClaudeProvider implements AgentProvider {
         `Loaded ${this.fallbackKeys.length} ANTHROPIC_API_KEY fallback(s): ${this.fallbackKeys.map((k) => k.name).join(', ')}`,
       );
     }
-    this.fallbackOauth = Object.entries(this.env)
-      .filter(([k, v]) => OAUTH_FALLBACK_RE.test(k) && typeof v === 'string' && v.length > 0)
-      .sort(([a], [b]) => {
-        const na = Number(a.match(OAUTH_FALLBACK_RE)![1]);
-        const nb = Number(b.match(OAUTH_FALLBACK_RE)![1]);
-        return na - nb;
-      })
-      .map(([k, v]) => ({ name: k, value: v as string }));
-    if (this.fallbackOauth.length > 0) {
-      log(
-        `Loaded ${this.fallbackOauth.length} CLAUDE_CODE_OAUTH_TOKEN fallback(s): ${this.fallbackOauth.map((k) => k.name).join(', ')}`,
-      );
-    }
-    // Deduped by value so a token in two slots isn't visited twice. The host already strips OneCLI's `placeholder`
-    // sentinel; guarded again so it never enters the ring as a usable credential.
+    // The host strips OneCLI's `placeholder` sentinel, so a primary still holding it means no usable OAuth ring.
     const ringPrimary = this.env.CLAUDE_CODE_OAUTH_TOKEN;
-    if (ringPrimary && ringPrimary !== 'placeholder') {
-      const seenRing = new Set<string>();
-      for (const entry of [{ name: 'CLAUDE_CODE_OAUTH_TOKEN', value: ringPrimary }, ...this.fallbackOauth]) {
-        if (seenRing.has(entry.value)) continue;
-        seenRing.add(entry.value);
-        this.oauthRing.push(entry);
-      }
+    if (ringPrimary && ringPrimary !== 'placeholder') this.oauthRing = oauthCredentialRing(this.env);
+    if (this.oauthRing.length > 1) {
+      log(
+        `Loaded ${this.oauthRing.length - 1} CLAUDE_CODE_OAUTH_TOKEN fallback(s): ${this.oauthRing
+          .slice(1)
+          .map((slot) => slot.name)
+          .join(', ')}`,
+      );
     }
   }
 
   /**
-   * Restores the ring position a previous container of this session rotated onto, so a respawn doesn't burn a
-   * rejected turn on the primary. Position only; the token value comes from env.
+   * Restores the ring position that last served a turn in this session, so a respawn doesn't burn a rejected turn on
+   * the primary. Position only; the token value comes from env. A slot the host marked spent is never restored: the
+   * container starts on the first slot not marked instead.
    *
    * Never called from the constructor or `query()`: `getCredentialSlot` opens the outbound session DB directly, so a
    * provider built in a unit test would create a session DB at the production path. The runner entrypoint calls it
@@ -1813,26 +1854,48 @@ export class ClaudeProvider implements AgentProvider {
       persisted = getCredentialSlot('claude');
     } catch (err) {
       log(`Could not read persisted credential slot: ${err instanceof Error ? err.message : String(err)}`);
-      return;
     }
-    if (!persisted) return;
+    const spent = new Set((process.env.CLAUDE_SPENT_SLOTS ?? '').split(',').filter(Boolean));
 
-    const ringIndex = this.oauthRing.findIndex((entry) => entry.name === persisted);
-    if (ringIndex !== -1) {
-      this.oauthRingPos = ringIndex;
-      const active = this.oauthRing[ringIndex];
-      this.env.CLAUDE_CODE_OAUTH_TOKEN = active.value;
-      process.env.CLAUDE_CODE_OAUTH_TOKEN = active.value;
-      log(`Resumed credential slot ${active.name} (ring ${ringIndex + 1}/${this.oauthRing.length}) from session state`);
-      return;
+    if (persisted && !spent.has(persisted)) {
+      const ringIndex = this.oauthRing.findIndex((entry) => entry.name === persisted);
+      if (ringIndex !== -1) {
+        this.oauthRingPos = ringIndex;
+        const active = this.oauthRing[ringIndex];
+        this.mirrorActiveCredential('CLAUDE_CODE_OAUTH_TOKEN', active.value);
+        log(
+          `Resumed credential slot ${active.name} (ring ${ringIndex + 1}/${this.oauthRing.length}) from session state`,
+        );
+        return;
+      }
+      // Deliberately no ANTHROPIC_API_KEY_N branch: that pool is forward-only (`nextFallback` never wraps), so a
+      // restored position could only advance past the end and the primary would never be eligible again. A respawn
+      // is that pool's only reset, so it is never persisted.
+      log(`Persisted credential slot "${persisted}" is not in the current pool — ignoring it`);
     }
 
-    // Deliberately no ANTHROPIC_API_KEY_N branch: that pool is forward-only (`nextFallback` never wraps), so a
-    // restored position could only advance past the end and the primary would never be eligible again. A respawn is
-    // that pool's only reset, so it is never persisted.
+    const start = this.oauthRing.findIndex((entry) => !spent.has(entry.name));
+    if (start === -1) return;
+    const active = this.oauthRing[start];
+    if (start > 0) {
+      this.oauthRingPos = start;
+      this.mirrorActiveCredential('CLAUDE_CODE_OAUTH_TOKEN', active.value);
+      log(`Starting on credential slot ${active.name}: the host marked the slots before it spent`);
+    }
+    // Saved once it serves, so a respawn after the host forgets its marks does not restore a spent slot.
+    if (start > 0 || (persisted && spent.has(persisted))) this.unprovenOauthSlot = active.name;
+  }
 
-    // A slot no longer in the pool (env changed since it was written): stay on the primary.
-    log(`Persisted credential slot "${persisted}" is not in the current pool — ignoring, staying on primary`);
+  /**
+   * Bash subprocesses and other in-process callers sign with the active slot. Callers that read the ring from
+   * process.env (the review service, task scripts) lose the primary's value when it is overwritten, so it stays there
+   * as `_0`. Only in process.env: this.env is what the SDK hands the CLI, and the CLI's children must not gain a token.
+   */
+  private mirrorActiveCredential(name: 'CLAUDE_CODE_OAUTH_TOKEN' | 'ANTHROPIC_API_KEY', value: string): void {
+    const primary = process.env[name];
+    if (primary && !process.env[`${name}_0`]) process.env[`${name}_0`] = primary;
+    this.env[name] = value;
+    process.env[name] = value;
   }
 
   /** Best-effort persist; never throws — a respawn just re-derives via rotation. */
@@ -1864,7 +1927,9 @@ export class ClaudeProvider implements AgentProvider {
       typeof err === 'object' && err !== null && 'classification' in err
         ? (err as { classification?: unknown }).classification
         : undefined;
-    if (classification === 'quota' || classification === 'rate_limit') return true;
+    if (classification === 'quota' || classification === 'rate_limit' || classification === CREDENTIAL_REJECTED) {
+      return true;
+    }
     const msg = err instanceof Error ? err.message : String(err);
     return RETRYABLE_ERROR_RE.test(msg);
   }
@@ -1894,20 +1959,18 @@ export class ClaudeProvider implements AgentProvider {
   rotateApiKey(): { rotated: boolean; slot?: string; position?: number; ringSize?: number } {
     if (this.usingOauth()) {
       // Circular, giving up only once every OTHER credential was tried this cycle, so a healed primary is reachable
-      // again on a later turn. Rotations are mirrored to process.env so Bash subprocesses (`claude -p`) and other
-      // in-process callers sign with the active slot.
-      if (this.oauthRing.length <= 1) return { rotated: false };
-      if (this.oauthRotationsThisCycle >= this.oauthRing.length - 1) return { rotated: false };
-      this.oauthRingPos = (this.oauthRingPos + 1) % this.oauthRing.length;
-      this.oauthRotationsThisCycle++;
+      // again on a later turn.
+      const landing = this.nextOauthSlot();
+      if (!landing) return { rotated: false };
+      this.oauthRingPos = landing.index;
+      this.oauthRotationsThisCycle += landing.steps;
       const next = this.oauthRing[this.oauthRingPos];
-      this.env.CLAUDE_CODE_OAUTH_TOKEN = next.value;
-      process.env.CLAUDE_CODE_OAUTH_TOKEN = next.value;
+      this.mirrorActiveCredential('CLAUDE_CODE_OAUTH_TOKEN', next.value);
       log(
         `Rotated CLAUDE_CODE_OAUTH_TOKEN → ${next.name} ` +
           `(ring ${this.oauthRingPos + 1}/${this.oauthRing.length}, cycle ${this.oauthRotationsThisCycle}/${this.oauthRing.length - 1})`,
       );
-      this.persistCredentialSlot(next.name);
+      this.unprovenOauthSlot = next.name;
       return { rotated: true, slot: next.name, position: this.oauthRingPos + 1, ringSize: this.oauthRing.length };
     }
     if (this.nextFallback >= this.fallbackKeys.length) return { rotated: false };
@@ -1916,11 +1979,58 @@ export class ClaudeProvider implements AgentProvider {
       // The base key already equals this fallback: skip to the next.
       return this.rotateApiKey();
     }
-    this.env.ANTHROPIC_API_KEY = next.value;
-    process.env.ANTHROPIC_API_KEY = next.value;
+    this.mirrorActiveCredential('ANTHROPIC_API_KEY', next.value);
     log(`Rotated ANTHROPIC_API_KEY → ${next.name} (${this.nextFallback}/${this.fallbackKeys.length})`);
     // Never persisted: see restorePersistedCredentialSlot on the forward-only pool.
     return { rotated: true, slot: next.name, position: this.nextFallback + 1, ringSize: this.fallbackKeys.length + 1 };
+  }
+
+  spentCredential(err: unknown): { slot: string; fingerprint: string; resetAt: string | null } | null {
+    const active = this.oauthRing[this.oauthRingPos];
+    if (!active || !this.usingOauth()) return null;
+    const event = (err as { event?: { classification?: unknown; resetAt?: unknown; window?: unknown } } | null)?.event;
+    if (event?.classification !== 'rate_limit' && event?.classification !== 'quota') return null;
+    // A model-scoped window (a pinned tier spent) leaves the account serving other models.
+    if (event.window !== 'five_hour' && event.window !== 'seven_day') return null;
+    return {
+      slot: active.name,
+      fingerprint: createHash('sha256').update(active.value).digest('hex'),
+      resetAt: typeof event.resetAt === 'string' ? event.resetAt : null,
+    };
+  }
+
+  lastAttemptActed(): boolean {
+    return this.attemptActed;
+  }
+
+  /** The first slot past the active one that this cycle's budget reaches and the API has not refused. */
+  private nextOauthSlot(): { index: number; steps: number } | null {
+    const size = this.oauthRing.length;
+    for (let steps = 1; this.oauthRotationsThisCycle + steps <= size - 1; steps++) {
+      const index = (this.oauthRingPos + steps) % size;
+      if (!this.rejectedOauthSlots.has(this.oauthRing[index].name)) return { index, steps };
+    }
+    return null;
+  }
+
+  /**
+   * Records that the API refused the active OAuth slot. Returns whether to rethrow for the ring to go on: true while
+   * any slot has not been refused, even one out of this turn's reach, because the error result poll-loop would see
+   * otherwise reads as a recovered turn. False leaves that plain result to end a lone token, API-key auth, or a ring
+   * that has refused every slot.
+   */
+  private recordCredentialRejection(): boolean {
+    const active = this.oauthRing[this.oauthRingPos];
+    if (!active || !this.usingOauth()) return false;
+    this.rejectedOauthSlots.add(active.name);
+    log(`Credential slot ${active.name} was refused by the API; skipping it for this container`);
+    return this.rejectedOauthSlots.size < this.oauthRing.length;
+  }
+
+  private saveProvenOauthSlot(): void {
+    if (!this.unprovenOauthSlot) return;
+    this.persistCredentialSlot(this.unprovenOauthSlot);
+    this.unprovenOauthSlot = undefined;
   }
 
   /**
@@ -1968,6 +2078,12 @@ export class ClaudeProvider implements AgentProvider {
 
   query(input: QueryInput): AgentQuery {
     if (!this.memorySessionHook) throw new Error('Claude memory session hook was not registered');
+    const recordCredentialRejection = () => this.recordCredentialRejection();
+    const saveProvenOauthSlot = () => this.saveProvenOauthSlot();
+    this.attemptActed = false;
+    const markAttemptActed = () => {
+      this.attemptActed = true;
+    };
     const stream = new MessageStream();
     const initialPromptId = stream.push(input.prompt);
     // Set by the first `session_state_changed`. Until the CLI proves it emits idle, report no queued work, so a CLI
@@ -2035,7 +2151,7 @@ export class ClaudeProvider implements AgentProvider {
     // Leave CLAUDE_CODE_SUBAGENT_MODEL unset: a concrete value outranks frontmatter model selection, pinning every
     // subagent to the group model. Never rewrite a family alias to the group's model here: family words are install
     // constants, and the model in force travels as the SDK's own `model` option.
-    const perQueryEnv: Record<string, string | undefined> = { ...this.env };
+    const perQueryEnv: Record<string, string | undefined> = { ...this.env, PATH: withCodexShimPath(this.env.PATH) };
 
     // The ring slot is fixed for the query's life (the CLI subprocess starts with this env), so it is captured here,
     // not at sample time; utilization is per account, and unlabelled samples would blend accounts. When an API key is
@@ -2250,6 +2366,7 @@ export class ClaudeProvider implements AgentProvider {
               modelUsage?: Record<string, ResultModelUsage>;
               // The SDK's own round-trip count for the turn: the `steps` signal.
               num_turns?: number;
+              api_error_status?: number | null;
             };
             const text = m.result ?? (m.errors && m.errors.length > 0 ? m.errors.join('\n') : null);
             // Retry-path guards run FIRST: they turn error text into a throw so poll-loop retries instead of posting
@@ -2268,6 +2385,12 @@ export class ClaudeProvider implements AgentProvider {
             if (text && TRANSIENT_OVERLOAD_RESULT_RE.test(text)) {
               throw new Error(`transient_overload: ${text}`);
             }
+            if (isCredentialRejection(m) && recordCredentialRejection()) {
+              throw Object.assign(new Error(text ?? 'Claude credential rejected'), {
+                classification: CREDENTIAL_REJECTED,
+              });
+            }
+            if (m.is_error !== true) saveProvenOauthSlot();
             const effortHeldAllTurn = effortTransitionsThisTurn === 0;
             // Cleared BEFORE the yield: poll-loop applies settings while the generator is suspended there, so a later
             // reset would wipe transitions belonging to the NEXT turn.
@@ -2320,6 +2443,7 @@ export class ClaudeProvider implements AgentProvider {
                 retryable: false,
                 classification: blocked.classification,
                 resetAt: blocked.resetAt,
+                window: info?.rateLimitType ?? null,
               };
             }
           } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'compact_boundary') {
@@ -2437,6 +2561,7 @@ export class ClaudeProvider implements AgentProvider {
               for (const block of blocks) {
                 const b = block as { type?: string; id?: string; name?: string; text?: unknown };
                 if (b.type === 'tool_use' && b.id && b.name) toolNameById.set(b.id, b.name);
+                if (b.type === 'tool_use') markAttemptActed();
                 if (!topLevel) continue;
                 // Text is mid-turn only once a tool call follows it, possibly in a later message. Text still pending
                 // at `result` is the final text the result carries, so it is never emitted twice.

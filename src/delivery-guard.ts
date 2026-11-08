@@ -31,7 +31,12 @@ export interface DeliveryGuardSpec {
   /** Create the hold (the domain's requestApproval call — card text lives with the domain). */
   requestHold: (content: Record<string, unknown>, session: Session) => Promise<void>;
   /** Tell the requester about a deny. */
-  onDeny?: (content: Record<string, unknown>, session: Session, reason: string) => void;
+  onDeny?: (content: Record<string, unknown>, session: Session, reason: string) => void | Promise<void>;
+  /**
+   * The action writes its request's `delivered` row itself on every path (refused, held, sent), because the caller
+   * waits on it; the delivery loop must not mark it delivered after a refusal or a hold.
+   */
+  ownsAck?: true;
 }
 
 /**
@@ -49,7 +54,8 @@ export async function runGuarded(
   session: Session,
   grant: PendingApproval | null,
 ): Promise<void | { deferAck: true }> {
-  if (spec.precheck && !(await spec.precheck(content, session))) return;
+  const deferred = spec.ownsAck ? ({ deferAck: true } as const) : undefined;
+  if (spec.precheck && !(await spec.precheck(content, session))) return deferred;
 
   // Under the central lease: the guard's reads are raw by design.
   const decision = await withCentralSync(
@@ -64,12 +70,12 @@ export async function runGuarded(
 
   if (decision.effect === 'deny') {
     log.warn('Delivery action denied by guard', { action, reason: decision.reason });
-    spec.onDeny?.(content, session, decision.reason);
-    return;
+    await spec.onDeny?.(content, session, decision.reason);
+    return deferred;
   }
   if (decision.effect === 'hold') {
     await spec.requestHold(content, session);
-    return;
+    return deferred;
   }
   return handler(content, session);
 }

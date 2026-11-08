@@ -5,7 +5,6 @@ import path from 'path';
 
 import {
   type AppServer,
-  buildCodexHooksJson,
   createCodexConfigOverrides,
   interruptCodexTurn,
   listCodexHooks,
@@ -18,7 +17,6 @@ import {
   renderCodexMcpServer,
   startOrResumeCodexThread,
   type ThreadParams,
-  writeCodexHooksJson,
   writeCodexMcpConfigToml,
 } from './codex-app-server.js';
 import { CodexProvider } from './codex.js';
@@ -217,69 +215,6 @@ describe('Codex app-server liveness RPCs', () => {
   });
 });
 
-describe('buildCodexHooksJson', () => {
-  it('emits a PreToolUse and PostToolUse entry with command type', () => {
-    const data = buildCodexHooksJson();
-    expect(data.hooks.PreToolUse).toHaveLength(1);
-    expect(data.hooks.PostToolUse).toHaveLength(1);
-    expect(data.hooks.PreToolUse[0].hooks[0].type).toBe('command');
-    expect(data.hooks.PostToolUse[0].hooks[0].type).toBe('command');
-  });
-
-  it('points commands at /app/src/codex-hooks/cli.ts via bun', () => {
-    const data = buildCodexHooksJson();
-    expect(data.hooks.PreToolUse[0].hooks[0].command).toBe('bun /app/src/codex-hooks/cli.ts PreToolUse');
-    expect(data.hooks.PostToolUse[0].hooks[0].command).toBe('bun /app/src/codex-hooks/cli.ts PostToolUse');
-  });
-
-  it('defaults PreToolUse timeout to 3600s (1h, for email-gate approval wait)', () => {
-    const data = buildCodexHooksJson();
-    expect(data.hooks.PreToolUse[0].hooks[0].timeout).toBe(3600);
-  });
-
-  it('honors emailGateTimeoutSec override on PreToolUse', () => {
-    const data = buildCodexHooksJson({ emailGateTimeoutSec: 7200 });
-    expect(data.hooks.PreToolUse[0].hooks[0].timeout).toBe(7200);
-  });
-
-  it('PostToolUse uses a short 30s timeout', () => {
-    const data = buildCodexHooksJson();
-    expect(data.hooks.PostToolUse[0].hooks[0].timeout).toBe(30);
-  });
-
-  it('writes to an explicit codexHome before environment fallbacks', () => {
-    const previousHome = process.env.HOME;
-    const previousCodexHome = process.env.CODEX_HOME;
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-hooks-home-'));
-    const explicitHome = path.join(root, 'explicit');
-    const environmentHome = path.join(root, 'environment');
-    const home = path.join(root, 'home');
-    try {
-      process.env.HOME = home;
-      process.env.CODEX_HOME = environmentHome;
-
-      writeCodexHooksJson({ codexHome: explicitHome, emailGateTimeoutSec: 7200 });
-
-      const hooks = JSON.parse(fs.readFileSync(path.join(explicitHome, 'hooks.json'), 'utf-8')) as {
-        hooks: { PreToolUse: Array<{ hooks: Array<{ command: string; timeout: number }> }> };
-      };
-      expect(hooks.hooks.PreToolUse[0].hooks[0]).toEqual({
-        type: 'command',
-        command: 'bun /app/src/codex-hooks/cli.ts PreToolUse',
-        timeout: 7200,
-      });
-      expect(fs.existsSync(path.join(environmentHome, 'hooks.json'))).toBe(false);
-      expect(fs.existsSync(path.join(home, '.codex', 'hooks.json'))).toBe(false);
-    } finally {
-      if (previousHome === undefined) delete process.env.HOME;
-      else process.env.HOME = previousHome;
-      if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
-      else process.env.CODEX_HOME = previousCodexHome;
-      fs.rmSync(root, { recursive: true, force: true });
-    }
-  });
-});
-
 describe('createCodexConfigOverrides', () => {
   it('omits the removed steering toggle', () => {
     expect(createCodexConfigOverrides().some((value) => value.startsWith('features.steer='))).toBe(false);
@@ -306,8 +241,8 @@ describe('createCodexConfigOverrides', () => {
 
   it('keeps context limits on CLI overrides through fallback-home rotation', () => {
     const overrides = createCodexConfigOverrides();
-    expect(overrides).toContain('model_context_window=400000');
-    expect(overrides).toContain('model_auto_compact_token_limit=360000');
+    expect(overrides).toContain('model_context_window=800000');
+    expect(overrides).toContain('model_auto_compact_token_limit=720000');
   });
 
   it('uses the configured native subagent concurrency default', () => {
@@ -367,6 +302,25 @@ describe('MCP server startup', () => {
     });
     expect(toml).toContain('[mcp_servers.nanoclaw]\nrequired = true\ntype = "stdio"');
     expect(toml.match(/required = true/g)).toHaveLength(1);
+  });
+
+  it('renders a stdio timeout in milliseconds as Codex tool_timeout_sec, above the env sub-table', () => {
+    const lines = renderCodexMcpServer('looker', {
+      type: 'stdio',
+      command: 'bun',
+      env: { A: 'b' },
+      timeout: 610_000,
+    });
+    expect(lines).toContain('tool_timeout_sec = 610');
+    expect(lines.indexOf('tool_timeout_sec = 610')).toBeLessThan(lines.indexOf('[mcp_servers.looker.env]'));
+    expect(renderCodexMcpServer('plain', { type: 'stdio', command: 'bun' }).join('\n')).not.toContain('timeout');
+  });
+
+  it('carries a stdio timeout from the provider options into the Codex server map', () => {
+    const provider = new CodexProvider({ mcpServers: { looker: { command: 'bun', timeout: 610_000 } } });
+    expect(
+      (provider as unknown as { mcpServers: Record<string, { timeout?: number }> }).mcpServers.looker.timeout,
+    ).toBe(610_000);
   });
 
   it('leaves the shared per-server renderer optional, as the peer-mode companion uses it', () => {
@@ -785,10 +739,9 @@ describe('writeCodexMcpConfigToml', () => {
     }
   });
 
-  it('writes config.toml + hooks.json to CODEX_HOME, not $HOME/.codex (codex #126 rotation)', () => {
-    // On OAuth rotation the provider sets CODEX_HOME to a fallback dir; the writers
-    // must target it (else the rotated app-server runs with stale config and — for
-    // hooks.json — NO destructive guard).
+  it('writes config.toml to CODEX_HOME, not $HOME/.codex (codex #126 rotation)', () => {
+    // On OAuth rotation the provider sets CODEX_HOME to a fallback dir; the writer
+    // must target it, or the rotated app-server runs with stale config.
     const prevHome = process.env.HOME;
     const prevCodexHome = process.env.CODEX_HOME;
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-home-'));
@@ -798,13 +751,10 @@ describe('writeCodexMcpConfigToml', () => {
       process.env.CODEX_HOME = fallback; // simulate post-rotation
 
       writeCodexMcpConfigToml({ nanoclaw: { command: 'bun', args: ['x'] } });
-      writeCodexHooksJson();
 
-      // Both land in the fallback (CODEX_HOME), NOT $HOME/.codex.
+      // It lands in the fallback (CODEX_HOME), NOT $HOME/.codex.
       expect(fs.existsSync(path.join(fallback, 'config.toml'))).toBe(true);
-      expect(fs.existsSync(path.join(fallback, 'hooks.json'))).toBe(true);
       expect(fs.existsSync(path.join(home, '.codex', 'config.toml'))).toBe(false);
-      expect(fs.existsSync(path.join(home, '.codex', 'hooks.json'))).toBe(false);
     } finally {
       if (prevHome === undefined) {
         delete process.env.HOME;

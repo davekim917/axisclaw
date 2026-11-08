@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 
+import { resetGuardCorePathsForTest, setGuardCorePathsForTest } from '../guard-core-paths.js';
 import { normalizeCodexHookInput, runPreToolUseChain } from './runner.js';
 
 describe('normalizeCodexHookInput', () => {
@@ -61,8 +62,8 @@ describe('runPreToolUseChain — guardrails', () => {
 
   beforeEach(() => {
     // Snapshot env vars the hooks read.
-    for (const k of ['NANOCLAW_IS_SCHEDULED_TASK', 'NANOCLAW_DESTRUCTIVE_GUARD_CORE']) savedEnv[k] = process.env[k];
-    process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = STUB_CORE;
+    for (const k of ['NANOCLAW_IS_SCHEDULED_TASK']) savedEnv[k] = process.env[k];
+    setGuardCorePathsForTest({ destructive: STUB_CORE });
   });
 
   afterEach(() => {
@@ -70,6 +71,7 @@ describe('runPreToolUseChain — guardrails', () => {
       if (v === undefined) delete process.env[k];
       else process.env[k] = v;
     }
+    resetGuardCorePathsForTest();
   });
 
   it('blocks git clone into /workspace/agent', async () => {
@@ -173,15 +175,11 @@ describe('runPreToolUseChain — destructive-action guard wiring', () => {
   // bootstrap repo; its verdicts are validated there). This tests that runner.ts
   // calls the core and maps verdicts → codex deny/continue correctly.
   const FIXTURE = new URL('./__test-fixtures__/guard-core-stub.ts', import.meta.url).pathname;
-  let saved: string | undefined;
-
   beforeEach(() => {
-    saved = process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE;
-    process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = FIXTURE;
+    setGuardCorePathsForTest({ destructive: FIXTURE });
   });
   afterEach(() => {
-    if (saved === undefined) delete process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE;
-    else process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = saved;
+    resetGuardCorePathsForTest();
   });
 
   it('denies a hard-blocked command (core → block)', async () => {
@@ -215,7 +213,7 @@ describe('runPreToolUseChain — destructive-action guard wiring', () => {
     // behavior (this test's old assertion) was the security gap this feature
     // closes. The reason text surfaces the unavailability so the agent reports
     // rather than retrying.
-    process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = '/nonexistent/guard-core.ts';
+    setGuardCorePathsForTest({ destructive: '/nonexistent/guard-core.ts' });
     const out = (await runPreToolUseChain({
       tool_name: 'exec_command',
       tool_input: { command: 'echo benign-after-core-gone' },
@@ -230,10 +228,9 @@ describe('runPreToolUseChain — destructive-action guard wiring', () => {
   // the `verdict.action` access OUTSIDE the try/catch, escape the chain, and hit
   // the CLI's fail-OPEN handler. The verdict-shape guard must DENY instead.
   it('test_codex_destructive_fail_closed_malformed_verdict: denies when the core returns undefined', async () => {
-    process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = new URL(
-      './__test-fixtures__/malformed-verdict/block-destructive-core.ts',
-      import.meta.url,
-    ).pathname;
+    setGuardCorePathsForTest({
+      destructive: new URL('./__test-fixtures__/malformed-verdict/block-destructive-core.ts', import.meta.url).pathname,
+    });
     const out = (await runPreToolUseChain({
       tool_name: 'exec_command',
       tool_input: { command: 'echo VERDICT_UNDEFINED' },
@@ -243,10 +240,9 @@ describe('runPreToolUseChain — destructive-action guard wiring', () => {
   });
 
   it('test_codex_destructive_fail_closed_unknown_action: denies when the core returns an unknown action', async () => {
-    process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = new URL(
-      './__test-fixtures__/malformed-verdict/block-destructive-core.ts',
-      import.meta.url,
-    ).pathname;
+    setGuardCorePathsForTest({
+      destructive: new URL('./__test-fixtures__/malformed-verdict/block-destructive-core.ts', import.meta.url).pathname,
+    });
     const out = (await runPreToolUseChain({
       tool_name: 'exec_command',
       tool_input: { command: 'echo anything-else-gives-banana-action' },
@@ -258,10 +254,10 @@ describe('runPreToolUseChain — destructive-action guard wiring', () => {
   // post-approval skipGate re-check allowed any non-block action — a malformed
   // post-verdict (gate→approved→{action:'banana'}) fell through to allow.
   it('test_codex_destructive_fail_closed_malformed_postcheck: denies on a malformed post-approval verdict', async () => {
-    process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = new URL(
-      './__test-fixtures__/malformed-postcheck/block-destructive-core.ts',
-      import.meta.url,
-    ).pathname;
+    setGuardCorePathsForTest({
+      destructive: new URL('./__test-fixtures__/malformed-postcheck/block-destructive-core.ts', import.meta.url)
+        .pathname,
+    });
     const out = (await runPreToolUseChain({
       tool_name: 'exec_command',
       tool_input: { command: 'echo gated-then-malformed-postcheck' },
@@ -274,10 +270,9 @@ describe('runPreToolUseChain — destructive-action guard wiring', () => {
   // not count as "already approved" — the strict `=== true` check falls through
   // to real gate staging, which here can't stage → deny (NOT a skip-gate allow).
   it('test_codex_gate_nonboolean_approval_fails_closed: truthy-non-boolean consumeGateApproval denies', async () => {
-    process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = new URL(
-      './__test-fixtures__/gate-postcheck/block-destructive-core.ts',
-      import.meta.url,
-    ).pathname;
+    setGuardCorePathsForTest({
+      destructive: new URL('./__test-fixtures__/gate-postcheck/block-destructive-core.ts', import.meta.url).pathname,
+    });
     const out = (await runPreToolUseChain({
       tool_name: 'exec_command',
       tool_input: { command: 'echo NONBOOL_APPROVAL' },
@@ -289,10 +284,9 @@ describe('runPreToolUseChain — destructive-action guard wiring', () => {
   // codex #126 N2: a repeated `gate` after an approval is consumed (a stale core
   // ignoring skipGate) must DENY — only an explicit `allow` post-verdict passes.
   it('test_codex_gate_repeated_after_approval_fails_closed: post-approval gate denies', async () => {
-    process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = new URL(
-      './__test-fixtures__/gate-postcheck/block-destructive-core.ts',
-      import.meta.url,
-    ).pathname;
+    setGuardCorePathsForTest({
+      destructive: new URL('./__test-fixtures__/gate-postcheck/block-destructive-core.ts', import.meta.url).pathname,
+    });
     const out = (await runPreToolUseChain({
       tool_name: 'exec_command',
       tool_input: { command: 'echo GATE_AFTER_APPROVAL' },
@@ -303,10 +297,10 @@ describe('runPreToolUseChain — destructive-action guard wiring', () => {
   // codex #126 N3: a file-protection core returning a falsy NON-null ({undefined})
   // for an edit must DENY (fail-closed), not fall through to allow.
   it('test_codex_file_protection_malformed_result_fails_closed: falsy-non-null denies the edit', async () => {
-    process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = new URL(
-      './__test-fixtures__/fp-malformed-result/block-destructive-core.ts',
-      import.meta.url,
-    ).pathname;
+    setGuardCorePathsForTest({
+      destructive: new URL('./__test-fixtures__/fp-malformed-result/block-destructive-core.ts', import.meta.url)
+        .pathname,
+    });
     const out = (await runPreToolUseChain({
       tool_name: 'Write',
       tool_input: { file_path: 'src/index.ts' },
@@ -351,8 +345,7 @@ function decisionOf(out: unknown): { decision?: string; reason?: string; denied:
   return { decision: hso?.permissionDecision, reason: hso?.permissionDecisionReason, denied };
 }
 
-// ── E4: Codex destructive guard — fail-closed + export-validation ──
-describe('E4 codex destructive guard — fail-closed', () => {
+describe('guard core location', () => {
   let saved: string | undefined;
   beforeEach(() => {
     saved = process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE;
@@ -362,8 +355,23 @@ describe('E4 codex destructive guard — fail-closed', () => {
     else process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = saved;
   });
 
+  // The hook process inherits the env of whoever started codex, so a core named there would be the caller's choice.
+  it('ignores a guard core named in the hook env', async () => {
+    process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = STUB_GUARD_CORE;
+    // The stub allows this; the installed core blocks it, and an absent installed core denies it.
+    const d = decisionOf(await runPreToolUseChain({ tool_name: 'exec_command', tool_input: { command: 'rm -rf /' } }));
+    expect(d.denied).toBe(true);
+  });
+});
+
+// ── E4: Codex destructive guard — fail-closed + export-validation ──
+describe('E4 codex destructive guard — fail-closed', () => {
+  afterEach(() => {
+    resetGuardCorePathsForTest();
+  });
+
   it('test_codex_destructive_fail_closed_missing_core', async () => {
-    process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = '/nonexistent/guard-core.ts';
+    setGuardCorePathsForTest({ destructive: '/nonexistent/guard-core.ts' });
     // Even a totally benign command denies when the core can't be imported.
     const out = await runPreToolUseChain({ tool_name: 'exec_command', tool_input: { command: 'echo hi' } });
     const d = decisionOf(out);
@@ -373,7 +381,7 @@ describe('E4 codex destructive guard — fail-closed', () => {
 
   it('test_codex_destructive_fail_closed_malformed_core', async () => {
     // Exports present but mis-typed → validateGuardCore rejects → deny.
-    process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = MALFORMED_CORE;
+    setGuardCorePathsForTest({ destructive: MALFORMED_CORE });
     const out = await runPreToolUseChain({ tool_name: 'exec_command', tool_input: { command: 'echo hi' } });
     const d = decisionOf(out);
     expect(d.decision).toBe('deny');
@@ -382,7 +390,7 @@ describe('E4 codex destructive guard — fail-closed', () => {
 
   it('test_codex_destructive_fail_closed_throwing_evaluator', async () => {
     // Core passes validation but evaluateBashCommand throws → caught → deny.
-    process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = THROWING_CORE;
+    setGuardCorePathsForTest({ destructive: THROWING_CORE });
     const out = await runPreToolUseChain({ tool_name: 'exec_command', tool_input: { command: 'echo hi' } });
     const d = decisionOf(out);
     expect(d.decision).toBe('deny');
@@ -391,7 +399,7 @@ describe('E4 codex destructive guard — fail-closed', () => {
 
   it('test_codex_destructive_happy_path_unchanged', async () => {
     // With a valid core: block/gate/allow verdicts map as before.
-    process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = STUB_GUARD_CORE;
+    setGuardCorePathsForTest({ destructive: STUB_GUARD_CORE });
     const blocked = decisionOf(
       await runPreToolUseChain({ tool_name: 'exec_command', tool_input: { command: 'echo STUB_BLOCK' } }),
     );
@@ -413,16 +421,13 @@ describe('E4 codex destructive guard — fail-closed', () => {
 
 // ── E5: Codex file-protection — fail-closed + export-validation ──
 describe('E5 codex file-protection — fail-closed', () => {
-  let savedGuard: string | undefined;
   let savedSkip: string | undefined;
   beforeEach(() => {
-    savedGuard = process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE;
     savedSkip = process.env.SKIP_FILE_PROTECTION;
     delete process.env.SKIP_FILE_PROTECTION;
   });
   afterEach(() => {
-    if (savedGuard === undefined) delete process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE;
-    else process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = savedGuard;
+    resetGuardCorePathsForTest();
     if (savedSkip === undefined) delete process.env.SKIP_FILE_PROTECTION;
     else process.env.SKIP_FILE_PROTECTION = savedSkip;
   });
@@ -430,7 +435,7 @@ describe('E5 codex file-protection — fail-closed', () => {
   it('test_codex_fileprot_fail_closed_missing_core', async () => {
     // Missing core → an EDIT tool call denies; the FP path derives from the
     // (nonexistent) guard-core dir so it can't import.
-    process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = '/nonexistent/block-destructive-core.ts';
+    setGuardCorePathsForTest({ destructive: '/nonexistent/block-destructive-core.ts' });
     const out = await runPreToolUseChain({ tool_name: 'Write', tool_input: { file_path: 'src/anything.ts' } });
     const d = decisionOf(out);
     expect(d.decision).toBe('deny');
@@ -440,14 +445,14 @@ describe('E5 codex file-protection — fail-closed', () => {
   it('missing core still passes non-edit tools through', async () => {
     // File-protection only governs edit tools; a non-edit tool is unaffected by
     // a missing FP core. (The Bash chain is separate; WebFetch hits the FP path.)
-    process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = '/nonexistent/block-destructive-core.ts';
+    setGuardCorePathsForTest({ destructive: '/nonexistent/block-destructive-core.ts' });
     const out = await runPreToolUseChain({ tool_name: 'WebFetch', tool_input: { url: 'https://example.com' } });
     expect(decisionOf(out).decision).toBeUndefined();
   });
 
   it('test_codex_fileprot_fail_closed_malformed', async () => {
     // EDIT_TOOLS not a Set / checkEditProtection not a fn → reject → deny edits.
-    process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = MALFORMED_CORE;
+    setGuardCorePathsForTest({ destructive: MALFORMED_CORE });
     const out = await runPreToolUseChain({ tool_name: 'apply_patch', tool_input: { input: '*** Add File: x.ts' } });
     const d = decisionOf(out);
     expect(d.decision).toBe('deny');
@@ -456,32 +461,31 @@ describe('E5 codex file-protection — fail-closed', () => {
 
   it('test_codex_fileprot_throwing_check_denies', async () => {
     // Valid shape but checkEditProtection throws → caught → deny.
-    process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = THROWING_CORE;
+    setGuardCorePathsForTest({ destructive: THROWING_CORE });
     const out = await runPreToolUseChain({ tool_name: 'Write', tool_input: { file_path: 'src/anything.ts' } });
     const d = decisionOf(out);
     expect(d.decision).toBe('deny');
     expect(d.reason).toContain('file-protection check errored');
   });
 
-  it('test_codex_fileprot_skip_env_bypass', async () => {
-    // SKIP_FILE_PROTECTION=1 bypasses entirely — even a protected path is allowed
-    // and even a missing core does not deny.
+  it('test_codex_fileprot_ignores_skip_env: the hook env cannot switch file protection off', async () => {
+    // The hook process runs with the env of whoever started codex, so SKIP_FILE_PROTECTION there is the caller's.
     process.env.SKIP_FILE_PROTECTION = '1';
-    process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = STUB_GUARD_CORE;
+    setGuardCorePathsForTest({ destructive: STUB_GUARD_CORE });
     const protectedEdit = await runPreToolUseChain({
       tool_name: 'Write',
       tool_input: { file_path: 'app/STUB_PROTECTED.env' },
     });
-    expect(decisionOf(protectedEdit).decision).toBeUndefined();
+    expect(decisionOf(protectedEdit).decision).toBe('deny');
 
-    process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = '/nonexistent/block-destructive-core.ts';
+    setGuardCorePathsForTest({ destructive: '/nonexistent/block-destructive-core.ts' });
     const missingCore = await runPreToolUseChain({ tool_name: 'Write', tool_input: { file_path: 'x.ts' } });
-    expect(decisionOf(missingCore).decision).toBeUndefined();
+    expect(decisionOf(missingCore).decision).toBe('deny');
   });
 
   it('test_codex_fileprot_happy_path', async () => {
     // Valid core: protected path denies, safe path allows (existing contract).
-    process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = STUB_GUARD_CORE;
+    setGuardCorePathsForTest({ destructive: STUB_GUARD_CORE });
     const blocked = await runPreToolUseChain({
       tool_name: 'Write',
       tool_input: { file_path: 'config/STUB_PROTECTED.yaml' },
@@ -494,17 +498,12 @@ describe('E5 codex file-protection — fail-closed', () => {
 
 // ── E6 (Codex side): dispatch coverage at the real entrypoint ──
 describe('E6 codex dispatch — each guard + uniform fail-closed', () => {
-  let saved: string | undefined;
-  beforeEach(() => {
-    saved = process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE;
-  });
   afterEach(() => {
-    if (saved === undefined) delete process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE;
-    else process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = saved;
+    resetGuardCorePathsForTest();
   });
 
   it('test_codex_dispatch_each_guard', async () => {
-    process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = STUB_GUARD_CORE;
+    setGuardCorePathsForTest({ destructive: STUB_GUARD_CORE });
     // Drive runPreToolUseChain (the real codex entrypoint) over each migrated
     // guard; assert per-gate block + a benign allow through the same chain.
     type Case = { name: string; tool: string; input: Record<string, unknown>; expectDeny: boolean };
@@ -554,7 +553,7 @@ describe('E6 codex dispatch — each guard + uniform fail-closed', () => {
   it('test_codex_denylist_chain_dispatched', async () => {
     // The tool denylist is dispatched via preToolUseHook (runner.ts:222, first
     // hook). A disallowed tool returns decision:'block' before any guard runs.
-    process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = STUB_GUARD_CORE;
+    setGuardCorePathsForTest({ destructive: STUB_GUARD_CORE });
     const out = (await runPreToolUseChain({ tool_name: 'CronCreate', tool_input: {} })) as { decision?: string };
     expect(out.decision).toBe('block');
   });
@@ -562,7 +561,7 @@ describe('E6 codex dispatch — each guard + uniform fail-closed', () => {
   it('test_codex_dispatch_uniform_fail_closed_both_cores', async () => {
     // Both the destructive core AND the file-protection core fail CLOSED in the
     // same direction when missing: bash command denies, edit denies.
-    process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = '/nonexistent/block-destructive-core.ts';
+    setGuardCorePathsForTest({ destructive: '/nonexistent/block-destructive-core.ts' });
     const bash = decisionOf(
       await runPreToolUseChain({ tool_name: 'exec_command', tool_input: { command: 'echo hi' } }),
     );
@@ -571,7 +570,7 @@ describe('E6 codex dispatch — each guard + uniform fail-closed', () => {
     expect(edit.decision).toBe('deny');
 
     // Same uniform direction under malformed cores.
-    process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = MALFORMED_CORE;
+    setGuardCorePathsForTest({ destructive: MALFORMED_CORE });
     const bash2 = decisionOf(
       await runPreToolUseChain({ tool_name: 'exec_command', tool_input: { command: 'echo hi' } }),
     );
@@ -594,8 +593,8 @@ describe('runPreToolUseChain — one approval card per tool call (#833)', () => 
   const saved: Record<string, string | undefined> = {};
 
   beforeEach(() => {
-    for (const k of ['NANOCLAW_DESTRUCTIVE_GUARD_CORE', 'NANOCLAW_TEST_GATE_ARG_SINK']) saved[k] = process.env[k];
-    process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = FIXTURE;
+    for (const k of ['NANOCLAW_TEST_GATE_ARG_SINK']) saved[k] = process.env[k];
+    setGuardCorePathsForTest({ destructive: FIXTURE });
     process.env.NANOCLAW_TEST_GATE_ARG_SINK = SINK;
     try {
       require('fs').unlinkSync(SINK);
@@ -604,6 +603,7 @@ describe('runPreToolUseChain — one approval card per tool call (#833)', () => 
     }
   });
   afterEach(() => {
+    resetGuardCorePathsForTest();
     for (const [k, v] of Object.entries(saved)) {
       if (v === undefined) delete process.env[k];
       else process.env[k] = v;

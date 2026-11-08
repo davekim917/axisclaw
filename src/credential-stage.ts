@@ -72,10 +72,16 @@ function resolveKeyPath(keyPath: unknown, home: string): { src: string; rel: str
   return { src, rel };
 }
 
-function stageProfileOutputs(outputs: Record<string, unknown>, home: string): StagedProfile | Refusal {
+function stageProfileOutputs(
+  outputs: Record<string, unknown>,
+  home: string,
+  queryTag: string,
+): StagedProfile | Refusal {
   const staged: Record<string, unknown> = {};
   const keys: StagedProfile['keys'] = [];
-  for (const [name, output] of Object.entries(outputs)) {
+  for (const [name, raw] of Object.entries(outputs)) {
+    const output =
+      isRecord(raw) && raw.type === 'snowflake' && !('query_tag' in raw) ? { ...raw, query_tag: queryTag } : raw;
     if (!isRecord(output) || output.private_key_path == null || output.private_key_path === '') {
       staged[name] = output;
       continue;
@@ -95,6 +101,7 @@ export function stageDbtProfiles(opts: {
   dest: string;
   allowedProfiles: string[] | null;
   agent: string;
+  queryTag: string;
 }): void {
   const parsed: unknown = YAML.parse(fs.readFileSync(opts.profilesPath, 'utf-8'), { merge: true }) ?? {};
   if (!isRecord(parsed)) throw new Error('profiles.yml is not a mapping');
@@ -115,7 +122,7 @@ export function stageDbtProfiles(opts: {
       staged[name] = profile;
       continue;
     }
-    const result = stageProfileOutputs(profile.outputs, opts.home);
+    const result = stageProfileOutputs(profile.outputs, opts.home, opts.queryTag);
     if ('refused' in result) {
       refuse(name, result);
       continue;
@@ -124,4 +131,34 @@ export function stageDbtProfiles(opts: {
     staged[name] = { ...profile, outputs: result.outputs };
   }
   fs.writeFileSync(path.join(opts.dest, 'profiles.yml'), YAML.stringify(staged), { mode: 0o600 });
+}
+
+const TOML_COMMENT = String.raw`\s*(?:#.*)?`;
+const TOML_HEADER = new RegExp(String.raw`^\s*\[\s*([A-Za-z0-9_-]+)\s*\]` + TOML_COMMENT + '$');
+const TOML_VALUE = String.raw`(?:"(?:[^"\\]|\\.)*"|'[^']*'|[A-Za-z0-9_.:+-]+|\{(?:[^{}"'#]|"(?:[^"\\]|\\.)*"|'[^']*')*\})`;
+const TOML_KEY_VALUE = new RegExp(String.raw`^\s*([A-Za-z0-9_-]+)\s*=\s*` + TOML_VALUE + TOML_COMMENT + '$');
+const TOML_BLANK = /^\s*(?:#.*)?$/;
+
+/**
+ * Adds `session_parameters = { QUERY_TAG = <tag> }` to every connection that declares no `session_parameters`.
+ * Returns null, never a partial edit, when any line falls outside the bare-header / bare-key / one-line-value subset:
+ * a duplicate table fails the whole file in TOML, and a header-shaped line can sit inside a multi-line credential.
+ */
+export function tagSnowflakeConnections(toml: string, tag: string): string | null {
+  const lines = toml.split('\n');
+  const sections: Array<{ at: number; declared: boolean }> = [];
+  for (const [at, raw] of lines.entries()) {
+    const line = raw.replace(/\r$/, '');
+    if (line.includes('"""') || line.includes("'''")) return null;
+    if (TOML_HEADER.test(line)) sections.push({ at, declared: false });
+    else if (TOML_BLANK.test(line)) continue;
+    else {
+      const kv = line.match(TOML_KEY_VALUE);
+      if (!kv || sections.length === 0) return null;
+      if (kv[1] === 'session_parameters') sections[sections.length - 1].declared = true;
+    }
+  }
+  const tagLine = `session_parameters = { QUERY_TAG = ${JSON.stringify(tag)} }`;
+  for (const { at } of sections.filter((section) => !section.declared).reverse()) lines.splice(at + 1, 0, tagLine);
+  return lines.join('\n');
 }

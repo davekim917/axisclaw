@@ -20,7 +20,7 @@ export type ClaudeSpawnConfig = Pick<
  * does not square it: 5 is 5 slots per session excluding the main agent. Not an absolute ceiling either: resumes can
  * bypass admission and agent teams count separately.
  */
-export const DEFAULT_CLAUDE_AUTO_COMPACT_WINDOW = 600_000;
+export const DEFAULT_CLAUDE_AUTO_COMPACT_WINDOW = 800_000;
 export const CLAUDE_MAX_SUBAGENT_SPAWN_DEPTH = '2';
 export const CLAUDE_MAX_CONCURRENT_SUBAGENTS = '5';
 /** The CLI defaults everything outside the main conversation (subagents, workflows, helpers) to a 5-minute cache. */
@@ -126,8 +126,6 @@ export function claudeSpawnEnv(
     `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS=${CLAUDE_MAX_CONCURRENT_SUBAGENTS}`,
     '-e',
     `CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL=${CLAUDE_SUBAGENT_PROMPT_CACHE_TTL}`,
-    '-e',
-    'CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1',
     // Claude Code enables fork subagents in SDK sessions by default, and a fork inherits the parent's whole context.
     '-e',
     'CLAUDE_CODE_FORK_SUBAGENT=0',

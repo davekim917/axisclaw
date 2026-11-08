@@ -852,7 +852,7 @@ describe('S2-PR11 scheduling + thread-close', () => {
         muteChat: true,
         quietStatus: true,
       };
-      const admitted = mailbox.dispatchTaskEvent(input);
+      const admitted = mailbox.dispatchTaskEvent(input, false);
       db.prepare('UPDATE messages_in SET status = ? WHERE id = ?').run(status, admitted.rowId);
       const session = fakeSession({ id: 'sess-keyed', thread_id: taskThreadId(admitted.seriesId) });
 
@@ -861,10 +861,24 @@ describe('S2-PR11 scheduling + thread-close', () => {
       expect(mailbox.countLiveTasks()).toBe(0);
       expect(calls.updates).toEqual([]);
       expect((await findSystemSession('ag-test', session.thread_id!))?.id).toBe(session.id);
-      expect(mailbox.dispatchTaskEvent(input)).toMatchObject({ rowId: admitted.rowId, admission: 'replay', status });
+      expect(mailbox.dispatchTaskEvent(input, false)).toMatchObject({
+        rowId: admitted.rowId,
+        admission: 'replay',
+        status,
+      });
       expect(db.prepare('SELECT count(*) AS n FROM messages_in').get()).toEqual({ n: 1 });
     },
   );
+
+  it('does not read a task merely named dispatch-… as a keyed receipt', () => {
+    const db = freshInbound();
+    db.prepare(
+      `INSERT INTO messages_in (id, seq, kind, timestamp, status, series_id, content)
+       VALUES ('task-1', 2, 'task', '2026-01-01T00:00:00.000Z', 'completed', 'dispatch-nightly-ab12', '{}')`,
+    ).run();
+
+    expect(sessionFor(db).hasTaskDispatchEvents()).toBe(false);
+  });
 
   it('rechecks keyed receipts after the S19 intent await even if the admitted task is already terminal', async () => {
     const db = freshInbound();
@@ -872,19 +886,24 @@ describe('S2-PR11 scheduling + thread-close', () => {
     const contextKey = 'phase/raced';
     const session = fakeSession({ id: 'sess-keyed-raced', thread_id: taskThreadId(dispatchSeriesId(contextKey)) });
     calls.intentHook = () => {
-      const admitted = mailbox.dispatchTaskEvent({
-        contextKey,
-        eventKey: 'start',
-        prompt: 'bounded phase',
-        originSessionId: null,
-        platformId: null,
-        channelType: null,
-        threadId: null,
-        muteChat: true,
-        quietStatus: true,
-      });
+      const admitted = mailbox.dispatchTaskEvent(
+        {
+          contextKey,
+          eventKey: 'start',
+          prompt: 'bounded phase',
+          originSessionId: null,
+          platformId: null,
+          channelType: null,
+          threadId: null,
+          muteChat: true,
+          quietStatus: true,
+        },
+        false,
+      );
       db.prepare("UPDATE messages_in SET status = 'completed' WHERE id = ?").run(admitted.rowId);
     };
+
+    expect(mailbox.hasTaskDispatchEvents()).toBe(false);
 
     await duty(SWEEP_DUTY_INVENTORY.S19).run(makeCtx({ session, mailbox }));
 

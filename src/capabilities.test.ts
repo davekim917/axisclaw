@@ -25,6 +25,7 @@ import { SIBLING_BOUND_FIELDS } from './sibling-parity.js';
 import { PRE_TURN_BOUNDS, boundedCapabilities, type ContextNotice } from './modules/memory/pre-turn-context.js';
 import type { AgentGroup } from './types.js';
 import { DEFAULT_FLEET_MCP_SERVERS } from './fleet-mcp-default-servers.js';
+import { resolveScopedCredentialEnv } from './container-runner.js';
 
 // The public export seeds no fleet MCP servers; src/fleet-mcp-default-servers.test.ts keeps the seed non-empty here.
 const itSeeded = it.skipIf(Object.keys(DEFAULT_FLEET_MCP_SERVERS).length === 0);
@@ -221,7 +222,11 @@ describe('buildSessionServicesSnapshot', () => {
   describe('Slack', () => {
     const OWNER_SAFE_MG = 'mg-owner-safe';
 
-    async function slackGroup(opts: { secret: boolean; enabled?: boolean }): Promise<AgentGroup> {
+    async function slackGroup(opts: {
+      secret: boolean;
+      enabled?: boolean;
+      postAsOwner?: boolean;
+    }): Promise<AgentGroup> {
       insertWorkgroup('example-retail', opts.secret ? ['Slack-User-Token-ExampleRetail'] : ['Anthropic']);
       const ag = group('ag-slack', 'example-retail-slack');
       await createGroupInWorkgroup(ag, 'example-retail');
@@ -235,6 +240,7 @@ describe('buildSessionServicesSnapshot', () => {
           ...(opts.enabled === undefined ? {} : { enabled: opts.enabled }),
           also_allowed_in: [OWNER_SAFE_MG],
         },
+        ...(opts.postAsOwner ? { post_as_owner: true } : {}),
       } as Parameters<typeof writeContainerConfig>[1]);
       return ag;
     }
@@ -266,6 +272,30 @@ describe('buildSessionServicesSnapshot', () => {
       expect(slack?.useFor).not.toMatch(/mcp__slack|user-token MCP|MCP \(if loaded\)/);
       // Posting needs an optional scope; the entry must not promise it unconditionally.
       expect(slack?.useFor).toContain('chat:write');
+    });
+
+    it("owner-safe: promises no DM read, and names missing_scope as the token's limit", async () => {
+      const ag = await slackGroup({ secret: true, enabled: true });
+      const slack = await slackEntry(ag.id, OWNER_SAFE_MG);
+
+      expect(slack?.summary).not.toMatch(/DM/);
+      expect(slack?.useFor).not.toMatch(/read a Slack DM/);
+      expect(slack?.useFor).toContain('may exclude DMs, search and files: `missing_scope` is that limit');
+      expect(slack?.useFor).toContain(
+        'a channels-only token instead searches channels with POST `assistant.search.context`',
+      );
+      expect(slack?.useFor).toContain('and cannot search DMs');
+      expect(slack?.useFor).toContain('"channel_types":["public_channel","private_channel"]');
+    });
+
+    it('owner-safe with post_as_owner: points writes at the tools, never at a raw chat.postMessage', async () => {
+      const ag = await slackGroup({ secret: true, enabled: true, postAsOwner: true });
+      const slack = await slackEntry(ag.id, OWNER_SAFE_MG);
+
+      expect(slack?.useFor).toContain('`post_as_owner` tool');
+      expect(slack?.useFor).toContain('`upload_as_owner`');
+      expect(slack?.useFor).not.toContain('chat.postMessage');
+      expect(slack?.useFor?.length).toBeLessThanOrEqual(PRE_TURN_BOUNDS.capabilityDetailChars);
     });
 
     it('owner-safe: the permalink recipe survives the runner fallback’s per-string clip', async () => {
@@ -506,6 +536,76 @@ describe('buildSessionServicesSnapshot', () => {
     expect(entry?.use).toContain('api.tryprofound.com');
   });
 
+  it.each([
+    ['every dbt var set', ['DBT_CLOUD_API_URL', 'DBT_CLOUD_ACCOUNT_ID', 'DBT_HOST', 'DBT_PROD_ENV_ID']],
+    ['no account id', ['DBT_CLOUD_API_URL', 'DBT_HOST', 'DBT_PROD_ENV_ID']],
+    ['no API URL', ['DBT_HOST', 'DBT_PROD_ENV_ID']],
+  ])(
+    'tells a dbt agent the gateway adds the token, naming only env vars its container receives (%s)',
+    async (_name, set) => {
+      insertWorkgroup('example-dbt', []);
+      const ag = group('ag-example-dbt', 'example-dbt');
+      await createGroupInWorkgroup(ag, 'example-dbt');
+      writeContainerConfig(ag.folder, {
+        mcpServers: {},
+        packages: { apt: [], npm: [] },
+        additionalMounts: [],
+        skills: 'all',
+        tools: ['dbt-mcp'],
+      });
+      for (const base of set) vi.stubEnv(`${base}_EXAMPLE_DBT`, `stub-${base.toLowerCase()}`);
+
+      const services = (await buildSessionServicesSnapshot(ag.id)).services.filter((s) =>
+        s.name.startsWith('dbt Cloud'),
+      );
+      expect(services.map((s) => s.name).sort()).toEqual(
+        set.includes('DBT_CLOUD_API_URL') ? ['dbt Cloud', 'dbt Cloud (dbt-mcp)'] : ['dbt Cloud (dbt-mcp)'],
+      );
+
+      const containerEnv = Object.keys(resolveScopedCredentialEnv({}, ag.folder));
+      for (const service of services) {
+        const text = [service.summary, service.activation, service.useFor].join('\n');
+        const named = [...text.matchAll(/\$([A-Z][A-Z0-9_]*)/g)].map((m) => m[1]);
+        if (set.includes('DBT_CLOUD_API_URL')) expect(named.length).toBeGreaterThan(0);
+        expect(containerEnv).toEqual(expect.arrayContaining(named));
+        expect(text).not.toMatch(/Authorization:/);
+      }
+      if (set.includes('DBT_CLOUD_API_URL')) {
+        expect(services.find((s) => s.name === 'dbt Cloud')?.summary).toContain('gateway adds the token');
+      }
+      const dbtMcp = services.find((s) => s.name === 'dbt Cloud (dbt-mcp)');
+      expect(dbtMcp?.useFor).toContain('follow `pagination`');
+      if (set.includes('DBT_CLOUD_ACCOUNT_ID')) {
+        expect(dbtMcp?.useFor).toContain('`list_projects`');
+        expect(dbtMcp?.summary).toContain('job-run history');
+      } else {
+        expect(dbtMcp?.useFor).not.toMatch(/list_projects|list_jobs/);
+        expect(dbtMcp?.summary).not.toContain('job-run history');
+      }
+      expect(JSON.stringify(dbtMcp)).not.toMatch(/execute_sql|text_to_sql|get_related_models|`search`/);
+    },
+  );
+
+  it('describes Looker as gateway-authenticated from the instance URL alone, naming no client credential', async () => {
+    insertWorkgroup('example-bi', []);
+    const ag = group('ag-example-bi', 'example-bi');
+    await createGroupInWorkgroup(ag, 'example-bi');
+    writeContainerConfig(ag.folder, {
+      mcpServers: {},
+      packages: { apt: [], npm: [] },
+      additionalMounts: [],
+      skills: 'all',
+      tools: ['looker'],
+    });
+    vi.stubEnv('LOOKER_BASE_URL_EXAMPLE_BI', 'https://example.cloud.looker.test');
+
+    const looker = (await buildSessionServicesSnapshot(ag.id)).services.find((s) => s.name === 'Looker');
+
+    expect(looker?.summary).toBe('Query explores, run raw SQL, inspect LookML, run saved Looks and dashboards');
+    expect(looker?.useFor).toContain('OneCLI gateway adds a short-lived Looker token');
+    expect(JSON.stringify(looker)).not.toMatch(/LOOKER_CLIENT_|client_secret/);
+  });
+
   it('does not surface Profound without the Profound OneCLI secret', async () => {
     insertWorkgroup('example-labs', []);
     const ag = group('ag-example-labs', 'example-labs');
@@ -734,8 +834,6 @@ describe('buildSessionServicesSnapshot', () => {
         'DBT_HOST',
         'DBT_PROD_ENV_ID',
         'LOOKER_BASE_URL',
-        'LOOKER_CLIENT_ID',
-        'LOOKER_CLIENT_SECRET',
         'ATLASSIAN_BASE_URL',
         'SELECT_ORGANIZATION_ID',
       ]) {
@@ -935,6 +1033,53 @@ describe('buildSessionServicesSnapshot', () => {
       function rosterText(roster: ReturnType<typeof boundedCapabilities>): string {
         return [roster.howToUse, ...roster.services.map((s) => `${s.name} — ${s.via} — ${s.use ?? ''}`)].join('\n');
       }
+
+      it("advertises the folder's own database variables and nothing else", async () => {
+        const ag = await warehouseShaped();
+        vi.stubEnv('RENDER_PG_URL_INITECH_SHOP_MAIN', 'postgres://initech-shop');
+        vi.stubEnv('RENDER_REDIS_URL_INITECH_SHOP_CACHE', 'redis://initech-shop');
+        vi.stubEnv('RENDER_PG_URL_OTHER_INITECH_SHOP_MAIN', 'postgres://other');
+        vi.stubEnv('RENDER_PG_INITECH_SHOP_OLD', 'postgres://old-shape');
+        const render = (await buildSessionServicesSnapshot(ag.id)).services.find((s) => s.name === 'Render');
+        expect(render?.activation).toContain(
+          'Scoped DB URLs also injected as env vars: RENDER_PG_URL_INITECH_SHOP_MAIN, RENDER_REDIS_URL_INITECH_SHOP_CACHE.',
+        );
+      });
+
+      it('routes production Render changes to the approved-run tools only for a group a Render target lists', async () => {
+        const ag = await warehouseShaped();
+        const renderActivation = async () =>
+          (await buildSessionServicesSnapshot(ag.id)).services.find((s) => s.name === 'Render')?.activation ?? '';
+        expect(await renderActivation()).not.toContain('propose_render_change');
+
+        fs.mkdirSync(`${dirs.DATA_DIR}/approved-run`, { recursive: true });
+        const target = (agentGroups: string[]) => ({
+          id: 'initech-render',
+          label: 'Initech Render',
+          kind: 'render',
+          mode: 'execute',
+          agentGroups,
+          approvers: ['slack:U0EXAMPLE1'],
+          execute: { onecliAgent: 'approved-run-initech-render', adminUserId: 'usr-aaaaaaaaaaaaaaaaaaaa' },
+          resources: { 'srv-aaaaaaaaaaaaaaaaaaaa': { label: 'Initech backend', plaintextEnv: [] } },
+        });
+        const write = (agentGroups: string[]) =>
+          fs.writeFileSync(
+            `${dirs.DATA_DIR}/approved-run/targets.json`,
+            JSON.stringify({ targets: [target(agentGroups)] }),
+          );
+
+        write(['ag-someone-else']);
+        expect(await renderActivation()).not.toContain('propose_render_change');
+        write([ag.id]);
+        const text = await renderActivation();
+        expect(text).toContain('Production (Initech backend)');
+        expect(text).toContain('`propose_render_change` with target `initech-render`');
+        expect(text).toContain('`render_env_read`');
+        expect(text).toContain('`RENDER_PG_URL_*`');
+        expect(text).toContain('never the owner connection string from Render');
+        expect(text).toContain('dashboard steps for a human');
+      });
 
       it.each([
         ['cloudflare+wix shape', () => cloudflareWixShaped()],

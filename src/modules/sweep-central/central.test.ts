@@ -19,15 +19,11 @@
  * (7-day receipt retention, 1-day dashboard-token grace, the GitHub App
  * 10-minute refresh margin), without duplicating those files' full suites.
  *
- * F-4.3 (session-title and thread-title caps/cooldowns/backoffs) is split
- * across two SIBLING files in this module directory, not inlined here:
- * `session-title-sweep.test.ts` and `thread-title-retry.test.ts` need
- * mutually incompatible `vi.mock('../../llm.js', ...)` treatments (the
- * session-title half needs llm.js's REAL credential-rotation reset helpers;
- * the thread-title half fully mocks llm.js's `callHaiku`), and `vi.mock` is
- * hoisted per FILE, not per `describe` block — combining them in one file
- * would silently mis-mock one half. Both files carry an `F-4.3a`/`F-4.3b`
- * label in their top describe name so the case is still traceable to F-4.3.
+ * F-4.3 (session-title caps/cooldowns/backoffs) lives in the SIBLING file
+ * `session-title-sweep.test.ts`, not inlined here: it needs llm.js's REAL
+ * credential-rotation reset helpers, and `vi.mock` is hoisted per FILE, not
+ * per `describe` block. Its top describe carries an `F-4.3a` label so the
+ * case is still traceable to F-4.3.
  *
  * Codex review finding (efb8350a..838d84f6, accepted): F-4.1..F-4.3 above
  * call each duty's underlying function DIRECTLY, so a coordinate could be
@@ -36,8 +32,8 @@
  * "the registered duties call their expected dependency" describe below
  * closes that gap for T7/T9/T10/T17 by fetching each duty from the SAME
  * registry accessor R-7 uses (`_listSweepRegistrationsForTesting`, keyed by
- * `SWEEP_DUTY_INVENTORY`) and invoking its `run(ctx)`. T15 and T16 get the
- * same treatment in their own sibling files instead — for the identical
+ * `SWEEP_DUTY_INVENTORY`) and invoking its `run(ctx)`. T15 gets the same
+ * treatment in its own sibling file instead — for the identical
  * `vi.mock` per-file hoisting reason as F-4.3a/b above, since a mocked
  * dependency wrapped in a spy still needs the OTHER exports of that same
  * `vi.mock`'d module (llm.js) to stay real or fully mocked, matching that
@@ -327,8 +323,8 @@ describe('F-4.2 — the GitHub App token refresh acts only inside the refresh ma
 });
 
 // ── Codex finding — the registered duty must call its dependency ───────────
-// T15/T16's equivalent cases live in session-title-sweep.test.ts and
-// thread-title-retry.test.ts (see the file header comment).
+// T15's equivalent cases live in session-title-sweep.test.ts (see the file
+// header comment).
 
 describe('the registered central-housekeeping duties call their expected dependency', () => {
   const fakeTickCtx: SweepTickContext = { now: Date.now(), sessions: [], activeContainerSessionIds: new Set() };

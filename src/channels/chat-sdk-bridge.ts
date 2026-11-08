@@ -33,6 +33,7 @@ import { log } from '../log.js';
 import { SqliteStateAdapter } from '../state-sqlite.js';
 import { registerWebhookAdapter } from '../webhook-server.js';
 import { getAskQuestionRender } from '../db/sessions.js';
+import { neutralizeMentions } from './neutralize-mentions.js';
 import { normalizeOptions, type NormalizedOption } from './ask-question.js';
 import { recordLiveInbound } from './post-deploy-inbound.js';
 import type {
@@ -44,11 +45,14 @@ import type {
   ChannelSetup,
   InboundMessage,
 } from './adapter.js';
+import { readSourcesFooter, renderSourcesFooter, type SubtextMarkup } from '../sources-footer.js';
 
 setAttachmentDownloadDefaults({ limit: INBOUND_ATTACHMENT_MAX_BYTES });
 
 /** Adapter with optional gateway support (e.g., Discord). */
 interface GatewayAdapter extends Adapter {
+  /** Discord's: the Chat SDK thread id of the channel an interaction arrived in. */
+  encodeInteractionThreadId?(interaction: Record<string, unknown>, interactionChannelId: string): string;
   startGatewayListener?(
     options: { waitUntil?: (task: Promise<unknown>) => void },
     durationMs?: number,
@@ -229,9 +233,10 @@ export async function resolveQuotedReply(
  * taken when an adapter declares `transformOutboundText`. `subtext` is an
  * OPTIONAL extension this fork's Slack adapter reads in its postMessage
  * wrapper — the Chat SDK's own postable types have no field for small print,
- * and adapters that do not look for it ignore it harmlessly.
+ * and adapters that do not look for it ignore it harmlessly. `workstreamThread`
+ * is the same kind of extension, read by `installMessageThreadAutoCreate`.
  */
-export type OutboundBody = ({ markdown: string } | { raw: string }) & { subtext?: string };
+export type OutboundBody = ({ markdown: string } | { raw: string }) & { subtext?: string; workstreamThread?: boolean };
 
 export interface ChatSdkBridgeConfig {
   adapter: Adapter;
@@ -284,6 +289,8 @@ export interface ChatSdkBridgeConfig {
    * footer under every reply is worse than none.
    */
   renderSubtext?: (body: OutboundBody, subtext: string) => OutboundBody;
+  /** Link and escaping syntax of the small-print line; without it the sources line renders as plain text. */
+  subtextMarkup?: SubtextMarkup;
   /**
    * Re-verifies a platform-claimed mention against the final text; false demotes it. Slack fires app_mention for
    * `@name` inside code spans.
@@ -480,6 +487,22 @@ export function parseRetryAfterMs(err: unknown): number | null {
  * adding more cannot push a max-length message over the cap.
  */
 const SUBTEXT_BUDGET_OVERHEAD = 8;
+
+/** The small print under a reply: the status subtext and the sources line, each on its own line. */
+function smallPrint(config: ChatSdkBridgeConfig, kind: string, content: Record<string, unknown>): string | null {
+  if (!config.renderSubtext) return null;
+  const status =
+    (kind === 'chat' || kind === 'task_list') && typeof content.subtext === 'string' && content.subtext.trim()
+      ? content.subtext.trim()
+      : null;
+  const segments = kind === 'chat' ? readSourcesFooter(content) : null;
+  const sources = segments ? renderSourcesFooter(segments, config.subtextMarkup) : null;
+  return [status, sources].filter(Boolean).join('\n') || null;
+}
+
+function smallPrintBudget(text: string | null): number {
+  return text ? text.length + SUBTEXT_BUDGET_OVERHEAD * text.split('\n').length : 0;
+}
 
 const SECRET_INTAKE_ACTION_PREFIX = 'ncs:';
 const SECRET_INTAKE_CALLBACK_ID = 'nc-secret-intake';
@@ -704,11 +727,6 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       return config.transformOutboundMarkdown(t, platformId ? { platformId } : undefined);
     return t;
   };
-  // Status text is narration, never an address, but the outbound mention rewriters cannot tell "@Name" in prose about
-  // someone from a live address. A zero-width space after `@` (and after `<` for Slack `<!here>`/`<!subteam^…>`,
-  // Discord `<@&role>`) breaks every rewriter while rendering identically.
-  const neutralizeMentions = (t: string): string =>
-    t.replace(/@(?=[\w\p{L}])/gu, '@\u200b').replace(/<(?=[!@])/g, '<\u200b');
   // Status and task-list text is progress, never a ping: an @ would notify on messages whose edits are otherwise
   // silent.
   const transformStatusOrText = (t: string, kind: string, platformId?: string): string =>
@@ -1138,6 +1156,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         // The button names only a questionId, which any card can carry, so approvals bind the click to this message
         // id.
         const messageId = event.messageId || null;
+        const clickedIn = event.threadId ? adapter.channelIdFromThreadId(event.threadId) : null;
 
         // Resolve render metadata BEFORE dispatching onAction (which deletes the row).
         const render = await getAskQuestionRender(questionId);
@@ -1166,7 +1185,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
                   await thread.postEphemeral(event.user, text, { fallbackToDM: false });
                 }
               : undefined;
-          setupConfig.onAction(questionId, selectedOption, userId, messageId, replyToClicker);
+          setupConfig.onAction(questionId, selectedOption, userId, messageId, replyToClicker, clickedIn);
           return;
         }
         const title = render?.title ?? '❓ Question';
@@ -1306,6 +1325,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       // "discord:guildId:channelId") — use it directly as the thread ID
       const tid = threadId ?? platformId;
       const content = message.content as Record<string, unknown>;
+      const threadHint = isDiscordBridge && message.workstreamThread ? { workstreamThread: true } : {};
 
       if (content.operation === 'edit' && content.messageId) {
         const editText = transformStatusOrText(
@@ -1313,15 +1333,9 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
           message.kind,
           platformId,
         );
-        const editSubtext =
-          (message.kind === 'chat' || message.kind === 'task_list') &&
-          typeof content.subtext === 'string' &&
-          content.subtext.trim() &&
-          config.renderSubtext
-            ? content.subtext.trim()
-            : null;
+        const editSubtext = smallPrint(config, message.kind, content);
         const limit = config.maxTextLength
-          ? Math.max(1, config.maxTextLength - (editSubtext ? editSubtext.length + SUBTEXT_BUDGET_OVERHEAD : 0))
+          ? Math.max(1, config.maxTextLength - smallPrintBudget(editSubtext))
           : undefined;
         const fitted =
           limit && editText.length > limit
@@ -1498,16 +1512,10 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         // cleanup, so chunks 2+ would linger as untracked "thinking" text. Truncate to one chunk; chat replies keep
         // full multi-chunk delivery.
         // The subtext is rendered on chat replies only, not on transient status bubbles.
-        const subtext =
-          (message.kind === 'chat' || message.kind === 'task_list') &&
-          typeof content.subtext === 'string' &&
-          content.subtext.trim() &&
-          config.renderSubtext
-            ? content.subtext.trim()
-            : null;
+        const subtext = smallPrint(config, message.kind, content);
         // Reserve the footer's room BEFORE splitting: Discord spends it inside the text, so a body split to the exact
         // limit and then appended to would be rejected.
-        const subtextBudget = subtext ? subtext.length + SUBTEXT_BUDGET_OVERHEAD : 0;
+        const subtextBudget = smallPrintBudget(subtext);
         const textLimit = config.maxTextLength ? Math.max(1, config.maxTextLength - subtextBudget) : undefined;
         const chunks: string[] =
           textLimit && text.length > textLimit
@@ -1526,8 +1534,10 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
           let attempt = 0;
           let chunkPosted = false;
           while (!chunkPosted) {
+            // A later chunk of a root post, back at channel level, would otherwise open a thread of its own.
+            const sent = i > 0 && threadId === null && chunkTid === tid ? body : { ...body, ...threadHint };
             try {
-              const result = await adapter.postMessage(chunkTid, attachFiles ? { ...body, files: fileUploads } : body);
+              const result = await adapter.postMessage(chunkTid, attachFiles ? { ...sent, files: fileUploads } : sent);
               if (i === 0 && firstId === undefined) {
                 firstId = result?.id;
                 if (config.threadContinuationChunks && threadId === null && firstId) {
@@ -1585,7 +1595,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
           data: f.data,
           filename: f.filename,
         }));
-        const result = await adapter.postMessage(tid, { markdown: '', files: fileUploads });
+        const result = await adapter.postMessage(tid, { markdown: '', files: fileUploads, ...threadHint });
         return result?.id;
       }
     },
@@ -2071,7 +2081,9 @@ async function handleDiscordSecretIntake(interaction: Record<string, unknown>, s
     discordEphemeral(
       result.ok
         ? 'Received. It goes straight to the vault; the card updates when it is stored.'
-        : `${result.message} Nothing was stored. Click the button to try again.`,
+        : result.field
+          ? `${result.message} Nothing was stored. Click the button to try again.`
+          : result.message,
     ),
   );
   return true;
@@ -2112,16 +2124,11 @@ export function startLocalWebhookServer(
           ? handleForwardedEvent(body, adapter, setupConfig, botToken, onConnectionRestored)
           : eventTail.then(() => handleForwardedEvent(body, adapter, setupConfig, botToken, onConnectionRestored));
         if (!urgent) eventTail = handled.catch(() => undefined);
-        handled
-          .then(() => {
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end('{"ok":true}');
-          })
-          .catch((err) => {
-            log.error('Webhook server error', { err });
-            res.writeHead(500);
-            res.end('{"error":"internal"}');
-          });
+        // The adapter sends a channel's next packet only after this answer, so answering once the packet is queued
+        // keeps a button click from waiting out every earlier packet of its thread past Discord's 3 s window.
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end('{"ok":true}');
+        handled.catch((err) => log.error('Webhook server error', { err }));
       });
     });
 
@@ -2172,6 +2179,11 @@ export async function handleForwardedEvent(
         // Approvals bind the click to this message.
         const clickedMessage = (interaction.message as Record<string, unknown> | undefined)?.id;
         const messageId = typeof clickedMessage === 'string' && clickedMessage ? clickedMessage : null;
+        const interactionChannel = interaction.channel_id;
+        const clickedIn =
+          typeof interactionChannel === 'string' && interactionChannel && adapter.encodeInteractionThreadId
+            ? adapter.channelIdFromThreadId(adapter.encodeInteractionThreadId(interaction, interactionChannel))
+            : null;
 
         let questionId: string | undefined;
         let tail: string | undefined;
@@ -2240,7 +2252,7 @@ export async function handleForwardedEvent(
                   if (!res.ok) throw new Error(`Discord follow-up returned ${res.status}`);
                 }
               : undefined;
-          setupConfig.onAction(questionId, selectedOption, user?.id || '', messageId, replyToClicker);
+          setupConfig.onAction(questionId, selectedOption, user?.id || '', messageId, replyToClicker, clickedIn);
           return;
         }
         const cardTitle = render?.title ?? ((originalEmbeds[0]?.title as string) || '❓ Question');

@@ -11,20 +11,24 @@ import sys
 USAGE = """usage:
   smoke-seat-lease.py check <seat>
   smoke-seat-lease.py status [<seat>]
-  smoke-seat-lease.py grant <seat> --to <group> --until <ISO-8601 UTC>
-  smoke-seat-lease.py transfer <seat> --to <group> --until <ISO-8601 UTC>
+  smoke-seat-lease.py grant <seat> --to <group> --until <ISO-8601 UTC> [--run <run-id>]
+  smoke-seat-lease.py transfer <seat> --to <group> --until <ISO-8601 UTC> [--run <run-id>]
   smoke-seat-lease.py release <seat>
 
 A seat is the account's login address. A lease binds it to one agent group
 (the groupName in the host-owned /workspace/agent/container.json) until
 --until. `check` exits 0 when this group may be issued the seat's credential
 and 69 when it may not, printing SEAT_LEASE_REFUSED on stderr. A missing lease
-or one past --until leaves the seat unleased; anything unreadable refuses."""
+or one past --until leaves the seat unleased; anything unreadable refuses.
+
+--run binds the lease to one run as well as one group: `check` then also needs
+SMOKE_SEAT_RUN to name that run, so two runs of one group can't share a seat."""
 
 REFUSED = 69
 NOT_PERMITTED = 3
 SEAT_RE = re.compile(r"[a-z0-9][a-z0-9._+-]*@[a-z0-9.-]+")
 GROUP_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+RUN_ENV = "SMOKE_SEAT_RUN"
 
 
 class Refusal(Exception):
@@ -125,6 +129,8 @@ def read_lease(dfd, seat):
         if not isinstance(lease.get("holder"), str) or not GROUP_RE.fullmatch(lease["holder"]):
             raise ValueError("no usable holder")
         lease["_until"] = parse_time(lease.get("until"))
+        if "run" in lease and not (isinstance(lease["run"], str) and GROUP_RE.fullmatch(lease["run"])):
+            raise ValueError("no usable run")
     except (OSError, ValueError, AttributeError, TypeError) as e:
         raise Refusal("unreadable-lease", seat=seat, detail=str(e))
     return lease
@@ -144,6 +150,8 @@ def check(seat):
             os.close(dfd)
     if live(lease) and lease["holder"] != me:
         raise Refusal("leased-elsewhere", seat=seat, holder=lease["holder"], until=iso(lease["_until"]), caller=me)
+    if live(lease) and "run" in lease and os.environ.get(RUN_ENV) != lease["run"]:
+        raise Refusal("leased-to-run", seat=seat, run=lease["run"], until=iso(lease["_until"]), caller=me)
     return 0
 
 
@@ -164,12 +172,15 @@ def status(seat):
         if lease is None:
             print(json.dumps({"seat": s, "state": "unleased"}))
             continue
-        print(json.dumps({"seat": s, "state": "live" if live(lease) else "expired", "holder": lease["holder"],
-                          "until": iso(lease["_until"])}))
+        row = {"seat": s, "state": "live" if live(lease) else "expired", "holder": lease["holder"],
+               "until": iso(lease["_until"])}
+        if "run" in lease:
+            row["run"] = lease["run"]
+        print(json.dumps(row))
     return 0
 
 
-def write(seat, verb, to, until):
+def write(seat, verb, to, until, run=None):
     me = identity()
     dfd = open_ledger(create=True)
     if dfd is None:
@@ -189,11 +200,16 @@ def write(seat, verb, to, until):
                     seat, verb, "expired " + iso(lease["_until"]) if lease else "unleased"))
             if lease["holder"] != me:
                 return refuse_op("{} is held by {}, not {}".format(seat, lease["holder"], me))
+            if "run" in lease and os.environ.get(RUN_ENV) != lease["run"]:
+                return refuse_op("{} is held by run {}, not this one".format(seat, lease["run"]))
         if verb == "release":
             os.unlink(name, dir_fd=dfd)
             print(json.dumps({"seat": seat, "state": "unleased", "releasedBy": me}))
             return 0
         record = {"seat": seat, "holder": to, "until": iso(until), "grantedBy": me, "at": iso(now())}
+        run = run or (lease.get("run") if verb == "transfer" else None)
+        if run:
+            record["run"] = run
         tmp = ".{}.{}".format(name, os.getpid())
         tfd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=dfd)
         with os.fdopen(tfd, "w") as f:
@@ -221,7 +237,7 @@ def main(argv):
     opts, args = {}, []
     while rest:
         a = rest.pop(0)
-        if a in ("--to", "--until"):
+        if a in ("--to", "--until", "--run"):
             if not rest:
                 usage(a + " needs a value")
             opts[a] = rest.pop(0)
@@ -234,16 +250,18 @@ def main(argv):
             return status(seat_arg(args[0]) if args else None)
         if verb == "release" and len(args) == 1 and not opts:
             return write(seat_arg(args[0]), verb, None, None)
-        if verb in ("grant", "transfer") and len(args) == 1 and set(opts) == {"--to", "--until"}:
+        if verb in ("grant", "transfer") and len(args) == 1 and set(opts) - {"--run"} == {"--to", "--until"}:
             if not GROUP_RE.fullmatch(opts["--to"]):
                 usage("not a group name: {!r}".format(opts["--to"]))
+            if "--run" in opts and not GROUP_RE.fullmatch(opts["--run"]):
+                usage("not a run id: {!r}".format(opts["--run"]))
             try:
                 until = parse_time(opts["--until"])
             except ValueError:
                 usage("--until must be an ISO-8601 time with a zone")
             if until <= now():
                 usage("--until is not in the future")
-            return write(seat_arg(args[0]), verb, opts["--to"], until)
+            return write(seat_arg(args[0]), verb, opts["--to"], until, opts.get("--run"))
     except Refusal as r:
         fields = " ".join("{}={}".format(k, v) for k, v in r.fields.items())
         print("SEAT_LEASE_REFUSED reason={} {}".format(r.reason, fields).rstrip(), file=sys.stderr)

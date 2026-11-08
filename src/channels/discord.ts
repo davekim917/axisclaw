@@ -17,15 +17,21 @@ import {
 } from 'discord.js';
 
 import { getDb } from '../db/connection.js';
+import { isRelayCopy, loadRelayPosts } from '../discord-relay-posts.js';
 import { readEnvFileMatching } from '../env.js';
 import { log } from '../log.js';
 import { getOwners } from '../modules/permissions/db/user-roles.js';
 import { transformOutsideProtectedRegions } from '../text-styles.js';
-import { createChatSdkBridge, type ReplyContext } from './chat-sdk-bridge.js';
+import { createChatSdkBridge, type OutboundBody, type ReplyContext } from './chat-sdk-bridge.js';
 import { createAdapterLogger } from './post-deploy-inbound.js';
 import { registerChannelAdapter } from './channel-registry.js';
 import { linkDiscordChannelNames, warmChannelDirectory } from './channel-links.js';
-import type { ChannelRecoveryRequest, ChannelRecoveryTarget } from './adapter.js';
+import {
+  ChannelRateLimitedError,
+  MAX_THREAD_NAME_CHARS,
+  type ChannelRecoveryRequest,
+  type ChannelRecoveryTarget,
+} from './adapter.js';
 
 interface DiscordRecoveryThread {
   id: string;
@@ -90,6 +96,16 @@ function classifyDiscordRecoveryError(err: unknown): 'permanent' | 'transient' {
   return message.includes('Unknown Channel') || message.includes('Unknown Guild') || message.includes('Missing Access')
     ? 'permanent'
     : 'transient';
+}
+
+/** Discord's small print is a `-# ` line prefix, so each line of a multi-line subtext needs its own. */
+export function renderDiscordSubtext(body: OutboundBody, subtext: string): OutboundBody {
+  if (!('markdown' in body)) return body;
+  const small = subtext
+    .split('\n')
+    .map((line) => `-# ${line}`)
+    .join('\n');
+  return { ...body, markdown: `${body.markdown}\n${small}` };
 }
 
 export async function discoverDiscordRecoveryTargets(
@@ -335,6 +351,20 @@ export function isUserMessage(message: { raw?: any }): boolean {
   return NON_SYSTEM_TYPES.has(type);
 }
 
+/** Also drops a sibling bot's post that carried someone's reply from the phone app: it reached the agent as theirs. */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export function isDiscordInbound(message: { id: string; author: { userId: string }; raw?: any }): boolean {
+  if (!isUserMessage(message)) return false;
+  const raw = message.raw;
+  return !isRelayCopy({
+    authorId: message.author.userId,
+    channelId: String(raw?.channel_id ?? raw?.channelId ?? ''),
+    messageId: message.id,
+    content: typeof raw?.content === 'string' ? raw.content : '',
+    nonce: raw?.nonce,
+  });
+}
+
 const MARKDOWN_LINK_PATTERN = /\[([^\]]+)\]\(([^)]+)\)/g;
 const BARE_URL_PATTERN = new RegExp(String.raw`https?:\/\/[^\s<>()\[\]]+`, 'g');
 const URL_SHAPED_TEXT_PATTERN = /https?:\/\//;
@@ -393,7 +423,11 @@ export function rewriteDiscordLinks(text: string): string {
 export interface DiscordBotIdentity {
   userId: string;
   username: string;
+  /** The bot's own avatar on Discord's CDN; absent when it has none and shows Discord's default. */
+  avatarUrl?: string;
 }
+
+const DISCORD_AVATAR_SIZE = 256;
 
 const knownDiscordBots = new Map<string, DiscordBotIdentity>();
 
@@ -440,9 +474,12 @@ async function fetchDiscordBotIdentity(botToken: string): Promise<DiscordBotIden
       log.warn('Discord bot identity fetch non-OK', { status: res.status });
       return null;
     }
-    const user = (await res.json()) as { id?: string; username?: string };
+    const user = (await res.json()) as { id?: string; username?: string; avatar?: string | null };
     if (!user.id || !user.username) return null;
-    return { userId: user.id, username: user.username };
+    const avatarUrl = user.avatar
+      ? `https://cdn.discordapp.com/avatars/${user.id}/${user.avatar}.png?size=${DISCORD_AVATAR_SIZE}`
+      : undefined;
+    return { userId: user.id, username: user.username, ...(avatarUrl ? { avatarUrl } : {}) };
   } catch (err) {
     log.warn('Discord bot identity fetch failed', {
       err: err instanceof Error ? err.message : String(err),
@@ -601,8 +638,6 @@ export async function discordCreateThread(
   return { threadId: thread.id, messageId: firstMsg.id };
 }
 
-const DISCORD_THREAD_NAME_MAX = 100;
-
 /** The post's first non-empty line, Markdown punctuation stripped, capped at Discord's limit. */
 export function discordThreadNameFrom(content: string | undefined): string {
   const line =
@@ -617,13 +652,60 @@ export function discordThreadNameFrom(content: string | undefined): string {
       .find((l) => l.length > 0) ?? '';
   const points = Array.from(line);
   if (points.length === 0) return 'Continued';
-  if (points.length <= DISCORD_THREAD_NAME_MAX) return line;
+  if (points.length <= MAX_THREAD_NAME_CHARS) return line;
   return (
     points
-      .slice(0, DISCORD_THREAD_NAME_MAX - 1)
+      .slice(0, MAX_THREAD_NAME_CHARS - 1)
       .join('')
       .trimEnd() + '…'
   );
+}
+
+const DEFAULT_RETRY_AFTER_S = 1;
+
+/**
+ * Plain fetch, not `rest`: @discordjs/rest sleeps through a rate limit for as long as the reset takes, and a thread
+ * rename limit can run to minutes. These fail at once and hand the wait from the response to the caller.
+ */
+async function discordThreadCall(
+  botToken: string,
+  threadId: string,
+  forbidden: string,
+  init?: RequestInit,
+): Promise<{ name?: string }> {
+  const id = threadId.split(':').pop() ?? '';
+  if (!SNOWFLAKE.test(id)) throw new Error(`Not a Discord thread id: ${threadId}`);
+  const res = await fetch(`${discordApiUrl()}/channels/${id}`, {
+    ...init,
+    headers: {
+      Authorization: `Bot ${botToken}`,
+      'Content-Type': 'application/json',
+      'User-Agent': 'nanoclaw-v2 (thread-title, v2)',
+    },
+    signal: AbortSignal.timeout(DISCORD_REST_TIMEOUT_MS),
+  });
+  if (res.status === 429) {
+    throw new ChannelRateLimitedError((Number(res.headers.get('retry-after')) || DEFAULT_RETRY_AFTER_S) * 1000);
+  }
+  if (res.status === 403) throw new Error(forbidden);
+  if (!res.ok) throw new Error(`Discord thread call failed: ${res.status}`);
+  return (await res.json()) as { name?: string };
+}
+
+export async function discordThreadName(botToken: string, threadId: string): Promise<string> {
+  const { name } = await discordThreadCall(botToken, threadId, 'Discord does not let this bot see this thread.');
+  if (!name) throw new Error(`Discord returned no name for thread ${threadId}`);
+  return name;
+}
+
+export async function discordRenameThread(botToken: string, threadId: string, name: string): Promise<string> {
+  const renamed = await discordThreadCall(
+    botToken,
+    threadId,
+    'Discord refused: this bot needs the Manage Threads permission, or to be the one that created the thread.',
+    { method: 'PATCH', body: JSON.stringify({ name }) },
+  );
+  return renamed.name ?? name;
 }
 
 export interface DiscordThreadRestClient {
@@ -692,7 +774,7 @@ export async function openRecoveredMentionThread(
   if (scheme !== 'discord' || !guildId || guildId === '@me' || !channelId || threadId) return null;
   try {
     await rest.post(Routes.threads(channelId, message.id), {
-      // Provisional: maybeRenameNewThread retitles it.
+      // Provisional: the title sweep renames it.
       body: {
         name: discordThreadNameFrom(message.text?.replace(/<@!?\d+>/g, '')),
         auto_archive_duration: ThreadAutoArchiveDuration.OneWeek,
@@ -726,6 +808,10 @@ function isDiscordUnknownChannelError(err: unknown): boolean {
  * from the message first; until then the post 404s (10003). On exactly that 404, open a thread on the message and
  * retry once (160004 means a concurrent creator won; retry anyway). Any other failure rethrows the ORIGINAL error so
  * callers keep their root-post fallbacks.
+ *
+ * A workstream root post opens its thread at once: until a thread exists the channel's thread list does not show the
+ * work, and a session looking for it opens another. Failing here leaves the post delivered and the 404 path above
+ * opens the thread on the next post, so the failure only logs.
  */
 export function installMessageThreadAutoCreate(
   adapter: ReturnType<typeof createDiscordAdapter>,
@@ -733,39 +819,63 @@ export function installMessageThreadAutoCreate(
   addThreadMembers: (rest: DiscordThreadRestClient, threadId: string) => Promise<void> = addDiscordThreadMembers,
 ): void {
   const target = adapter as unknown as {
-    postMessage: (threadId: string, message: unknown) => Promise<unknown>;
+    postMessage: (threadId: string, message: unknown) => Promise<{ id?: string } | undefined>;
   };
   const original = target.postMessage.bind(adapter);
-  target.postMessage = async (threadId, message) => {
+
+  const openThread = async (channelId: string, messageId: string, workstreamThread: boolean | undefined) => {
+    let name = 'Continued';
     try {
-      return await original(threadId, message);
+      const parent = (await rest.get(Routes.channelMessage(channelId, messageId))) as { content?: string };
+      name = discordThreadNameFrom(parent.content);
+    } catch {
+      // Unreadable parent: the thread-create call below decides whether the id is usable.
+    }
+    try {
+      await rest.post(Routes.threads(channelId, messageId), {
+        body: {
+          name,
+          auto_archive_duration: workstreamThread
+            ? ThreadAutoArchiveDuration.OneWeek
+            : ThreadAutoArchiveDuration.OneDay,
+        },
+      });
+    } catch (createErr) {
+      if ((createErr as { code?: unknown }).code === RESTJSONErrorCodes.ThreadAlreadyCreatedForMessage) return;
+      throw createErr;
+    }
+    log.info('Discord thread opened under anchor message', { channelId, messageId });
+    // Best-effort; the retried post does not wait on it.
+    void addThreadMembers(rest, messageId);
+  };
+
+  target.postMessage = async (threadId, message) => {
+    const [scheme, guildId, channelId, messageId] = threadId.split(':');
+    const { workstreamThread } = message as OutboundBody;
+    try {
+      const posted = await original(threadId, message);
+      if (workstreamThread && scheme === 'discord' && guildId !== '@me' && channelId && !messageId && posted?.id) {
+        await openThread(channelId, posted.id, workstreamThread).catch((err: unknown) => {
+          log.warn('Discord thread open for a workstream post failed; the next post retries', {
+            channelId,
+            messageId: posted.id,
+            err: err instanceof Error ? err.message : String(err),
+          });
+        });
+      }
+      return posted;
     } catch (err) {
-      const [scheme, guildId, channelId, messageId] = threadId.split(':');
       if (scheme !== 'discord' || guildId === '@me' || !channelId || !messageId) throw err;
       if (!isDiscordUnknownChannelError(err)) throw err;
       try {
-        let name = 'Continued';
-        try {
-          const parent = (await rest.get(Routes.channelMessage(channelId, messageId))) as { content?: string };
-          name = discordThreadNameFrom(parent.content);
-        } catch {
-          // Unreadable parent: the thread-create call below decides whether the id is usable.
-        }
-        await rest.post(Routes.threads(channelId, messageId), {
-          body: { name, auto_archive_duration: ThreadAutoArchiveDuration.OneDay },
-        });
-        log.info('Discord thread opened under anchor message', { channelId, messageId });
-        // Best-effort; the retried post does not wait on it.
-        void addThreadMembers(rest, messageId);
+        await openThread(channelId, messageId, workstreamThread);
       } catch (createErr) {
-        if ((createErr as { code?: unknown }).code !== RESTJSONErrorCodes.ThreadAlreadyCreatedForMessage) {
-          log.warn('Discord thread auto-create failed', {
-            channelId,
-            messageId,
-            err: createErr instanceof Error ? createErr.message : String(createErr),
-          });
-          throw err;
-        }
+        log.warn('Discord thread auto-create failed', {
+          channelId,
+          messageId,
+          err: createErr instanceof Error ? createErr.message : String(createErr),
+        });
+        throw err;
       }
       return original(threadId, message);
     }
@@ -819,6 +929,7 @@ const workspaces = parseDiscordWorkspaces(
 for (const ws of workspaces) {
   registerChannelAdapter(ws.channelType, {
     factory: async () => {
+      await loadRelayPosts();
       // Registers this bot's identity so siblings can resolve `@username` → `<@id>`.
       const identity = await fetchDiscordBotIdentity(ws.botToken);
       if (identity) {
@@ -861,11 +972,11 @@ for (const ws of workspaces) {
           linkDiscordChannelNames(rewriteDiscordLinks(resolveDiscordMentions(text)), destination?.platformId),
         // Discord subtext is plain `-# ` at the start of a line, so the footer rides in the body. The explicit
         // newline is required, and the outbound transform above must not run over the footer.
-        renderSubtext: (body, subtext) =>
-          'markdown' in body ? { ...body, markdown: `${body.markdown}\n-# ${subtext}` } : body,
+        renderSubtext: renderDiscordSubtext,
+        subtextMarkup: 'discord-markdown',
         // Rewrites raw `<@snowflake>` to `@bot_username` for sibling bots.
         transformInboundText: (text) => resolveIncomingDiscordMentions(text),
-        inboundFilter: isUserMessage,
+        inboundFilter: isDiscordInbound,
         detectRecoveredMention: (message) => {
           if (!identity) return false;
           const raw = message.raw as { mentions?: Array<{ id?: string }> } | undefined;
@@ -892,6 +1003,8 @@ for (const ws of workspaces) {
         void addDiscordThreadMembers(rest, created.threadId);
         return created;
       };
+      bridge.threadName = (threadId) => discordThreadName(ws.botToken, threadId);
+      bridge.renameThread = (threadId, name) => discordRenameThread(ws.botToken, threadId, name);
       return bridge;
     },
   });

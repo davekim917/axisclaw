@@ -57,6 +57,15 @@ describe('speakerOf', () => {
 });
 
 describe('requestFromTurn', () => {
+  it('shows the only person on the call everything they said, and still drops an exact re-send', () => {
+    const turn = 'Can you check whether the deploy finished?';
+    expect(requestFromTurn(turn, isName, null, 0, true)).toEqual({ text: turn, shown: turn });
+    const named = 'Stop the deployment. Pixel, check the logs.';
+    expect(requestFromTurn(named, isName, null, 0, true)).toEqual({ text: named, shown: named });
+    expect(requestFromTurn(turn, isName, { turn, atMs: 0 }, 1_000, true)).toBe('duplicate');
+    expect(requestFromTurn('   ', isName, null, 0, true)).toBeNull();
+  });
+
   it.each([
     [
       'chatter before the request, shown from where the agent is spoken to',
@@ -82,8 +91,9 @@ describe('requestFromTurn', () => {
     expect(requestFromTurn(turn, isName)).toEqual({ text: turn, shown });
   });
 
-  it('hands over nothing when the agent is never named', () => {
-    expect(requestFromTurn('Somebody should look into it after lunch.', isName)).toBeNull();
+  it('hands over a turn whose text never names the agent, and shows the thread a placeholder', () => {
+    const turn = 'Pickle, rerun the tests';
+    expect(requestFromTurn(turn, isName)).toEqual({ text: turn, shown: UNNAMED_SHOWN });
   });
 
   it.each([

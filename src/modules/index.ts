@@ -29,6 +29,9 @@ import './remote-control/index.js';
 import './channel-auto-wire/index.js';
 // Bash-gate depends on approvals and the delivery action registry, both loaded above.
 import './bash-gate/index.js';
+import './approved-run/index.js';
+// Post-as-owner reuses the bash-gate card helpers, loaded above.
+import './post-as-owner/index.js';
 import './orchestrator-dispatch/index.js';
 import './sweep-orchestrator/index.js';
 import './backlog/index.js';
@@ -39,6 +42,8 @@ import './scheduled-wake/index.js';
 import './provider-fallback/index.js';
 import './repository-workspaces/index.js';
 import './sweep-storage/index.js';
+import './sweep-oauth-slots/index.js';
+import './sweep-codex-rollouts/index.js';
 
 import './escalation/index.js';
 
@@ -57,6 +62,8 @@ import './sweep-session-core/index.js';
 
 import './sweep-continuation/index.js';
 import './sweep-promise-watch/index.js';
+import './open-asks/index.js';
+import './sweep-team-search/index.js';
 
 import './sweep-scheduling/index.js';
 
@@ -64,3 +71,4 @@ import './sweep-task-escalation/index.js';
 import './sweep-orphan-containers/index.js';
 
 import './mcp-oauth/index.js';
+import './email-signatures/index.js';

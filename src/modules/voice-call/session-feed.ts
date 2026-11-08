@@ -82,7 +82,7 @@ function deliveredEvent(event: DeliveredOutbound, sessionId: string, route: Call
   return { type: 'reply', text, inReplyTo: event.inReplyTo };
 }
 
-export function startupContext(events: FeedEvent[], agentName: string): string {
+export function startupContext(events: FeedEvent[], agentName: string, platform: string): string {
   const lines: string[] = [];
   let remaining = STARTUP_CONTEXT_BYTES;
   for (const event of [...events].reverse()) {
@@ -96,7 +96,7 @@ export function startupContext(events: FeedEvent[], agentName: string): string {
     remaining -= size;
   }
   if (lines.length === 0) return '';
-  return `Recent messages in this Slack thread, oldest first. Background only; do not read them back unless asked:\n${lines.join('\n')}`;
+  return `Recent messages in this ${platform} thread, oldest first. Background only; do not read them back unless asked:\n${lines.join('\n')}`;
 }
 
 function recentThread(agentGroupId: string, route: CallRoute): FeedEvent[] {

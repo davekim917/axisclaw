@@ -87,9 +87,10 @@ import { createUser } from '../permissions/db/users.js';
 // Production order: approvals, then interactive (src/modules/index.ts:22-23).
 import './index.js';
 import '../interactive/index.js';
+import { recordCardCopy } from './card-copies.js';
 import { registerChoiceHandler, type ChoiceHandlerContext } from './choices.js';
 import { ONECLI_ACTION } from './onecli-approvals.js';
-import { registerApprovalHandler } from './primitive.js';
+import { editApprovalCard, registerApprovalHandler } from './primitive.js';
 import { handleApprovalsResponse } from './response-handler.js';
 
 const AG = 'ag-click';
@@ -155,15 +156,24 @@ function setupFor(channelType: string): ChannelSetup {
   };
 }
 
-/** A click through the Chat SDK dispatch: button `index` of `questionId`, made on message `messageId`. */
-async function click(questionId: string, index: number, clicker: string, messageId: string): Promise<void> {
+/**
+ * A click through the Chat SDK dispatch: button `index` of `questionId`, made on message `messageId` in thread
+ * `threadId`, which the stub adapter maps to conversation `stub:<threadId>`.
+ */
+async function click(
+  questionId: string,
+  index: number,
+  clicker: string,
+  messageId: string,
+  threadId = 'T-1',
+): Promise<void> {
   await (captured.chat as Chat).processAction(
     {
       actionId: `ncq:${questionId}:${index}`,
       adapter: bridgeAdapter,
       messageId,
       raw: {},
-      threadId: 'T-1',
+      threadId,
       user: { userId: clicker, userName: clicker } as never,
       value: String(index),
     },
@@ -172,13 +182,14 @@ async function click(questionId: string, index: number, clicker: string, message
   await Promise.all(dispatches.splice(0));
 }
 
-/** The same click on Discord, as the gateway forwards the interaction. */
+/** The same click on Discord, as the gateway forwards the interaction; `dmChannel` makes it a click in that DM. */
 async function discordClick(
   questionId: string,
   index: number,
   clicker: string,
   messageId: string,
   applicationId?: string,
+  dmChannel?: string,
 ): Promise<void> {
   vi.stubGlobal(
     'fetch',
@@ -198,9 +209,17 @@ async function discordClick(
         data: { custom_id: `ncq:${questionId}:${index}\n${index}` },
         member: { user: { id: clicker } },
         message: { id: messageId, content: 'Run this?' },
+        ...(dmChannel ? { channel_id: dmChannel } : {}),
       },
     }),
-    { name: 'gateway-stub', handleWebhook: vi.fn(async () => new Response('ok')) } as unknown as Adapter,
+    {
+      name: 'gateway-stub',
+      handleWebhook: vi.fn(async () => new Response('ok')),
+      // The Discord adapter's own encoding: a DM interaction (no guild) is `discord:@me:<channel>`.
+      encodeInteractionThreadId: (interaction: Record<string, unknown>, channel: string) =>
+        `discord:${(interaction.guild_id as string | undefined) ?? '@me'}:${channel}`,
+      channelIdFromThreadId: (threadId: string) => threadId,
+    } as unknown as Adapter,
     setupFor('discord'),
     'bot-token',
   );
@@ -783,5 +802,162 @@ describe('an accepted press edits the card the approval row names', () => {
     expect(deliveries).toEqual([
       expect.objectContaining({ operation: 'edit', messageId: 'real-dm-card', text: 'Run this?\n\nReject — Owner' }),
     ]);
+  });
+});
+
+describe('a copy of the card in a DM', () => {
+  /** Records the host's copy of `approvalId` at `messageId` in conversation `platformId`, as the card pointer does. */
+  async function copy(approvalId: string, platformId: string, messageId: string, channelType = 'slack'): Promise<void> {
+    expect(
+      await recordCardCopy(approvalId, {
+        channel_type: channelType,
+        platform_id: platformId,
+        instance: null,
+        platform_message_id: messageId,
+      }),
+    ).toBe(true);
+  }
+  const edited = () => deliveries.filter((d) => d.operation === 'edit').map((d) => d.messageId);
+
+  it('a press on the copy answers the card, and the host closes the card and the copy', async () => {
+    await seedChoice('appr-copy', 'real-card');
+    await copy('appr-copy', 'stub:DM-1', 'copy-card');
+
+    await click('appr-copy', 0, 'UOWNER', 'copy-card', 'DM-1');
+
+    expect(answered.map((a) => [a.approval.approval_id, a.value])).toEqual([['appr-copy', 'ship']]);
+    expect(edited()).toEqual(['real-card', 'copy-card']);
+    expect(deliveries.every((d) => d.clearActions === true)).toBe(true);
+  });
+
+  it('with two copies recorded, a press on either copy counts and all three are closed', async () => {
+    await seedChoice('appr-copy', 'real-card');
+    await copy('appr-copy', 'stub:DM-1', 'copy-1');
+    await copy('appr-copy', 'stub:DM-2', 'copy-2');
+
+    await click('appr-copy', 0, 'UOWNER', 'copy-2', 'DM-2');
+
+    expect(answered).toHaveLength(1);
+    expect(edited()).toEqual(['real-card', 'copy-1', 'copy-2']);
+  });
+
+  it('a second press, on either the card or the copy, runs nothing', async () => {
+    await seedChoice('appr-copy', 'real-card');
+    await copy('appr-copy', 'stub:DM-1', 'copy-card');
+    await click('appr-copy', 0, 'UOWNER', 'copy-card', 'DM-1');
+
+    await click('appr-copy', 0, 'UOWNER', 'copy-card', 'DM-1');
+    await click('appr-copy', 1, 'UOWNER', 'real-card');
+
+    expect(answered).toHaveLength(1);
+  });
+
+  it('a press on the card itself also closes the copy', async () => {
+    await seedChoice('appr-copy', 'real-card');
+    await copy('appr-copy', 'stub:DM-1', 'copy-card');
+
+    await click('appr-copy', 1, 'UOWNER', 'real-card');
+
+    expect(answered.map((a) => a.value)).toEqual(['hold']);
+    expect(edited()).toEqual(['real-card', 'copy-card']);
+  });
+
+  it('someone the card does not name is refused on the copy, and nothing is closed', async () => {
+    await createUser({ id: 'slack:UMORGAN', kind: 'slack', display_name: 'Morgan', created_at: now() });
+    await seedChoice('appr-copy', 'real-card', ['slack:UMORGAN']);
+    await copy('appr-copy', 'stub:DM-1', 'copy-card');
+
+    await click('appr-copy', 0, 'UOWNER', 'copy-card', 'DM-1');
+
+    expect(answered).toEqual([]);
+    expect((await getPendingApproval('appr-copy'))?.status).toBe('pending');
+    expect(edited()).toEqual([]);
+    expect(ephemerals.map((e) => e.message)).toEqual(['Only Morgan can answer this card. Your click did not count.']);
+  });
+
+  it('an agent-posted card in the same DM, carrying the real approval id, is refused', async () => {
+    await seedChoice('appr-copy', 'real-card');
+    await copy('appr-copy', 'stub:DM-1', 'copy-card');
+    await agentCard('appr-copy', 'Dismiss', 'ship');
+    const warn = vi.spyOn(log, 'warn');
+
+    await click('appr-copy', 0, 'UOWNER', 'agent-card', 'DM-1');
+
+    expect(answered).toEqual([]);
+    expect((await getPendingApproval('appr-copy'))?.status).toBe('pending');
+    expect(warn).toHaveBeenCalledWith(REFUSED, expect.objectContaining({ clickedMessageId: 'agent-card' }));
+  });
+
+  it("the copy's message id in another conversation is refused", async () => {
+    await seedChoice('appr-copy', 'real-card');
+    await copy('appr-copy', 'stub:DM-1', 'copy-card');
+
+    await click('appr-copy', 0, 'UOWNER', 'copy-card', 'DM-OTHER');
+
+    expect(answered).toEqual([]);
+    expect((await getPendingApproval('appr-copy'))?.status).toBe('pending');
+  });
+
+  it("a click from another channel's adapter on the copy's conversation and message id is refused", async () => {
+    await seedChoice('appr-copy', 'real-card');
+    await copy('appr-copy', 'stub:DM-1', 'copy-card', 'discord');
+
+    await click('appr-copy', 0, 'UOWNER', 'copy-card', 'DM-1');
+
+    expect(answered).toEqual([]);
+  });
+
+  it('two cards open in one DM never cross: a press answers the card it was made on, and only that one', async () => {
+    await seedChoice('appr-a', 'real-a');
+    await seedChoice('appr-b', 'real-b');
+    await copy('appr-a', 'stub:DM-1', 'copy-a');
+    await copy('appr-b', 'stub:DM-1', 'copy-b');
+
+    // One card's id on the other card's message: refused, whichever way round.
+    await click('appr-a', 0, 'UOWNER', 'copy-b', 'DM-1');
+    await click('appr-b', 0, 'UOWNER', 'copy-a', 'DM-1');
+    expect(answered).toEqual([]);
+
+    await click('appr-b', 0, 'UOWNER', 'copy-b', 'DM-1');
+
+    expect(answered.map((a) => a.approval.approval_id)).toEqual(['appr-b']);
+    expect((await getPendingApproval('appr-a'))?.status).toBe('pending');
+    expect(edited()).toEqual(['real-b', 'copy-b']);
+  });
+
+  it('Discord: a press on the copy in a DM approves, and the host closes both', async () => {
+    await seedGate('appr-d-copy', {
+      sessionId: 'sess-dm',
+      channelType: 'discord',
+      platformId: 'discord:guild-1:work',
+      platformMessageId: 'discord-card',
+    });
+    await copy('appr-d-copy', 'discord:@me:dm-owner', 'discord-copy', 'discord');
+
+    await discordClick('appr-d-copy', 0, 'downer', 'discord-copy', undefined, 'dm-owner');
+
+    expect(approved).toEqual([{ approvalId: 'appr-d-copy', userId: DISCORD_OWNER }]);
+    expect(edited()).toEqual(['discord-card', 'discord-copy']);
+  });
+
+  it('an edit whose re-read of the row fails still closes the card and the copies it holds, and never throws', async () => {
+    await seedChoice('appr-copy', 'real-card');
+    await copy('appr-copy', 'stub:DM-1', 'copy-card');
+    const held = (await getPendingApproval('appr-copy'))!;
+    await closeDb();
+
+    await expect(editApprovalCard(held, 'answered')).resolves.toBeUndefined();
+
+    expect(edited()).toEqual(['real-card', 'copy-card']);
+  });
+
+  it('a copy recorded after the answering press read the row is still closed', async () => {
+    await seedChoice('appr-copy', 'real-card');
+    const readEarlier = (await getPendingApproval('appr-copy'))!;
+    await copy('appr-copy', 'stub:DM-1', 'copy-card');
+
+    await editApprovalCard(readEarlier, 'answered');
+
+    expect(edited()).toEqual(['real-card', 'copy-card']);
   });
 });

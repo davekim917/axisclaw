@@ -4,6 +4,7 @@ import path from 'path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
+  effectiveSourcesFooter,
   configFromDb,
   mcpServerPluginOwner,
   opaqueUrlParts,
@@ -193,6 +194,34 @@ describe('readContainerConfigStrict', () => {
 });
 
 describe('readContainerConfig — resource block', () => {
+  it('test_sources_footer_on_unless_file_says_false', () => {
+    writeGroupConfig('test-footer-unset', {
+      mcpServers: {},
+      packages: { apt: [], npm: [] },
+      additionalMounts: [],
+      skills: 'all',
+    });
+    writeGroupConfig('test-footer-true', {
+      mcpServers: {},
+      packages: { apt: [], npm: [] },
+      additionalMounts: [],
+      skills: 'all',
+      sourcesFooter: true,
+    });
+    writeGroupConfig('test-footer-false', {
+      mcpServers: {},
+      packages: { apt: [], npm: [] },
+      additionalMounts: [],
+      skills: 'all',
+      sourcesFooter: false,
+    });
+
+    expect(effectiveSourcesFooter(readContainerConfig('test-footer-unset'))).toBe(true);
+    expect(effectiveSourcesFooter(readContainerConfig('test-footer-true'))).toBe(true);
+    expect(readContainerConfig('test-footer-false').sourcesFooter).toBe(false);
+    expect(effectiveSourcesFooter(readContainerConfig('test-footer-false'))).toBe(false);
+  });
+
   it('test_container_resources_round_trip', () => {
     writeGroupConfig('test-resources', {
       mcpServers: {},
@@ -755,6 +784,19 @@ describe('autoCompactWindow (quota-burn plan §0.5)', () => {
     }
     writeGroupConfig('acw-floor', { autoCompactWindow: MIN_AUTO_COMPACT_WINDOW });
     expect(readContainerConfig('acw-floor').autoCompactWindow).toBe(MIN_AUTO_COMPACT_WINDOW);
+  });
+});
+
+describe('browserSso', () => {
+  it('survives a rewrite of the file by another writer', async () => {
+    const browserSso = { example: ['login.idp.example'] };
+    writeGroupConfig('sso-keep', { browserSso });
+
+    await updateContainerConfig('sso-keep', (config) => {
+      config.model = 'example-model';
+    });
+
+    expect(readContainerConfig('sso-keep').browserSso).toEqual(browserSso);
   });
 });
 

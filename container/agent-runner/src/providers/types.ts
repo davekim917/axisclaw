@@ -36,7 +36,7 @@ export interface AgentProvider {
    */
   isContextTooLong?(err: unknown): boolean;
 
-  /** Transient upstream failure (429, overloaded, upstream_error) that warrants `rotateApiKey` before a retry. */
+  /** A failure another credential may not hit (429, overloaded, upstream_error, a refused token): `rotateApiKey`, retry. */
   isRetryable?(err: unknown): boolean;
 
   /**
@@ -65,6 +65,15 @@ export interface AgentProvider {
    * `ringSize` the ring length; the poll-loop tells the replayed turn it runs on a different credential.
    */
   rotateApiKey?(): { rotated: boolean; slot?: string; position?: number; ringSize?: number };
+
+  /**
+   * The active credential slot, when `err` says its whole account is spent until a window resets (not a
+   * model-scoped limit, not a transient error). Called before `rotateApiKey` moves off it.
+   */
+  spentCredential?(err: unknown): { slot: string; fingerprint: string; resetAt: string | null } | null;
+
+  /** Whether the most recent query started any tool call; absent means unknown, which callers treat as true. */
+  lastAttemptActed?(): boolean;
 
   /**
    * Whether resuming `continuation` provably loads `prompt` as a user message recorded at or after `sinceMs`, so
@@ -211,6 +220,8 @@ interface StdioMcpServerConfig {
   cwd?: string;
   /** Consumed and stripped by plugin-mcp.ts before the config reaches a provider. */
   pluginRoot?: string;
+  /** Tool-call timeout in ms, past a provider's default (Codex 300s, OpenCode 60s); each renders its own setting. */
+  timeout?: number;
 }
 
 /** The OneCLI gateway injects credentials via HTTPS_PROXY; the container never sees the token. */
@@ -384,13 +395,27 @@ export type ProviderEvent =
    * `resetAt` is a MEASURED recovery instant (ISO-8601 UTC): the host parks until exactly then, unlike a reset
    * parsed from error prose, which it treats as an upper bound.
    */
-  | { type: 'error'; message: string; retryable: boolean; classification?: string; resetAt?: string | null }
+  | {
+      type: 'error';
+      message: string;
+      retryable: boolean;
+      classification?: string;
+      resetAt?: string | null;
+      /** The rate-limit window that refused the request (`five_hour`, `seven_day`, a model-scoped one), when known. */
+      window?: string | null;
+    }
   | { type: 'progress'; message: string }
   /**
    * The Codex account at `home` (a CODEX_HOME inside the container) is at its quota and the provider is moving to
    * the next one. Reported to the host so new containers start past it.
    */
-  | { type: 'codex_account_exhausted'; home: string }
+  | { type: 'codex_account_exhausted'; home: string; resetAt?: string | null }
+  /**
+   * The Claude OAuth slot named `slot` (its container env name) hit an account-wide limit until `resetAt`.
+   * `fingerprint` (sha256 hex of the token) is what the host marks: the slot name can name a different token by
+   * the time the report lands.
+   */
+  | { type: 'claude_account_exhausted'; slot: string; fingerprint: string; resetAt: string | null }
   /** File to deliver as an attachment; the poll-loop owns routing and outbox staging. */
   | { type: 'file'; path: string; filename?: string; text?: string }
   /**

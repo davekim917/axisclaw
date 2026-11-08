@@ -155,7 +155,7 @@ function reportAliases(root: string, workgroupId: string, subpath: string): void
   });
 }
 
-function realOrResolved(p: string): string {
+export function realOrResolved(p: string): string {
   try {
     return fs.realpathSync(p);
   } catch {
@@ -164,7 +164,7 @@ function realOrResolved(p: string): string {
   }
 }
 
-function isInside(child: string, parent: string): boolean {
+export function isInside(child: string, parent: string): boolean {
   return child.startsWith(parent + path.sep);
 }
 

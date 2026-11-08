@@ -10,8 +10,11 @@ the lane -- it decides nothing about the verdict and the barrier never reads
 it (smoke-evidence-barrier.sh:805-814 turns every invalid entry into exit 1,
 so a warning channel cannot live there; SKILL.md "Acceptance verifier").
 
-  extract <run-dir> [--force]       intent/pr-body.md (and intent/pr-<n>-body.md
-                                    for a freeze campaign) -> intent/acceptance.json
+  extract <run-dir> [--force] [--carry-from <prior-run-dir>]
+                                    intent/pr-body.md (and intent/pr-<n>-body.md
+                                    for a freeze campaign) -> intent/acceptance.json;
+                                    --carry-from copies the prior run's unresolved
+                                    obligations into `carried`
   check   <run-dir> [--lane <id>]   provenance, ids, completeness, evidence,
                                     not_demonstrable / blocked shape
   report  <run-dir>                 the one Untested-line sentence
@@ -63,9 +66,18 @@ DOC_ITEM_KEYS = ITEM_KEYS | {"carrier", "derived"}
 THEN_KEYS = {"surface", "expect"}
 NEGATIVE_KEYS = {"given", "expect"}
 BLOCK_KEYS = {"v", "sources", "items", "reason"}
-DOC_KEYS = {"schemaVersion", "origin", "blocks", "sources", "items", "none", "problems"}
+DOC_KEYS = {"schemaVersion", "origin", "blocks", "sources", "items", "none", "problems", "carried"}
+CARRIED_KEYS = {"item", "request", "priorRun", "priorOutcome", "firstRun", "followUp"}
+RESOLVED = ("met", "changed")
 ROW_KEYS = {"itemId", "verdict", "observed", "evidence", "blockedBy", "object", "query"}
 OBJECT_KEYS = {"relation", "build"}
+RULINGS_FILE = os.path.join("coordinator", "acceptance-rulings.json")
+CHALLENGER_CHECK_FILE = os.path.join("challenger", "acceptance-check.json")
+OUTCOMES = ("met", "not_met", "changed", "deferred", "unproved")
+RULING_KEYS = {"itemId", "outcome", "why", "decidedBy", "followUp"}
+CHALLENGER_STATUSES = ("supported", "narrowed", "unsupported")
+DISPUTED = ("narrowed", "unsupported")
+FOLLOW_UP_RE = re.compile(r"^([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#[0-9]+$")
 
 
 def emit(obj, code=0):
@@ -412,9 +424,49 @@ def cmd_extract(args):
            "sources": sources if origin == "pr-body" else {},
            "items": items if origin == "pr-body" else [],
            "none": none if origin == "pr-body" else [], "problems": problems}
+    if args.carry_from:
+        carried, why = open_obligations(args.carry_from)
+        if carried is not None:
+            clash = sorted({e["item"]["id"] for e in carried} & {it["id"] for it in doc["items"]})
+            if clash:
+                why = "this run's items reuse carried ids {}".format(", ".join(clash))
+                carried = None
+        if carried is None:
+            emit({"ok": False, "error": "--carry-from {}: {}; nothing written".format(args.carry_from, why)}, 1)
+        doc["carried"] = carried
     _write_atomic(out_path, (json.dumps(doc, indent=2) + "\n").encode("utf-8"))
-    emit({"ok": True, "origin": origin, "itemCount": len(doc["items"]), "blocks": blocks,
-          "problems": problems, "path": out_path}, 0)
+    emit({"ok": True, "origin": origin, "itemCount": len(doc["items"]), "carriedCount": len(doc.get("carried", [])),
+          "blocks": blocks, "problems": problems, "path": out_path}, 0)
+
+
+def open_obligations(prior_dir):
+    """(carried entries, None) for every obligation the prior run left
+    unresolved -- its still-open carried ones, then its own items whose final
+    outcome (the ruling, else the raw verdict) is not met or changed -- or
+    (None, why) when the prior run's acceptance can't be read. The prior's
+    check stops on a carried id its own items reuse, so no obligation here is
+    ever merged with, or replaced by, a later item."""
+    prior = run_check(prior_dir, None)
+    if prior.get("stopped"):
+        return None, "its acceptance check stopped ({})".format(prior["stopped"])
+    doc = _read_json(os.path.join(prior_dir, "intent", "acceptance.json"))
+    run_name = os.path.basename(os.path.abspath(prior_dir))
+    rulings, _ = load_rulings(prior_dir, set(prior["outcomes"]) | {e["item"]["id"] for e in doc.get("carried", [])})
+    out = {}
+    for e in doc.get("carried", []):
+        iid = e["item"]["id"]
+        if iid in prior["carriedOpen"]:
+            out[iid] = dict(e, priorRun=run_name, priorOutcome=prior["outcomes"].get(iid) or e["priorOutcome"])
+    for it in doc["items"]:
+        outcome = prior["outcomes"].get(it["id"]) or "no result"
+        if outcome in RESOLVED:
+            continue
+        entry = {"item": {k: v for k, v in it.items() if k in ITEM_KEYS}, "request": doc["sources"][it["source"]]["request"],
+                 "priorRun": run_name, "priorOutcome": outcome, "firstRun": run_name}
+        if outcome == "deferred":
+            entry["followUp"] = rulings[it["id"]]["followUp"]
+        out[it["id"]] = entry
+    return list(out.values()), None
 
 
 # --- check ------------------------------------------------------------------
@@ -497,6 +549,9 @@ def doc_problems(doc):
         if (not DOC_ID_RE.match(k) or not isinstance(v, dict) or _unknown_keys(v, {"request", "frozen"})
                 or source_path(v.get("request"), None) is None):
             problems.append("sources.{}: must be {{request: issue#<n> | slack:<channel>/<thread> | pr-body}}".format(k))
+    if origin == "derived":
+        problems.extend("sources.{}: a derived contract derives from the frozen request sources, never the PR prose"
+                        .format(k) for k, v in sources.items() if isinstance(v, dict) and v.get("request") == "pr-body")
     problems.extend(validate_items(items, sources, DOC_ITEM_KEYS, DOC_ID_RE))
     for it in items:
         if not isinstance(it, dict) or not isinstance(it.get("id"), str):
@@ -507,6 +562,26 @@ def doc_problems(doc):
             problems.append("item {}: an authored contract cannot carry derived items".format(it["id"]))
     # An empty contract is a claim ("no user-observable effect") and must say
     # so: `none: [{reason}]`, the doc form of the block's items "none".
+    carried, seen_carried = doc.get("carried", []), set()
+    item_ids = {it["id"] for it in items if isinstance(it, dict) and _is_text(it.get("id"))}
+    if not isinstance(carried, list):
+        problems.append("carried must be a list")
+        carried = []
+    for e in carried:
+        item = e.get("item") if isinstance(e, dict) else None
+        iid = item.get("id") if isinstance(item, dict) else None
+        if (not isinstance(iid, str) or not DOC_ID_RE.match(iid) or _unknown_keys(e, CARRIED_KEYS)
+                or not all(_is_text(e.get(k)) for k in ("request", "priorRun", "priorOutcome", "firstRun"))):
+            problems.append("carried: every entry needs item{{id, ...}}, request, priorRun, priorOutcome and firstRun ({!r})".format(iid))
+            continue
+        source = {item["source"]: {"request": e["request"]}} if _is_text(item.get("source")) else {}
+        problems.extend(validate_item(item, "carried {} item".format(iid), source, ITEM_KEYS | {"id"}))
+        if iid in item_ids:
+            problems.append("carried {}: an item of this run reuses its id".format(iid))
+        if iid in seen_carried:
+            problems.append("carried: {} appears twice".format(iid))
+        else:
+            seen_carried.add(iid)
     none = doc.get("none", [])
     if not isinstance(none, list) or not all(isinstance(n, dict) and _is_text(n.get("reason")) for n in none):
         problems.append("none must be a list of {reason} entries")
@@ -535,6 +610,64 @@ def load_rows(run_dir, lane):
             continue
         rows.extend((rel, r) for r in data)
     return rows, rels, problems
+
+
+def load_rulings(run_dir, known):
+    """({itemId: ruling}, problems) from the coordinator's one adjudicated
+    record. Absent is fine: nothing has been overruled."""
+    path = os.path.join(run_dir, RULINGS_FILE)
+    if not os.path.lexists(path):
+        return {}, []
+    data = _read_json(path)
+    if not isinstance(data, list):
+        return {}, ["{}: not a JSON list of rulings".format(RULINGS_FILE)]
+    rulings, problems = {}, []
+    for ruling in data:
+        iid = ruling.get("itemId") if isinstance(ruling, dict) else None
+        if not isinstance(iid, str) or iid not in known:
+            problems.append("{}: ruling for unknown item {!r}".format(RULINGS_FILE, iid))
+            continue
+        if iid in rulings:
+            problems.append("{}: more than one ruling for {}".format(RULINGS_FILE, iid))
+            continue
+        extra = _unknown_keys(ruling, RULING_KEYS)
+        outcome = ruling.get("outcome")
+        why = []
+        if extra:
+            why.append("unknown keys {}".format(extra))
+        if outcome not in OUTCOMES:
+            why.append("outcome must be one of {}".format(", ".join(OUTCOMES)))
+        if not _is_text(ruling.get("why")):
+            why.append("why is required")
+        if outcome in ("changed", "deferred") and not _is_text(ruling.get("decidedBy")):
+            why.append("{} needs decidedBy: who agreed, and where".format(outcome))
+        if outcome == "deferred" and not (isinstance(ruling.get("followUp"), str)
+                                          and FOLLOW_UP_RE.fullmatch(ruling["followUp"])):
+            why.append("deferred needs followUp: the issue that carries it")
+        if why:
+            problems.append("{}: {}: {}".format(RULINGS_FILE, iid, "; ".join(why)))
+            continue
+        rulings[iid] = ruling
+    return rulings, problems
+
+
+def disputed_items(run_dir, known):
+    """(item ids the challenger marked narrowed or unsupported, problems).
+    Absent is fine. Records name an item `itemId` or `id` and its status
+    `status`, `support` or `mapping`, one of CHALLENGER_STATUSES; a record whose
+    items can't all be read that way, or that names an item the contract doesn't
+    have, is unreadable rather than guessed at."""
+    path = os.path.join(run_dir, CHALLENGER_CHECK_FILE)
+    if not os.path.lexists(path):
+        return set(), []
+    data = _read_json(path)
+    items = data.get("items") if isinstance(data, dict) else None
+    entries = [(it.get("itemId") or it.get("id"), it.get("status") or it.get("support") or it.get("mapping"))
+               for it in items if isinstance(it, dict)] if isinstance(items, list) else []
+    if not isinstance(items, list) or len(entries) != len(items) or not all(
+            isinstance(i, str) and i in known and st in CHALLENGER_STATUSES for i, st in entries):
+        return set(), ["{}: unreadable".format(CHALLENGER_CHECK_FILE)]
+    return {i for i, st in entries if st in DISPUTED}, []
 
 
 def table_name(relation):
@@ -633,8 +766,9 @@ def row_problems(run_dir, row, item):
 def run_check(run_dir, lane):
     doc_path = os.path.join(run_dir, "intent", "acceptance.json")
     result = {"ok": False, "origin": "absent", "itemCount": 0, "stopped": None, "provenance": {}, "unsupported": [],
-              "missingRows": [], "unknownRows": [], "rowProblems": [], "resultFiles": [],
-              "verdicts": {v: 0 for v in VERDICTS}, "problems": []}
+              "builderClaims": [], "missingRows": [], "unknownRows": [], "rowProblems": [], "resultFiles": [],
+              "verdicts": {v: 0 for v in VERDICTS}, "problems": [], "outcomes": {}, "unruled": [], "changed": [],
+              "deferred": [], "ruledNotMet": [], "carriedOpen": []}
 
     def stop(why):
         result["stopped"] = why
@@ -661,12 +795,17 @@ def run_check(run_dir, lane):
     prov = provenance(run_dir, doc)
     result["provenance"] = {k: v[0] for k, v in prov.items()}
     result["unsupported"] = [{"id": k, "reason": v[1]} for k, v in prov.items() if v[0] == "unsupported"]
+    result["builderClaims"] = [it["id"] for it in items
+                               if result["provenance"].get(it["id"]) == "supported"
+                               and doc["sources"][it["source"]].get("request") == "pr-body"]
 
     rows, files, file_problems = load_rows(run_dir, lane)
     result["resultFiles"] = files
     result["problems"].extend(file_problems)
+    carried = {e["item"]["id"]: e for e in doc.get("carried", [])}
     known = {it["id"]: it for it in items}
-    seen = {}
+    known.update({iid: e["item"] for iid, e in carried.items()})
+    seen, raw = {}, {}
     for rel, row in rows:
         iid = row.get("itemId") if isinstance(row, dict) else None
         if not isinstance(iid, str) or iid not in known:
@@ -683,8 +822,27 @@ def run_check(run_dir, lane):
             result["rowProblems"].append({"itemId": iid, "file": rel, "problems": probs})
         if row.get("verdict") in VERDICTS:
             result["verdicts"][row["verdict"]] += 1
+            raw[iid] = row["verdict"]
     result["missingRows"] = [it["id"] for it in items if it["id"] not in seen]
-    result["ok"] = not (result["problems"] or result["unsupported"] or result["missingRows"] or result["rowProblems"])
+    rulings, ruling_problems = load_rulings(run_dir, known)
+    result["problems"].extend(ruling_problems)
+    result["outcomes"] = {iid: rulings[iid]["outcome"] if iid in rulings else raw.get(iid)
+                          for iid in known if iid in rulings or iid in raw}
+    disputed, dispute_problems = disputed_items(run_dir, known)
+    result["problems"].extend(dispute_problems)
+    result["challengerRecord"] = "unusable" if dispute_problems else "ok"
+    result["adjudicationProblems"] = len(ruling_problems) + len(dispute_problems)
+    # A met on an obligation an earlier campaign left unresolved needs a ruling,
+    # the same as a disputed one.
+    result["unruled"] = sorted(i for i in disputed | set(carried)
+                               if i in known and raw.get(i) == "met" and i not in rulings)
+    result["outcomes"].update({i: "unruled" for i in result["unruled"]})
+    result["deferred"] = sorted(rulings[i]["followUp"] for i in rulings if rulings[i]["outcome"] == "deferred")
+    result["changed"] = sorted(i for i in rulings if rulings[i]["outcome"] == "changed")
+    result["ruledNotMet"] = sorted(i for i in rulings if rulings[i]["outcome"] in ("not_met", "unproved"))
+    result["carriedOpen"] = sorted(i for i in carried if not (i in rulings and rulings[i]["outcome"] in RESOLVED))
+    result["ok"] = not (result["problems"] or result["unsupported"] or result["missingRows"] or result["rowProblems"]
+                        or result["unruled"])
     result["sentence"] = sentence(result)
     return result
 
@@ -700,8 +858,23 @@ def sentence(result):
         head = "{}({})".format("present" if origin == "pr-body" else "derived", result["itemCount"])
         if result.get("stopped"):
             return "Acceptance: {} — stopped: {}, nothing checked".format(head, result["stopped"])
-    return "Acceptance: {} — {} unsupported, {} missing rows".format(
-        head, len(result["unsupported"]), len(result["missingRows"]))
+    claims = len(result["builderClaims"])
+    tail = ", {} builder claim{}".format(claims, "" if claims == 1 else "s") if claims else ""
+    problems = result.get("adjudicationProblems", 0)
+    if problems:
+        tail += ", {} adjudication record problem{}".format(problems, "" if problems == 1 else "s")
+    if result["unruled"]:
+        tail += ", {} disputed and unruled".format(len(result["unruled"]))
+    if result["ruledNotMet"]:
+        tail += ", {} ruled not met or unproved".format(len(result["ruledNotMet"]))
+    if result["changed"]:
+        tail += ", {} changed".format(len(result["changed"]))
+    if result["deferred"]:
+        tail += ", {} deferred ({})".format(len(result["deferred"]), ", ".join(result["deferred"]))
+    if result.get("carriedOpen"):
+        tail += ", {} carried open from earlier campaigns ({})".format(len(result["carriedOpen"]), ", ".join(result["carriedOpen"]))
+    return "Acceptance: {} — {} unsupported, {} missing rows{}".format(
+        head, len(result["unsupported"]), len(result["missingRows"]), tail)
 
 
 def cmd_check(args):
@@ -719,6 +892,7 @@ def main():
     e = sub.add_parser("extract")
     e.add_argument("run_dir")
     e.add_argument("--force", action="store_true")
+    e.add_argument("--carry-from", default="")
     e.set_defaults(fn=cmd_extract)
     for name, fn in (("check", cmd_check), ("report", cmd_report)):
         c = sub.add_parser(name)

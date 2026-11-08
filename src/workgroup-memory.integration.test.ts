@@ -66,6 +66,7 @@ vi.mock('../container/agent-runner/src/destinations.js', () => ({
 
 import { closeDb, getRawDb, initMigratedTestDb } from './db/index.js';
 import { upsertArchiveMessage } from './message-archive.js';
+import { tenancyNow } from './test-fixtures/archive-search.js';
 import { writeSessionMessageIfNew } from './session-manager.js';
 import { openInboundDb as openInboundDbAt } from './modules/mailbox/openers.js';
 import { inboundDbPath } from './mailbox/sqlite/paths.js';
@@ -221,14 +222,17 @@ function archive(input: {
   threadId: string;
   text: string;
 }): void {
-  upsertArchiveMessage({
-    ...input,
-    channelName: 'fixture',
-    role: 'user',
-    senderId: 'fixture:user',
-    senderName: 'Fixture User',
-    sentAt: '2026-07-25T12:00:00.000Z',
-  });
+  upsertArchiveMessage(
+    {
+      ...input,
+      channelName: 'fixture',
+      role: 'user',
+      senderId: 'fixture:user',
+      senderName: 'Fixture User',
+      sentAt: '2026-07-25T12:00:00.000Z',
+    },
+    tenancyNow(getRawDb(), input.agentGroupId),
+  );
 }
 
 async function writeTurn(

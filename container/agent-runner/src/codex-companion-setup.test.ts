@@ -13,17 +13,22 @@ import path from 'path';
 
 import {
   buildRuntimeConfigForTest,
+  codexRuntimeEnv,
+  completeDeferredCodexRegistration,
   planCodexPluginRegistration,
   projectCodexPluginConfigForTest,
   readCodexConfigToml,
   renderMcpServerForTest,
+  setupCodexFallbackRuntimes,
+  setupCodexPrimaryRuntime,
   setupCodexRuntime,
   stripPluginsAndMarketplacesForTest,
+  syncCodexHookTrust,
   verifyCodexHookTrust,
-  writeCodexHooksAndTrust,
 } from './codex-companion-setup.js';
-import { type AppServer, buildCodexHooksJson, parseTomlTableHeader } from './providers/codex-app-server.js';
-import { codexHookEventKey, collectCodexHookTrustEntries, isCodexHookEvent } from './providers/codex-hook-trust.js';
+import { type AppServer, parseTomlTableHeader } from './providers/codex-app-server.js';
+import { FAILED_CODEX_HOME, PENDING_CODEX_HOME } from './codex-home-sentinel.js';
+import { allowSubprocess } from './test-hermeticity.js';
 
 describe('parseTomlTableHeader', () => {
   it('closes on the LAST bracket so a quoted segment may contain one', () => {
@@ -140,10 +145,10 @@ describe('buildRuntimeConfig', () => {
     // Generated container base, load-bearing settings present.
     expect(config).toContain('sandbox_mode = "workspace-write"');
     expect(config).toContain('approval_policy = "on-request"');
-    expect(config).toContain('model_context_window = 400000');
-    expect(config).toContain('model_auto_compact_token_limit = 360000');
-    expect(config.indexOf('model_context_window = 400000')).toBeLessThan(config.indexOf('[features]'));
-    expect(config.indexOf('model_auto_compact_token_limit = 360000')).toBeLessThan(config.indexOf('[features]'));
+    expect(config).toContain('model_context_window = 800000');
+    expect(config).toContain('model_auto_compact_token_limit = 720000');
+    expect(config.indexOf('model_context_window = 800000')).toBeLessThan(config.indexOf('[features]'));
+    expect(config.indexOf('model_auto_compact_token_limit = 720000')).toBeLessThan(config.indexOf('[features]'));
     expect(config).toContain('[features]');
     expect(config).toContain('hooks = true');
     expect(config).toContain('context_management = true');
@@ -196,19 +201,18 @@ describe('buildRuntimeConfig', () => {
     expect(source).not.toContain('buildMergedConfig');
   });
 
-  it('installs the in-tree hook chain into the peer-mode CODEX_HOME', () => {
+  it('exposes the peer-mode CODEX_HOME only once the image guard chain is confirmed installed', () => {
     const source = fs.readFileSync(new URL('./codex-companion-setup.ts', import.meta.url), 'utf8');
-    // `writeCodexHooksAndTrust`, not `writeCodexHooksJson`: Codex will not
-    // dispatch a hook with no matching `[hooks.state.*]` trust entry, so the
-    // bare file write leaves the guard chain loaded and inert.
-    expect(source).toMatch(/writeCodexHooksAndTrust\(\{\s*codexHome:\s*RUNTIME_CODEX_DIR\s*\}\)/);
+    const start = source.indexOf('export function setupCodexRuntime');
+    const body = source.slice(start, source.indexOf('\nfunction replaceWithDirectorySymlink', start));
+    expect(body).toMatch(/systemGuardHookKeys\(\);\s*syncCodexHookTrust\(RUNTIME_CODEX_DIR\);/);
   });
 
   it('setupCodexRuntime fails closed on codex, not on the container', () => {
-    // A `return null` on a hard failure is a guard BYPASS, not a degrade: the
-    // caller only sets CODEX_HOME on a non-null return, so peer `codex exec`
-    // would fall back to the host-mounted /home/node/.codex — authenticated and
-    // with no PreToolUse guard chain. Hard paths must hand back the nonexistent
+    // A `return null` on a hard failure is not a degrade: the caller only sets
+    // CODEX_HOME on a non-null return, so peer `codex exec` would fall back to
+    // the host-mounted /home/node/.codex — authenticated, without the runtime's
+    // config or plugin hooks. Hard paths must hand back the nonexistent
     // sentinel instead, which codex refuses to start on. Throwing would also
     // close the guard but takes the whole container down over an optional peer
     // feature — under disk pressure that turns a degrade into a crash-loop.
@@ -220,18 +224,18 @@ describe('buildRuntimeConfig', () => {
     // The ONLY null return is the benign missing-auth case.
     expect(body.match(/return null/g) ?? []).toHaveLength(1);
     expect(body).toMatch(/Host codex auth not mounted[\s\S]*?return null/);
-    // mkdir, auth symlink, config.toml write, hooks.json+trust write, and the
-    // post-registration trust re-sync — all five hand the sentinel back to the
-    // caller. The re-sync counts because `codex plugin add` has already
-    // rewritten config.toml by then, so a failure there leaves NO trust entries
-    // standing rather than the pre-registration ones.
-    expect(body.match(/return failClosed\(/g) ?? []).toHaveLength(5);
+    // mkdir, auth symlink, config.toml write, and the guard-chain/trust check —
+    // all four hand the sentinel back to the caller. Plugin registration and its
+    // trust re-sync run at the first codex call
+    // (completeDeferredCodexRegistration), which refuses that call instead.
+    expect(body.match(/return failClosed\(/g) ?? []).toHaveLength(4);
     expect(body).not.toMatch(/\bthrow new\b/);
 
     // The sentinel must be a nonexistent path (codex hard-errors on it), and
     // failClosed must RETURN it rather than throw. Slice the helper's own body
     // only — trailing docs are prose and may legitimately say "throw".
-    expect(source).toMatch(/const FAILED_CODEX_HOME = '\/nonexistent\/[^']+';/);
+    expect(FAILED_CODEX_HOME).toStartWith('/nonexistent/');
+    expect(fs.existsSync(FAILED_CODEX_HOME)).toBe(false);
     const helperStart = source.indexOf('function failClosed(');
     const helper = source.slice(helperStart, source.indexOf('\n}\n', helperStart));
     expect(helper).toMatch(/^function failClosed\(what: string, err: unknown\): string \{/);
@@ -240,12 +244,12 @@ describe('buildRuntimeConfig', () => {
   });
 
   it("the runner exports setupCodexRuntime's home before the provider snapshots process.env", () => {
-    const source = fs.readFileSync(new URL('./index.ts', import.meta.url), 'utf8');
+    const source = fs.readFileSync(new URL('./runner-main.ts', import.meta.url), 'utf8');
     const setup = source.indexOf('const codexHome = setupCodexRuntime(mcpServers');
     const construct = source.indexOf('createProvider(providerName, {');
     expect(setup).toBeGreaterThan(-1);
     expect(source.slice(setup, construct)).toMatch(
-      /^const codexHome = setupCodexRuntime\([^;]+\);\s*if \(codexHome\) \{\s*process\.env\.CODEX_HOME = codexHome;\s*\}\s*\}\s*const provider = $/,
+      /^const codexHome = setupCodexRuntime\([^;]+\);\s*if \(codexHome\) \{\s*Object\.assign\(process\.env, codexRuntimeEnv\(codexHome\)\);\s*\}\s*\}\s*const provider = $/,
     );
     expect(source.slice(construct, source.indexOf('});', construct))).toContain('env: { ...process.env },');
   });
@@ -633,227 +637,158 @@ describe('readCodexConfigToml', () => {
   });
 });
 
-describe('writeCodexHooksAndTrust', () => {
+/** A plugins root holding one Codex plugin that declares one PreToolUse hook running `command`. */
+function hookedPluginsRoot(command = 'bun "${PLUGIN_ROOT}/hooks/codex-guard.ts" PreToolUse'): string {
+  const pluginsRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-trust-plugins-'));
+  const repo = path.join(pluginsRoot, 'bootstrap');
+  const sub = path.join(repo, 'plugins', 'workflow-agents');
+  fs.mkdirSync(path.join(repo, '.agents', 'plugins'), { recursive: true });
+  fs.writeFileSync(
+    path.join(repo, '.agents', 'plugins', 'marketplace.json'),
+    JSON.stringify({ name: 'davekim917-bootstrap' }),
+  );
+  fs.mkdirSync(path.join(sub, '.codex-plugin'), { recursive: true });
+  fs.mkdirSync(path.join(sub, 'hooks'), { recursive: true });
+  fs.writeFileSync(
+    path.join(sub, '.codex-plugin', 'plugin.json'),
+    JSON.stringify({ name: 'bootstrap-workflow-agents', hooks: './hooks/workflow-hooks.json' }),
+  );
+  fs.writeFileSync(
+    path.join(sub, 'hooks', 'workflow-hooks.json'),
+    JSON.stringify({ hooks: { PreToolUse: [{ hooks: [{ type: 'command', command, timeout: 3600 }] }] } }),
+  );
+  return pluginsRoot;
+}
+
+const WORKFLOW_HOOK_KEY = 'bootstrap-workflow-agents@davekim917-bootstrap:hooks/workflow-hooks.json:pre_tool_use:0:0';
+
+describe('syncCodexHookTrust', () => {
   let home: string;
+  let pluginsRoot: string;
 
   beforeEach(() => {
     home = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-hook-trust-home-'));
     fs.writeFileSync(path.join(home, 'config.toml'), '[features]\nhooks = true\n');
+    pluginsRoot = hookedPluginsRoot();
   });
-  afterEach(() => fs.rmSync(home, { recursive: true, force: true }));
+  afterEach(() => {
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(pluginsRoot, { recursive: true, force: true });
+  });
 
-  it('throws rather than returning when the TRUST write specifically fails', () => {
-    // The postcondition is "hooks written AND trusted". Reporting success with
-    // only the first half is the state this module exists to eliminate: codex
-    // loads the handlers, reports them untrusted, never dispatches them, and
-    // the app-server starts anyway — the destructive-action guard present,
-    // inert and silent. Every caller continues straight into a spawn, so the
-    // failure has to reach them.
+  it('throws rather than returning when the TRUST write fails', () => {
+    // Reporting success with the trust write failed leaves codex loading the
+    // plugin handlers, reporting them untrusted and never dispatching them,
+    // while the app-server starts anyway. Every caller continues straight into
+    // a spawn, so the failure has to reach them.
     //
-    // The directory stays WRITABLE and the commit is blocked at the temp file,
-    // so hooks.json is written normally and the trust write is the one thing
-    // that fails. An unwritable directory would fail the hooks.json write first
-    // and this test would pass with the trust failure still swallowed — which
-    // is exactly what it did before the message assertion below was added.
-    //
-    // A read-only config.toml is NOT the lever any more, and that is the
-    // durable writer working: it commits by rename, which the DIRECTORY's mode
-    // governs, so a 0400 config.toml is now correctly replaced rather than
-    // blocking the guard wiring. The lever is a leftover read-only
-    // `config.toml.tmp` — the shape a crashed write can leave behind — which
-    // makes the `open(…, 'w')` fail with EACCES.
-    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-hook-trust-ro-'));
+    // A read-only config.toml is NOT the lever: the durable writer commits by
+    // rename, which the DIRECTORY's mode governs, so a 0400 config.toml is
+    // replaced. The lever is a leftover read-only `config.toml.tmp` — the shape
+    // a crashed write can leave behind — which makes the `open(…, 'w')` fail.
     const configPath = path.join(home, 'config.toml');
     const tmpPath = `${configPath}.tmp`;
-    fs.writeFileSync(configPath, '[features]\nhooks = true\n');
     fs.writeFileSync(tmpPath, 'leftover');
     fs.chmodSync(tmpPath, 0o400);
-    try {
-      expect(() => writeCodexHooksAndTrust({ codexHome: home, pluginsRoot: path.join(home, 'no-plugins') })).toThrow(
-        /hook trust/i,
-      );
-      // hooks.json really was written — so the throw is the trust write, not
-      // an earlier step failing for an unrelated reason.
-      expect(fs.existsSync(path.join(home, 'hooks.json'))).toBe(true);
-      // …and the last valid config is still standing, untouched.
-      expect(fs.readFileSync(configPath, 'utf-8')).toBe('[features]\nhooks = true\n');
-      // The failed commit cleaned up after itself: `unlink(2)` needs write on
-      // the DIRECTORY, so even the read-only temp file goes, and the next spawn
-      // is not blocked by the wreckage of this one.
-      expect(fs.existsSync(tmpPath)).toBe(false);
-    } finally {
-      fs.rmSync(home, { recursive: true, force: true });
-    }
+    expect(() => syncCodexHookTrust(home, { pluginsRoot })).toThrow(/hook trust/i);
+    // The last valid config is still standing, untouched.
+    expect(fs.readFileSync(configPath, 'utf-8')).toBe('[features]\nhooks = true\n');
+    // The failed commit cleaned up after itself: `unlink(2)` needs write on
+    // the DIRECTORY, so even the read-only temp file goes, and the next spawn
+    // is not blocked by the wreckage of this one.
+    expect(fs.existsSync(tmpPath)).toBe(false);
   });
 
   it('REPLACES a read-only config.toml, because the commit is a rename the directory governs', () => {
-    // Pinned as a deliberate behavior change from the plain `writeFileSync`
-    // this replaced: a 0400 config.toml used to make the trust write fail and
-    // refuse the spawn, which is the safe answer but not the right one — the
-    // guard wiring should land. `rename(2)` needs write on the DIRECTORY, not
-    // on the target file.
-    const roHome = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-hook-trust-ro-replaced-'));
-    const configPath = path.join(roHome, 'config.toml');
-    fs.writeFileSync(configPath, '[features]\nhooks = true\n');
+    const configPath = path.join(home, 'config.toml');
     fs.chmodSync(configPath, 0o400);
-    try {
-      writeCodexHooksAndTrust({ codexHome: roHome, pluginsRoot: path.join(roHome, 'no-plugins') });
-      const committed = fs.readFileSync(configPath, 'utf-8');
-      expect(committed).toContain('[features]');
-      expect(committed).toContain('[hooks.state.');
-      // No temp file left behind on the success path.
-      expect(fs.existsSync(`${configPath}.tmp`)).toBe(false);
-    } finally {
-      fs.rmSync(roHome, { recursive: true, force: true });
-    }
+    syncCodexHookTrust(home, { pluginsRoot });
+    const committed = fs.readFileSync(configPath, 'utf-8');
+    expect(committed).toContain('[features]');
+    expect(committed).toContain('[hooks.state.');
+    // No temp file left behind on the success path.
+    expect(fs.existsSync(`${configPath}.tmp`)).toBe(false);
   });
 
   it('throws, and leaves config.toml untouched, when the config is unreadable but writable', () => {
-    // The read side of the same class as the test above, and the one that is
-    // worse: rewriting from an empty base SUCCEEDS, so nothing fails, and the
-    // file it writes has lost `[features] hooks = true` — codex then loads no
-    // hooks at all and the app-server starts. Mode 0200 is the live shape (a
-    // mount that kept write and lost read); only ENOENT means "absent".
-    const roHome = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-hook-trust-unreadable-'));
-    const configPath = path.join(roHome, 'config.toml');
+    // Rewriting from an empty base would SUCCEED and drop `[features] hooks =
+    // true`. Mode 0200 is the live shape (a mount that kept write and lost
+    // read); only ENOENT means "absent".
+    const configPath = path.join(home, 'config.toml');
     const original = '[features]\nhooks = true\n\n[marketplaces.mkt]\nsource_type = "local"\n';
     fs.writeFileSync(configPath, original);
     fs.chmodSync(configPath, 0o200);
     try {
-      expect(() =>
-        writeCodexHooksAndTrust({ codexHome: roHome, pluginsRoot: path.join(roHome, 'no-plugins') }),
-      ).toThrow(/could not read Codex config/i);
+      expect(() => syncCodexHookTrust(home, { pluginsRoot })).toThrow(/could not read Codex config/i);
       fs.chmodSync(configPath, 0o600);
-      // The feature flag and the plugin tables are still there — the refusal
-      // happened BEFORE the rewrite, not after a partial one.
+      // The refusal happened BEFORE the rewrite, not after a partial one.
       expect(fs.readFileSync(configPath, 'utf-8')).toBe(original);
     } finally {
       fs.chmodSync(configPath, 0o600);
-      fs.rmSync(roHome, { recursive: true, force: true });
     }
   });
 
-  it('leaves every hook it wrote to hooks.json trusted in config.toml', () => {
-    writeCodexHooksAndTrust({ codexHome: home, pluginsRoot: path.join(home, 'no-plugins') });
-
-    const hooksJson = JSON.parse(fs.readFileSync(path.join(home, 'hooks.json'), 'utf-8')) as {
-      hooks: Record<string, Array<{ hooks: unknown[] }>>;
-    };
+  it('writes exactly the plugin rows: none for the guard chain, and a stale per-home guard row is dropped', () => {
+    // The guard chain is the image's system layer, dispatched as managed with no
+    // row. A row naming a per-home hooks.json is dead weight that must not
+    // survive the rewrite.
+    fs.writeFileSync(
+      path.join(home, 'config.toml'),
+      `[features]\nhooks = true\n\n[hooks.state."${home}/hooks.json:pre_tool_use:0:0"]\ntrusted_hash = "sha256:stale"\n`,
+    );
+    syncCodexHookTrust(home, { pluginsRoot });
     const trusted = parseTrustEntries(fs.readFileSync(path.join(home, 'config.toml'), 'utf-8'));
-
-    const expectedKeys: string[] = [];
-    for (const [event, groups] of Object.entries(hooksJson.hooks)) {
-      expect(isCodexHookEvent(event)).toBe(true);
-      groups.forEach((group, gi) =>
-        group.hooks.forEach((_handler, hi) =>
-          // Keyed on the home this call actually wrote to — that is what makes
-          // an OAuth-fallback rotation carry its own trust entries.
-          expectedKeys.push(`${path.join(home, 'hooks.json')}:${codexHookEventKey(event as never)}:${gi}:${hi}`),
-        ),
-      );
-    }
-
-    expect(expectedKeys.length).toBeGreaterThan(0);
-    for (const key of expectedKeys) {
-      expect(trusted.get(key)).toMatch(/^sha256:[0-9a-f]{64}$/);
-    }
-    // No orphan rows either: an entry keyed on a hook that no longer exists is
-    // dead weight that hides a rename.
-    expect([...trusted.keys()].sort()).toEqual(expectedKeys.sort());
-    // And the pre-existing config is still there.
+    expect([...trusted.keys()]).toEqual([WORKFLOW_HOOK_KEY]);
     expect(fs.readFileSync(path.join(home, 'config.toml'), 'utf-8')).toContain('hooks = true');
   });
 
-  it('is what the codex provider calls at every hooks.json write', () => {
+  it('is what the codex provider calls before every app-server spawn', () => {
     // Two call sites: the pre-spawn write and `restartAppServer`, which every
-    // recovery and OAuth-rotation branch goes through. A bare
-    // `writeCodexHooksJson()` at either writes the guard chain into a home with
-    // no trust entries, where it loads and never fires.
+    // recovery and OAuth-rotation branch goes through. A rotated home without
+    // the plugin rows runs without the plugins' hooks.
     const source = fs.readFileSync(new URL('./providers/codex.ts', import.meta.url), 'utf8');
-    expect(source).not.toMatch(/\bwriteCodexHooksJson\s*\(/);
-    expect(source.match(/\bwriteCodexHooksAndTrust\s*\(/g)).toHaveLength(2);
+    expect(source.match(/\bsyncCodexHookTrust\(resolveCodexConfigDir\(\)\)/g)).toHaveLength(2);
   });
 
   it('trusts the hooks a mounted plugin declares, keyed <plugin>@<marketplace>', () => {
     // The Claude provider already dispatches these same plugins' hooks through
     // the SDK; leaving them untrusted under Codex is a provider asymmetry, not
     // isolation — it is why the workflow-agents Codex guard was inert.
-    const pluginsRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-trust-plugins-'));
-    try {
-      const repo = path.join(pluginsRoot, 'bootstrap');
-      const sub = path.join(repo, 'plugins', 'workflow-agents');
-      fs.mkdirSync(path.join(repo, '.agents', 'plugins'), { recursive: true });
-      fs.writeFileSync(
-        path.join(repo, '.agents', 'plugins', 'marketplace.json'),
-        JSON.stringify({ name: 'davekim917-bootstrap' }),
-      );
-      fs.mkdirSync(path.join(sub, '.codex-plugin'), { recursive: true });
-      fs.mkdirSync(path.join(sub, 'hooks'), { recursive: true });
-      fs.writeFileSync(
-        path.join(sub, '.codex-plugin', 'plugin.json'),
-        JSON.stringify({ name: 'bootstrap-workflow-agents', hooks: './hooks/workflow-hooks.json' }),
-      );
-      fs.writeFileSync(
-        path.join(sub, 'hooks', 'workflow-hooks.json'),
-        JSON.stringify({
-          hooks: {
-            PreToolUse: [
-              {
-                hooks: [
-                  { type: 'command', command: 'bun "${PLUGIN_ROOT}/hooks/codex-guard.ts" PreToolUse', timeout: 3600 },
-                ],
-              },
-            ],
-          },
-        }),
-      );
-
-      writeCodexHooksAndTrust({ codexHome: home, pluginsRoot });
-      const trusted = parseTrustEntries(fs.readFileSync(path.join(home, 'config.toml'), 'utf-8'));
-      // Hash pinned to what Codex itself wrote for this exact hook, so this
-      // asserts interoperability, not just self-consistency.
-      expect(
-        trusted.get('bootstrap-workflow-agents@davekim917-bootstrap:hooks/workflow-hooks.json:pre_tool_use:0:0'),
-      ).toBe('sha256:098408625edddbfeabfdc5593d17ade95699bf36fd463bd17ffd604cf314cb4a');
-      // The generated guard chain is still trusted alongside it.
-      expect(trusted.has(`${path.join(home, 'hooks.json')}:pre_tool_use:0:0`)).toBe(true);
-    } finally {
-      fs.rmSync(pluginsRoot, { recursive: true, force: true });
-    }
+    syncCodexHookTrust(home, { pluginsRoot });
+    const trusted = parseTrustEntries(fs.readFileSync(path.join(home, 'config.toml'), 'utf-8'));
+    // Hash pinned to what Codex itself wrote for this exact hook, so this
+    // asserts interoperability, not just self-consistency.
+    expect(trusted.get(WORKFLOW_HOOK_KEY)).toBe(
+      'sha256:098408625edddbfeabfdc5593d17ade95699bf36fd463bd17ffd604cf314cb4a',
+    );
   });
 
-  it('re-keys the entries when the home rotates', () => {
+  it('writes the same plugin rows into a rotated home', () => {
     const other = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-hook-trust-home2-'));
     try {
-      const pluginsRoot = path.join(home, 'no-plugins');
-      writeCodexHooksAndTrust({ codexHome: home, pluginsRoot });
-      writeCodexHooksAndTrust({ codexHome: other, pluginsRoot });
-      const rotated = [...parseTrustEntries(fs.readFileSync(path.join(other, 'config.toml'), 'utf-8')).keys()];
-      expect(rotated.length).toBeGreaterThan(0);
-      expect(rotated.every((key) => key.startsWith(path.join(other, 'hooks.json') + ':'))).toBe(true);
+      syncCodexHookTrust(home, { pluginsRoot });
+      syncCodexHookTrust(other, { pluginsRoot });
+      expect([...parseTrustEntries(fs.readFileSync(path.join(other, 'config.toml'), 'utf-8')).keys()]).toEqual([
+        WORKFLOW_HOOK_KEY,
+      ]);
     } finally {
       fs.rmSync(other, { recursive: true, force: true });
     }
   });
 
   it('tracks a changed hook command instead of leaving the old hash trusted', () => {
-    const pluginsRoot = path.join(home, 'no-plugins');
-    writeCodexHooksAndTrust({ codexHome: home, emailGateTimeoutSec: 3600, pluginsRoot });
+    syncCodexHookTrust(home, { pluginsRoot });
     const before = parseTrustEntries(fs.readFileSync(path.join(home, 'config.toml'), 'utf-8'));
-    writeCodexHooksAndTrust({ codexHome: home, emailGateTimeoutSec: 120, pluginsRoot });
-    const after = parseTrustEntries(fs.readFileSync(path.join(home, 'config.toml'), 'utf-8'));
-
-    const preKey = `${path.join(home, 'hooks.json')}:pre_tool_use:0:0`;
-    expect(before.get(preKey)).toBeDefined();
-    expect(after.get(preKey)).toBeDefined();
-    // The PreToolUse timeout is part of the hashed identity, so the entry must
-    // move; the untouched PostToolUse entry must not.
-    expect(after.get(preKey)).not.toBe(before.get(preKey));
-    const postKey = `${path.join(home, 'hooks.json')}:post_tool_use:0:0`;
-    expect(after.get(postKey)).toBe(before.get(postKey) as string);
-    // Sanity: the hooks.json really did change, so the assertion above is not
-    // passing on a no-op.
-    expect(buildCodexHooksJson({ emailGateTimeoutSec: 120 }).hooks.PreToolUse[0].hooks[0].timeout).toBe(120);
+    const changed = hookedPluginsRoot('bun "${PLUGIN_ROOT}/hooks/codex-guard.ts" PreToolUse --changed');
+    try {
+      syncCodexHookTrust(home, { pluginsRoot: changed });
+      const after = parseTrustEntries(fs.readFileSync(path.join(home, 'config.toml'), 'utf-8'));
+      expect(before.get(WORKFLOW_HOOK_KEY)).toMatch(/^sha256:[0-9a-f]{64}$/);
+      expect(after.get(WORKFLOW_HOOK_KEY)).toMatch(/^sha256:[0-9a-f]{64}$/);
+      expect(after.get(WORKFLOW_HOOK_KEY)).not.toBe(before.get(WORKFLOW_HOOK_KEY));
+    } finally {
+      fs.rmSync(changed, { recursive: true, force: true });
+    }
   });
 });
 
@@ -918,6 +853,28 @@ const CAN_RUN_FS = (() => {
     expect(result).toBe(null);
   });
 
+  it('prepares the home without running codex: plugin registration waits for the first codex call', () => {
+    fs.writeFileSync(path.join(HOST_CODEX_DIR, 'auth.json'), '{}');
+    const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-boot-'));
+    const savedPath = process.env.PATH;
+    try {
+      fs.mkdirSync(path.join(scratch, 'bin'));
+      fs.writeFileSync(path.join(scratch, 'bin', 'codex'), FAKE_PLUGIN_CODEX, { mode: 0o755 });
+      process.env.PATH = `${path.join(scratch, 'bin')}:${savedPath}`;
+      process.env.FAKE_CODEX_LOG = path.join(scratch, 'calls.tsv');
+
+      expect(setupCodexRuntime({})).toBe(RUNTIME_CODEX_DIR);
+
+      expect(fs.existsSync(path.join(scratch, 'calls.tsv'))).toBe(false);
+      expect(fs.existsSync(path.join(RUNTIME_CODEX_DIR, 'config.toml'))).toBe(true);
+      expect(fs.existsSync(path.join(RUNTIME_CODEX_DIR, '.nanoclaw-plugins-registered'))).toBe(false);
+    } finally {
+      process.env.PATH = savedPath;
+      delete process.env.FAKE_CODEX_LOG;
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
   it('symlinks auth.json to host', () => {
     fs.writeFileSync(path.join(HOST_CODEX_DIR, 'auth.json'), '{}');
     const result = setupCodexRuntime({});
@@ -942,11 +899,35 @@ const CAN_RUN_FS = (() => {
     expect(written).not.toContain('[mcp_servers.exa]');
     expect(written).toContain('sandbox_mode = "workspace-write"');
     expect(written).toContain('[mcp_servers.nanoclaw]');
-    const hooks = JSON.parse(fs.readFileSync(path.join(RUNTIME_CODEX_DIR, 'hooks.json'), 'utf-8')) as {
-      hooks: { PreToolUse: Array<{ hooks: Array<{ command: string }> }> };
-    };
-    expect(hooks.hooks.PreToolUse[0].hooks[0].command).toBe('bun /app/src/codex-hooks/cli.ts PreToolUse');
+    // The guard chain is the image's /etc/codex layer, never a per-home file.
+    expect(fs.existsSync(path.join(RUNTIME_CODEX_DIR, 'hooks.json'))).toBe(false);
   });
+
+  it('gives each staged fallback the runtime config, and keeps its own credential', () => {
+    const fallback = '/home/node/.codex-fallback-test';
+    const bare = '/home/node/.codex-fallback-test-bare';
+    try {
+      fs.writeFileSync(path.join(HOST_CODEX_DIR, 'auth.json'), '{}');
+      fs.mkdirSync(fallback, { recursive: true });
+      fs.mkdirSync(bare, { recursive: true });
+      fs.writeFileSync(path.join(fallback, 'auth.json'), '{"account":"fallback"}');
+      fs.writeFileSync(path.join(fallback, 'config.toml'), 'model = "host-staged"\n');
+      const servers = { nanoclaw: { type: 'stdio' as const, command: 'bun', args: ['run', '/app/mcp.ts'], env: {} } };
+      expect(setupCodexRuntime(servers)).toBe(RUNTIME_CODEX_DIR);
+
+      expect(setupCodexFallbackRuntimes(servers, [fallback, bare])).toEqual([fallback]);
+
+      const config = fs.readFileSync(path.join(fallback, 'config.toml'), 'utf-8');
+      expect(config).toContain('[mcp_servers.nanoclaw]');
+      expect(config).not.toContain('host-staged');
+      expect(fs.existsSync(path.join(fallback, 'hooks.json'))).toBe(false);
+      expect(fs.readFileSync(path.join(fallback, 'auth.json'), 'utf-8')).toBe('{"account":"fallback"}');
+      expect(fs.readdirSync(bare)).toEqual([]);
+    } finally {
+      fs.rmSync(fallback, { recursive: true, force: true });
+      fs.rmSync(bare, { recursive: true, force: true });
+    }
+  }, 120_000);
 });
 
 // ── verifyCodexHookTrust ───────────────────────────────────────────────────
@@ -982,64 +963,73 @@ function hookListServer(answer: { result?: unknown; error?: { code: number; mess
   } as unknown as AppServer;
 }
 
-/** The keys `syncCodexHookTrust` writes for a given home, from the same collector. */
-function generatedKeys(home: string): string[] {
-  return collectCodexHookTrustEntries(path.join(home, 'hooks.json'), buildCodexHooksJson().hooks).map((e) => e.key);
-}
+/** The guard chain the image installs at /etc/codex/hooks.json, read from its source in the repo. */
+const SYSTEM_HOOKS = new URL('../../codex-system/hooks.json', import.meta.url).pathname;
+const SYSTEM_KEYS = [`${SYSTEM_HOOKS}:pre_tool_use:0:0`, `${SYSTEM_HOOKS}:post_tool_use:0:0`];
 
 function listing(rows: Array<Record<string, unknown>>): { result: unknown } {
   return { result: { data: [{ cwd: '/workspace/agent', hooks: rows, warnings: [], errors: [] }] } };
 }
 
-describe('verifyCodexHookTrust', () => {
-  const HOME = '/probe/codex-home';
+/** As codex 0.163.0 lists a system-layer handler (measured). */
+const managedRow = (key: string) => ({ key, source: 'system', isManaged: true, enabled: true, trustStatus: 'managed' });
 
-  it('passes when every generated handler reads back trusted and enabled', async () => {
-    const rows = generatedKeys(HOME).map((key) => ({ key, enabled: true, trustStatus: 'trusted' }));
-    await verifyCodexHookTrust(hookListServer(listing(rows)), HOME);
+describe('verifyCodexHookTrust', () => {
+  const verify = (answer: Parameters<typeof hookListServer>[0], systemHooksPath = SYSTEM_HOOKS) =>
+    verifyCodexHookTrust(hookListServer(answer), { systemHooksPath });
+
+  it('passes when every system guard handler reads back managed and enabled', async () => {
+    await verify(listing(SYSTEM_KEYS.map(managedRow)));
   });
 
-  it('REFUSES the spawn when a generated handler reads back untrusted', async () => {
+  it('REFUSES the spawn when a guard handler reads back untrusted', async () => {
     // The failure this check exists for: the handler loads, codex reports it
-    // untrusted, never dispatches it, and the session otherwise runs normally.
-    const keys = generatedKeys(HOME);
-    const rows = keys.map((key, i) => ({ key, enabled: true, trustStatus: i === 0 ? 'untrusted' : 'trusted' }));
-    await expect(verifyCodexHookTrust(hookListServer(listing(rows)), HOME)).rejects.toThrow(
-      /hook trust verification failed/i,
+    // undispatchable, and the session otherwise runs normally.
+    const rows = SYSTEM_KEYS.map((key, i) =>
+      i === 0 ? { ...managedRow(key), trustStatus: 'untrusted' } : managedRow(key),
     );
+    await expect(verify(listing(rows))).rejects.toThrow(/hook trust verification failed/i);
   });
 
   it('REFUSES the spawn when the listing is empty', async () => {
-    // Hooks feature off, or hooks.json unread: nothing bad to find in the
+    // Hooks feature off, or the system file unread: nothing bad to find in the
     // listing, and the whole guard chain is inert.
-    await expect(verifyCodexHookTrust(hookListServer(listing([])), HOME)).rejects.toThrow(/missing/);
+    await expect(verify(listing([]))).rejects.toThrow(/missing/);
   });
 
-  it('REFUSES the spawn when a generated handler is trusted but DISABLED', async () => {
-    const rows = generatedKeys(HOME).map((key, i) => ({ key, enabled: i !== 0, trustStatus: 'trusted' }));
-    await expect(verifyCodexHookTrust(hookListServer(listing(rows)), HOME)).rejects.toThrow(/enabled=false/);
+  it('REFUSES the spawn when a guard handler is managed but DISABLED', async () => {
+    const rows = SYSTEM_KEYS.map((key, i) => ({ ...managedRow(key), enabled: i !== 0 }));
+    await expect(verify(listing(rows))).rejects.toThrow(/enabled=false/);
   });
 
   it('REFUSES the spawn when hooks/list itself fails', async () => {
     // Fail closed on a version drift that removes or renames the method: the
     // alternative is the same silence the check exists to end.
-    const server = hookListServer({ error: { code: -32601, message: 'method not found' } });
-    await expect(verifyCodexHookTrust(server, HOME)).rejects.toThrow(/hooks\/list unavailable/);
+    await expect(verify({ error: { code: -32601, message: 'method not found' } })).rejects.toThrow(
+      /hooks\/list unavailable/,
+    );
   });
 
-  it('keys the expected set on the home passed in, so a rotated CODEX_HOME is checked against ITS own hooks.json', async () => {
-    // An OAuth-fallback rotation moves CODEX_HOME; trust entries are keyed on
-    // the absolute hooks.json path, so rows from the OLD home must not satisfy
-    // the check for the new one.
-    const rows = generatedKeys('/probe/fallback-home').map((key) => ({ key, enabled: true, trustStatus: 'trusted' }));
-    await expect(verifyCodexHookTrust(hookListServer(listing(rows)), HOME)).rejects.toThrow(/missing/);
+  it('REFUSES the spawn when the image ships no guard chain', async () => {
+    await expect(verify(listing(SYSTEM_KEYS.map(managedRow)), '/nonexistent/etc/codex/hooks.json')).rejects.toThrow(
+      /no Codex guard chain is installed at \/nonexistent\/etc\/codex\/hooks\.json/,
+    );
+  });
+
+  it('does not accept a per-home copy of the chain in place of the system one', async () => {
+    // A home's own hooks.json is agent-writable, so it can never stand in for the root-owned layer.
+    const rows = [
+      '/home/node/.codex/hooks.json:pre_tool_use:0:0',
+      '/home/node/.codex/hooks.json:post_tool_use:0:0',
+    ].map((key) => ({ key, source: 'user', enabled: true, trustStatus: 'trusted' }));
+    await expect(verify(listing(rows))).rejects.toThrow(/missing/);
   });
 
   it('does NOT fail on an undispatchable plugin handler', async () => {
     // Reported, not fatal: one oddly-shaped third-party plugin must not take
     // the container down, and the guard core depends on no plugin.
     const rows = [
-      ...generatedKeys(HOME).map((key) => ({ key, enabled: true, trustStatus: 'trusted' })),
+      ...SYSTEM_KEYS.map(managedRow),
       {
         key: 'some-plugin@mkt:hooks/hooks.json:pre_tool_use:0:0',
         pluginId: 'some-plugin@mkt',
@@ -1047,6 +1037,243 @@ describe('verifyCodexHookTrust', () => {
         trustStatus: 'untrusted',
       },
     ];
-    await verifyCodexHookTrust(hookListServer(listing(rows)), HOME);
+    await verify(listing(rows));
+  });
+});
+
+// ── deferred plugin registration ───────────────────────────────────────────
+
+// `codex plugin …` is faked at the process boundary: it logs each call and appends the plugin table real codex
+// writes. Its rewrite drops the hook trust rows, so only the trust re-sync after registration restores them.
+const FAKE_PLUGIN_CODEX = `#!/usr/bin/env bash
+printf '%s\\t%s\\n' "$CODEX_HOME" "$*" >>"$FAKE_CODEX_LOG"
+if [ "$2" = add ]; then
+  [ "$3" = "\${FAKE_PLUGIN_ADD_FAILS:-}" ] && { echo "plugin add exploded" >&2; exit 1; }
+  mkdir -p "$CODEX_HOME/plugins/cache/$3"
+  awk '/^\\[/{ skip = ($0 ~ /^\\[hooks\\.state/) } !skip' "$CODEX_HOME/config.toml" >"$CODEX_HOME/config.toml.new"
+  mv "$CODEX_HOME/config.toml.new" "$CODEX_HOME/config.toml"
+  printf '\\n[plugins."%s"]\\nenabled = true\\n' "$3" >>"$CODEX_HOME/config.toml"
+  if [ -n "\${FAKE_BLOCK_TRUST_WRITE:-}" ]; then echo leftover >"$CODEX_HOME/config.toml.tmp"; chmod 0400 "$CODEX_HOME/config.toml.tmp"; fi
+fi
+exit 0
+`;
+
+allowSubprocess(['codex']);
+
+describe('deferred Codex plugin registration', () => {
+  let root: string;
+  let pluginsRoot: string;
+  let home: string;
+  let log: string;
+  const savedPath = process.env.PATH;
+  const savedFails = process.env.FAKE_PLUGIN_ADD_FAILS;
+  const pluginHookKey = (entry: string, marketplace: string) =>
+    `${entry}@${marketplace}:hooks/hooks.json:pre_tool_use:0:0`;
+  /** Trust keys present in a home's config.toml. */
+  const trustedKeys = (codexHome: string): string[] => [
+    ...parseTrustEntries(fs.readFileSync(path.join(codexHome, 'config.toml'), 'utf-8')).keys(),
+  ];
+
+  /** A plugin declares one PreToolUse hook unless `hooks` is false. */
+  function addPlugin(repo: string, entry: string, marketplace: string, sub?: string, hooks = true): void {
+    const repoDir = path.join(pluginsRoot, repo);
+    const pluginDir = sub ? path.join(repoDir, 'plugins', sub) : repoDir;
+    fs.mkdirSync(path.join(repoDir, '.agents', 'plugins'), { recursive: true });
+    fs.writeFileSync(
+      path.join(repoDir, '.agents', 'plugins', 'marketplace.json'),
+      JSON.stringify({ name: marketplace }),
+    );
+    fs.mkdirSync(path.join(pluginDir, '.codex-plugin'), { recursive: true });
+    fs.writeFileSync(
+      path.join(pluginDir, '.codex-plugin', 'plugin.json'),
+      JSON.stringify(hooks ? { name: entry, hooks: './hooks/hooks.json' } : { name: entry }),
+    );
+    if (!hooks) return;
+    fs.mkdirSync(path.join(pluginDir, 'hooks'), { recursive: true });
+    fs.writeFileSync(
+      path.join(pluginDir, 'hooks', 'hooks.json'),
+      JSON.stringify({ hooks: { PreToolUse: [{ hooks: [{ type: 'command', command: 'bun guard.ts PreToolUse' }] }] } }),
+    );
+  }
+
+  const codexCalls = (): string[] =>
+    fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n').filter(Boolean) : [];
+
+  beforeEach(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-deferred-'));
+    pluginsRoot = path.join(root, 'plugins');
+    home = path.join(root, 'runtime-home');
+    log = path.join(root, 'codex-calls.tsv');
+    fs.mkdirSync(path.join(root, 'bin'));
+    fs.writeFileSync(path.join(root, 'bin', 'codex'), FAKE_PLUGIN_CODEX, { mode: 0o755 });
+    process.env.PATH = `${path.join(root, 'bin')}:${savedPath}`;
+    process.env.FAKE_CODEX_LOG = log;
+    delete process.env.FAKE_PLUGIN_ADD_FAILS;
+    fs.mkdirSync(home, { recursive: true });
+    // What the boot leaves: the runtime config and no plugins.
+    fs.writeFileSync(path.join(home, 'config.toml'), '[features]\nhooks = true\n');
+  });
+
+  afterEach(() => {
+    process.env.PATH = savedPath;
+    delete process.env.FAKE_CODEX_LOG;
+    if (savedFails === undefined) delete process.env.FAKE_PLUGIN_ADD_FAILS;
+    else process.env.FAKE_PLUGIN_ADD_FAILS = savedFails;
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('boot hands out no runnable home: CODEX_HOME is a nonexistent pending path until the first codex call', () => {
+    const env = codexRuntimeEnv('/home/node/.codex-runtime');
+    expect(env.CODEX_HOME).toBe(PENDING_CODEX_HOME);
+    expect(fs.existsSync(PENDING_CODEX_HOME)).toBe(false);
+    expect(path.basename(env.NANOCLAW_CODEX_REGISTER)).toBe('codex-plugin-registration.ts');
+    expect(fs.existsSync(env.NANOCLAW_CODEX_REGISTER)).toBe(true);
+    expect(codexRuntimeEnv(FAILED_CODEX_HOME)).toEqual({ CODEX_HOME: FAILED_CODEX_HOME });
+  });
+
+  it('registers on the first call only: the next call finds the home ready and runs no codex', () => {
+    addPlugin('humanizer', 'humanizer', 'humanizer');
+
+    expect(
+      completeDeferredCodexRegistration({ home, pluginsRoot, fallbackHomes: [], systemHooksPath: SYSTEM_HOOKS }),
+    ).toBe(home);
+    expect(
+      completeDeferredCodexRegistration({ home, pluginsRoot, fallbackHomes: [], systemHooksPath: SYSTEM_HOOKS }),
+    ).toBe(home);
+
+    expect(codexCalls().map((line) => line.split('\t')[1])).toEqual([
+      `plugin marketplace add ${path.join(pluginsRoot, 'humanizer')}`,
+      'plugin add humanizer@humanizer',
+    ]);
+    expect(fs.readFileSync(path.join(home, 'config.toml'), 'utf8')).toContain('[plugins."humanizer@humanizer"]');
+    // `plugin add` dropped the trust rows; the re-sync restored the plugin hook's.
+    expect(trustedKeys(home)).toEqual([pluginHookKey('humanizer', 'humanizer')]);
+  });
+
+  it("adds a monorepo's marketplace once for all of its sub-plugins", () => {
+    addPlugin('bootstrap', 'wwbd', 'example-bootstrap', 'wwbd');
+    addPlugin('bootstrap', 'wwed', 'example-bootstrap', 'wwed');
+
+    completeDeferredCodexRegistration({ home, pluginsRoot, fallbackHomes: [], systemHooksPath: SYSTEM_HOOKS });
+
+    expect(codexCalls().map((line) => line.split('\t')[1])).toEqual([
+      `plugin marketplace add ${path.join(pluginsRoot, 'bootstrap')}`,
+      'plugin add wwbd@example-bootstrap',
+      'plugin add wwed@example-bootstrap',
+    ]);
+  });
+
+  it('refuses when a plugin with hooks fails to add: throws, leaves the home unready, and the next call retries', () => {
+    addPlugin('humanizer', 'humanizer', 'humanizer');
+    process.env.FAKE_PLUGIN_ADD_FAILS = 'humanizer@humanizer';
+
+    expect(() =>
+      completeDeferredCodexRegistration({ home, pluginsRoot, fallbackHomes: [], systemHooksPath: SYSTEM_HOOKS }),
+    ).toThrow(
+      /plugin registration failed for humanizer, whose hooks would not run: humanizer: plugin add failed — plugin add exploded/,
+    );
+    expect(fs.existsSync(path.join(home, '.nanoclaw-plugins-registered'))).toBe(false);
+
+    delete process.env.FAKE_PLUGIN_ADD_FAILS;
+    expect(
+      completeDeferredCodexRegistration({ home, pluginsRoot, fallbackHomes: [], systemHooksPath: SYSTEM_HOOKS }),
+    ).toBe(home);
+    expect(codexCalls().filter((line) => line.endsWith('plugin add humanizer@humanizer'))).toHaveLength(2);
+  });
+
+  it('completes when only a plugin without hooks fails to add: the home loses its skills, not a guard', () => {
+    addPlugin('humanizer', 'humanizer', 'humanizer');
+    addPlugin('skills-only', 'skills-only', 'skills-only', undefined, false);
+    process.env.FAKE_PLUGIN_ADD_FAILS = 'skills-only@skills-only';
+
+    expect(
+      completeDeferredCodexRegistration({ home, pluginsRoot, fallbackHomes: [], systemHooksPath: SYSTEM_HOOKS }),
+    ).toBe(home);
+    expect(fs.existsSync(path.join(home, '.nanoclaw-plugins-registered'))).toBe(true);
+    expect(trustedKeys(home)).toContain(pluginHookKey('humanizer', 'humanizer'));
+  });
+
+  it('refuses when the trust re-sync after registration fails, and marks nothing registered', () => {
+    addPlugin('humanizer', 'humanizer', 'humanizer');
+    process.env.FAKE_BLOCK_TRUST_WRITE = '1';
+    try {
+      expect(() =>
+        completeDeferredCodexRegistration({ home, pluginsRoot, fallbackHomes: [], systemHooksPath: SYSTEM_HOOKS }),
+      ).toThrow(/could not write Codex hook trust entries/);
+      expect(fs.existsSync(path.join(home, '.nanoclaw-plugins-registered'))).toBe(false);
+    } finally {
+      delete process.env.FAKE_BLOCK_TRUST_WRITE;
+    }
+  });
+
+  it('refuses a home the boot never prepared, before running any codex', () => {
+    addPlugin('humanizer', 'humanizer', 'humanizer');
+    const unprepared = path.join(root, 'never-prepared');
+    fs.mkdirSync(unprepared);
+
+    expect(() =>
+      completeDeferredCodexRegistration({
+        home: unprepared,
+        pluginsRoot,
+        fallbackHomes: [],
+        systemHooksPath: SYSTEM_HOOKS,
+      }),
+    ).toThrow(/never prepared at boot \(no config\.toml\)/);
+    expect(codexCalls()).toEqual([]);
+  });
+
+  it('refuses in an image with no guard chain, before running any codex', () => {
+    addPlugin('humanizer', 'humanizer', 'humanizer');
+
+    expect(() =>
+      completeDeferredCodexRegistration({
+        home,
+        pluginsRoot,
+        fallbackHomes: [],
+        systemHooksPath: '/nonexistent/etc/codex/hooks.json',
+      }),
+    ).toThrow(/no Codex guard chain is installed/);
+    expect(codexCalls()).toEqual([]);
+    expect(fs.existsSync(path.join(home, '.nanoclaw-plugins-registered'))).toBe(false);
+  });
+
+  it('projects the registered plugin tables and their trust into each fallback that holds a credential', () => {
+    addPlugin('humanizer', 'humanizer', 'humanizer');
+    const fallback = path.join(root, 'fallback-1');
+    const bare = path.join(root, 'fallback-bare');
+    fs.mkdirSync(fallback);
+    fs.mkdirSync(bare);
+    fs.writeFileSync(path.join(fallback, 'auth.json'), '{"account":"fallback"}');
+    fs.writeFileSync(path.join(fallback, 'config.toml'), 'model = "kept"\n');
+    // As at boot, but before the plugin was mounted: the fallback trusts no plugin hook.
+    syncCodexHookTrust(fallback, { pluginsRoot: path.join(root, 'no-plugins') });
+    expect(trustedKeys(fallback)).not.toContain(pluginHookKey('humanizer', 'humanizer'));
+
+    completeDeferredCodexRegistration({
+      home,
+      pluginsRoot,
+      fallbackHomes: [fallback, bare],
+      systemHooksPath: SYSTEM_HOOKS,
+    });
+
+    const config = fs.readFileSync(path.join(fallback, 'config.toml'), 'utf8');
+    expect(config).toContain('[plugins."humanizer@humanizer"]');
+    expect(config).toContain('model = "kept"');
+    expect(trustedKeys(fallback)).toEqual([pluginHookKey('humanizer', 'humanizer')]);
+    expect(fs.readlinkSync(path.join(fallback, 'plugins'))).toBe(path.join(home, 'plugins'));
+    expect(fs.readdirSync(bare)).toEqual([]);
+  });
+
+  it('the primary runtime still registers at start', () => {
+    addPlugin('humanizer', 'humanizer', 'humanizer');
+
+    const result = setupCodexPrimaryRuntime([], { home, pluginsRoot });
+
+    expect(result.registered).toEqual(['humanizer']);
+    expect(result.errors).toEqual([]);
+    expect(codexCalls().map((line) => line.split('\t')[1])).toEqual([
+      `plugin marketplace add ${path.join(pluginsRoot, 'humanizer')}`,
+      'plugin add humanizer@humanizer',
+    ]);
   });
 });

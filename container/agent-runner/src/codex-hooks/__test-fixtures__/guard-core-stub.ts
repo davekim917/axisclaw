@@ -9,7 +9,7 @@
  * maps verdicts (block/gate/allow) to the right codex decision (deny/continue) —
  * without depending on the cross-repo bootstrap mount being present in CI.
  *
- * Pointed at via NANOCLAW_DESTRUCTIVE_GUARD_CORE in runner.test.ts.
+ * Pointed at via setGuardCorePathsForTest({ destructive }) in runner.test.ts.
  */
 export const IS_NANOCLAW = false;
 

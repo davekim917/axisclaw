@@ -35,6 +35,14 @@ describe('ClaudeProvider constructor wires shimCwd onto mcpServers', () => {
     ]);
   });
 
+  it('keeps a stdio timeout, which the Claude SDK reads under the same name, through the cwd shim', () => {
+    const provider = new ClaudeProvider({
+      mcpServers: { looker: { command: 'bun', cwd: '/workspace/agent', timeout: 610_000 } },
+    });
+    const server = (provider as unknown as { mcpServers: Record<string, { timeout?: number }> }).mcpServers.looker;
+    expect(server.timeout).toBe(610_000);
+  });
+
   it('leaves a cwd-less stdio server untouched', () => {
     const provider = new ClaudeProvider({
       mcpServers: {

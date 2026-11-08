@@ -10,12 +10,14 @@ import { withCentralSync, withRawDb } from './db/central-lease.js';
 import { GROUPS_DIR } from './config.js';
 import { getRegisteredChannelNames } from './channels/channel-registry.js';
 import { readContainerConfig, type McpServerConfig } from './container-config.js';
+import { folderDbEnvNames } from './folder-db-env.js';
 import { RETIRED_MCP_SERVER_NAMES, effectiveMcpServers, readFleetMcpServers } from './fleet-mcp-servers.js';
 import { getAllAgentGroups, getAgentGroup } from './db/agent-groups.js';
 import type { AgentGroup } from './types.js';
 import { gatewayRestHosts, mergeWorkgroupAndGroupSecrets, slackUserTokenSecrets } from './onecli-secrets.js';
 import { GITHUB_APP_SENTINEL, peekGitHubAppTokenExpiry } from './github-app-token.js';
 import { GH_TOKEN_CONTAINER_PATH, githubTokenDeliveredAsEnv } from './github-token-file.js';
+import { renderTargetsFor } from './modules/approved-run/targets.js';
 import { isOwnerSafeSlackSession } from './modules/permissions/slack-user-token-gate.js';
 import { getAllMessagingGroups } from './db/messaging-groups.js';
 import { loadPluginScopes, pluginAllowedForWorkgroup } from './plugin-scopes.js';
@@ -227,7 +229,7 @@ const SCOPED_ENV_NAMES = [
   'SNOWFLAKE_ROLE',
   'SNOWFLAKE_DATABASE',
   'DBT_CLOUD_ACCOUNT_ID',
-  'DBT_CLOUD_API_TOKEN',
+  'DBT_CLOUD_API_URL',
   // OPENAI_API_KEY and DEEPGRAM_API_KEY are deliberately absent: neither has a working key, so advertising them
   // made every call 401. The codex provider reads its own OPENAI_API_KEY fallback.
   'BRAINTRUST_API_KEY',
@@ -240,8 +242,6 @@ const SCOPED_ENV_NAMES = [
   'CLOUDFLARE_API_TOKEN',
   'CLOUDFLARE_ACCOUNT_ID',
   'LOOKER_BASE_URL',
-  'LOOKER_CLIENT_ID',
-  'LOOKER_CLIENT_SECRET',
   'ATLASSIAN_BASE_URL',
   'SELECT_ORGANIZATION_ID',
 ];
@@ -307,6 +307,18 @@ export async function buildSessionServicesSnapshot(
     () => buildSessionServicesSnapshotFrom(agentGroupId, central, sessionMessagingGroupId),
     'session services snapshot',
   );
+}
+
+/** Where a production change goes when Render's protected environments refuse it to the agents' own key. */
+function renderProdRouting(agentGroupId: string): string {
+  return renderTargetsFor(agentGroupId)
+    .map((t) => {
+      const names = Object.values(t.resources)
+        .map((r) => r.label)
+        .join(', ');
+      return ` Production (${names}): your key deploys and reads status, events and logs. An env-var write or delete, a one-off job, an auto-deploy toggle, a custom domain or routes go through \`propose_render_change\` with target \`${t.id}\` (a named approver approves a card). Env reads go through \`render_env_read\` (secret values masked); for the database use the scoped login in your \`RENDER_PG_URL_*\` variables, never the owner connection string from Render. Deleting, suspending or creating services or databases, and any other setting, are dashboard steps for a human.`;
+    })
+    .join('');
 }
 
 /**
@@ -453,10 +465,9 @@ export function buildSessionServicesSnapshotFrom(
     });
   }
 
-  // Env-var-scoped, surfaced whenever a token resolves for this folder; no `tools` declaration needed.
-  const dbtCloudToken = resolveScopedEnvVar('DBT_CLOUD_API_TOKEN', folder);
-  if (dbtCloudToken.set) {
-    const dbtCloudUrl = resolveScopedEnvVar('DBT_CLOUD_API_URL', folder);
+  // Env-var-scoped, surfaced whenever an API URL resolves for this folder; no `tools` declaration needed.
+  const dbtCloudUrl = resolveScopedEnvVar('DBT_CLOUD_API_URL', folder);
+  if (dbtCloudUrl.set) {
     const dbtCloudAccount = resolveScopedEnvVar('DBT_CLOUD_ACCOUNT_ID', folder);
     services.push({
       name: 'dbt Cloud',
@@ -464,12 +475,12 @@ export function buildSessionServicesSnapshotFrom(
       declaredTools: [],
       scopes: [],
       credentialPaths: [],
-      summary: 'dbt Cloud Admin/Discovery REST — token already in your env, send no auth header of your own',
-      activation: `Authenticated via \`DBT_CLOUD_API_TOKEN\` (resolved from host env \`${dbtCloudToken.name}\`)${
-        dbtCloudUrl.set
-          ? `, base URL via \`${dbtCloudUrl.name}\``
-          : ' — no API URL var set, default to https://cloud.getdbt.com'
-      }${dbtCloudAccount.set ? `, account id via \`${dbtCloudAccount.name}\`` : ' — no account id var set, required by most endpoints'}. Example: \`curl -H "Authorization: Token $DBT_CLOUD_API_TOKEN" "$DBT_CLOUD_API_URL/api/v2/accounts/$DBT_CLOUD_ACCOUNT_ID/"\`. Do NOT ask the user for the token — it's already in your env.`,
+      summary: 'dbt Cloud Admin/Discovery REST — the OneCLI gateway adds the token, send no auth header',
+      activation: `Base URL in \`$DBT_CLOUD_API_URL\` (host env \`${dbtCloudUrl.name}\`)${
+        dbtCloudAccount.set
+          ? `, account id in \`$DBT_CLOUD_ACCOUNT_ID\` (host env \`${dbtCloudAccount.name}\`)`
+          : ' — no account id var set, required by most endpoints'
+      }. Example: \`curl "$DBT_CLOUD_API_URL/api/v2/accounts/${dbtCloudAccount.set ? '$DBT_CLOUD_ACCOUNT_ID' : '<account id>'}/"\`. The OneCLI gateway injects the dbt Cloud token for the hosts it was stored for; \`$DBT_CLOUD_API_TOKEN\` holds only a placeholder the gateway replaces. A 401 or 403 means no gateway secret covers that host: ask the operator, never the user for a token.`,
     });
   }
 
@@ -517,12 +528,7 @@ export function buildSessionServicesSnapshotFrom(
     const apiKey = resolveScopedEnvVar('RENDER_API_KEY', folder);
     if (apiKey.set || declared(['render'])) {
       const workspace = resolveScopedEnvVar('RENDER_WORKSPACE_ID', folder);
-      const folderTok = folder.toUpperCase().replace(/-/g, '_');
-      const scopedDbEnv = Object.keys(process.env)
-        .filter(
-          (k) => (k.startsWith('RENDER_PG_') || k.startsWith('RENDER_REDIS_URL_')) && k.includes(`_${folderTok}_`),
-        )
-        .sort();
+      const scopedDbEnv = folderDbEnvNames(folder);
       const scopeList = extractToolScopes(tools, 'render').scopes;
       services.push({
         name: 'Render',
@@ -534,7 +540,7 @@ export function buildSessionServicesSnapshotFrom(
           ? 'Render CLI: list services, tail logs, psql into managed Postgres'
           : 'Render declared but RENDER_API_KEY is unset on the host — ask the operator',
         activation: apiKey.set
-          ? `\`render\` CLI authenticated via \`RENDER_API_KEY\` (from host env \`${apiKey.name}\`${workspace.set ? `, workspace via \`${workspace.name}\`` : ''}). Common: \`render services -o json\`, \`render logs --service-id <id>\`, \`render psql --service-id <pg-id>\`.${scopedDbEnv.length > 0 ? ` Scoped DB URLs also injected as env vars: ${scopedDbEnv.join(', ')}.` : ''} DO NOT ask the user for the API key — it's already in your env.`
+          ? `\`render\` CLI authenticated via \`RENDER_API_KEY\` (from host env \`${apiKey.name}\`${workspace.set ? `, workspace via \`${workspace.name}\`` : ''}). Common: \`render services -o json\`, \`render logs --service-id <id>\`, \`render psql --service-id <pg-id>\`.${scopedDbEnv.length > 0 ? ` Scoped DB URLs also injected as env vars: ${scopedDbEnv.join(', ')}.` : ''} DO NOT ask the user for the API key — it's already in your env.${renderProdRouting(agentGroupId)}`
           : `render tool declared but RENDER_API_KEY not set at host — ask Operator.`,
       });
     }
@@ -632,9 +638,12 @@ export function buildSessionServicesSnapshotFrom(
   // Read-only by default: CLI/LSP toolsets disabled and mutating Admin tools blocked via DISABLE_TOOLS.
   if (declared(['dbt-mcp'])) {
     const host = resolveScopedEnvVar('DBT_HOST', folder);
-    const token = resolveScopedEnvVar('DBT_CLOUD_API_TOKEN', folder);
     const prodEnvId = resolveScopedEnvVar('DBT_PROD_ENV_ID', folder);
-    const credsReady = host.set && token.set && prodEnvId.set;
+    const credsReady = host.set && prodEnvId.set;
+    const dbtMcpHasAdminApi = resolveScopedEnvVar('DBT_CLOUD_ACCOUNT_ID', folder).set;
+    const dbtMcpAdminApi = dbtMcpHasAdminApi
+      ? 'Admin API (read-only by default — `trigger_job_run`, `cancel_job_run`, `retry_job_run` are disabled): `list_projects`, `list_jobs`, `get_job_details`, `list_jobs_runs`, `get_job_run_details`, `get_job_run_error`, `list_job_run_artifacts`, `get_job_run_artifacts`. '
+      : 'Admin API tools are off: this group has no dbt account id, so ask the operator for one to get job and run history. ';
     services.push({
       name: 'dbt Cloud (dbt-mcp)',
       mcpNamespace: 'mcp__dbt-mcp__*',
@@ -642,31 +651,28 @@ export function buildSessionServicesSnapshotFrom(
       scopes: [],
       credentialPaths: [],
       summary: credsReady
-        ? 'Model lineage/health, Semantic Layer metrics, execute_sql, job-run history (read-only)'
+        ? `Model lineage/health, Semantic Layer metrics${dbtMcpHasAdminApi ? ', job-run history' : ''} (read-only)`
         : 'dbt-mcp declared but its host credentials are incomplete — ask the operator',
       useFor: credsReady
-        ? `dbt Cloud via dbt-labs/dbt-mcp on \`${process.env[host.name]}\` (prod env \`${process.env[prodEnvId.name]}\`). Discovery API (project intelligence): \`mcp__dbt-mcp__get_all_models\`, \`get_mart_models\`, \`get_model_details\`, \`get_model_parents\`, \`get_model_children\`, \`get_lineage\`, \`get_model_health\`, \`get_model_performance\`, \`get_related_models\`, \`get_exposures\`, \`get_all_macros\`, \`get_all_sources\`, \`search\`. Semantic Layer: \`list_metrics\`, \`query_metrics\`, \`list_saved_queries\`, \`get_dimensions\`, \`get_entities\`, \`get_metrics_compiled_sql\`. SQL on dbt Platform: \`execute_sql\`, \`text_to_sql\`. Admin API (read-only by default — \`trigger_job_run\`, \`cancel_job_run\`, \`retry_job_run\` are disabled): \`list_projects\`, \`list_jobs\`, \`get_job_details\`, \`list_jobs_runs\`, \`get_job_run_details\`, \`get_job_run_error\`, \`list_job_run_artifacts\`. dbt CLI and LSP toolsets are disabled (no local project mounted). For ad-hoc Cloud REST not exposed here, fall back to \`curl -H "Authorization: Token $DBT_CLOUD_API_TOKEN_${folder.toUpperCase().replace(/-/g, '_')}"\`.`
-        : `dbt-mcp tool declared but credentials missing: ${[!host.set && 'DBT_HOST', !token.set && 'DBT_CLOUD_API_TOKEN', !prodEnvId.set && 'DBT_PROD_ENV_ID'].filter(Boolean).join(', ')} not set on host (looked for \`*_${folder.toUpperCase().replace(/-/g, '_')}\` then unscoped fallback). Ask the operator.`,
+        ? `dbt Cloud via dbt-labs/dbt-mcp on \`${process.env[host.name]}\` (prod env \`${process.env[prodEnvId.name]}\`). Discovery API (project intelligence): \`mcp__dbt-mcp__get_all_models\`, \`get_mart_models\`, \`get_model_details\`, \`get_model_parents\`, \`get_model_children\`, \`get_lineage\`, \`get_model_health\`, \`get_model_performance\`, \`get_exposures\`, \`get_all_macros\`, \`get_all_sources\`. Semantic Layer: \`list_metrics\`, \`query_metrics\`, \`list_saved_queries\`, \`get_dimensions\`, \`get_entities\`, \`get_metrics_compiled_sql\`. ${dbtMcpAdminApi}dbt CLI, LSP, SQL and remote MCP tools are off. List tools return one page per call: follow \`pagination\` in the result for the rest. For ad-hoc Cloud REST not exposed here, ${dbtCloudUrl.set ? 'fall back to `curl "$DBT_CLOUD_API_URL/api/v2/…"` with no auth header; the OneCLI gateway adds it' : 'ask the operator for the dbt Cloud API URL, which this group has none of'}.`
+        : `dbt-mcp tool declared but credentials missing: ${[!host.set && 'DBT_HOST', !prodEnvId.set && 'DBT_PROD_ENV_ID'].filter(Boolean).join(', ')} not set on host (looked for \`*_${folder.toUpperCase().replace(/-/g, '_')}\` then unscoped fallback). Ask the operator.`,
     });
   }
 
   if (declared(['looker'])) {
     const baseUrl = resolveScopedEnvVar('LOOKER_BASE_URL', folder);
-    const clientId = resolveScopedEnvVar('LOOKER_CLIENT_ID', folder);
-    const clientSecret = resolveScopedEnvVar('LOOKER_CLIENT_SECRET', folder);
-    const credsReady = baseUrl.set && clientId.set && clientSecret.set;
     services.push({
       name: 'Looker',
       mcpNamespace: 'mcp__looker__*',
       declaredTools: declaredMatchingTools(['looker']),
       scopes: [],
       credentialPaths: [],
-      summary: credsReady
+      summary: baseUrl.set
         ? 'Query explores, run raw SQL, inspect LookML, run saved Looks and dashboards'
-        : 'Looker declared but its host credentials are incomplete — ask the operator',
-      useFor: credsReady
-        ? `Looker via Google's MCP Toolbox (--prebuilt looker), instance \`${process.env[baseUrl.name]}\`. Auth via API3 client_id/client_secret (resolved from host env \`${clientId.name}\`). Use for: LookML inspection (\`mcp__looker__get_projects\`, \`get_project_files\`, \`get_project_file\`), inline queries against explores (\`mcp__looker__query\`), raw SQL (\`mcp__looker__query_sql\`), rerunning a UI URL (\`mcp__looker__query_url\`), browsing models/explores/dimensions/measures, listing/running saved Looks and dashboards, warehouse schema introspection (\`get_connection_*\`). Gaps: scheduled plans, alerts, user/role admin, PDT controls — fall back to direct Looker REST API via \`curl\` if needed.`
-        : `Looker tool declared but credentials missing: ${[!baseUrl.set && 'LOOKER_BASE_URL', !clientId.set && 'LOOKER_CLIENT_ID', !clientSecret.set && 'LOOKER_CLIENT_SECRET'].filter(Boolean).join(', ')} not set on host (looked for \`*_${folder.toUpperCase().replace(/-/g, '_')}\` then unscoped fallback). Ask the operator.`,
+        : 'Looker declared but no instance URL is configured — ask the operator',
+      useFor: baseUrl.set
+        ? `Looker via Google's MCP Toolbox (--prebuilt looker), instance \`${process.env[baseUrl.name]}\`. The OneCLI gateway adds a short-lived Looker token; this container holds no Looker credential, and a 401 means the host's token refresh needs the operator. Use for: LookML inspection (\`mcp__looker__get_projects\`, \`get_project_files\`, \`get_project_file\`), inline queries against explores (\`mcp__looker__query\`), raw SQL (\`mcp__looker__query_sql\`), rerunning a UI URL (\`mcp__looker__query_url\`), browsing models/explores/dimensions/measures, listing/running saved Looks and dashboards, warehouse schema introspection (\`get_connection_*\`). Gaps: scheduled plans, alerts, user/role admin, PDT controls — fall back to direct Looker REST API via \`curl\` if needed.`
+        : `Looker tool declared but LOOKER_BASE_URL is not set on host (looked for \`LOOKER_BASE_URL_${folder.toUpperCase().replace(/-/g, '_')}\` then unscoped fallback). Ask the operator.`,
     });
   }
 
@@ -709,6 +715,9 @@ export function buildSessionServicesSnapshotFrom(
 
     const archive =
       '`resolve_thread_link` resolves a pasted Slack OR Discord permalink from the workgroup chat archive (`/workspace/archive.db`) in any session. ';
+    const writes = cfg?.post_as_owner
+      ? 'The owner’s token here is READ-ONLY: any `chat.*`, `files.*` or `reactions.*` write returns `missing_scope`. WRITING AS THE OWNER goes only through the `post_as_owner` tool (post, or edit with `edit_ts`) and `upload_as_owner`: they show the owner the exact text on a card to approve, and post it themselves. To delete a message or react, ask the owner. '
+      : '`chat.postMessage` posts AS THE OWNER: only when they ask, and only if the token carries `chat:write` — `missing_scope` means it does not; say so, do not retry. ';
     let useFor: string;
     // The withheld branch changes what the agent may do, so it says so first and in full.
     let summary: string;
@@ -723,14 +732,19 @@ export function buildSessionServicesSnapshotFrom(
     } else if (sessionKnown) {
       useFor =
         'LIVE in THIS session: `curl https://slack.com/api/<method>` with NO auth header — the OneCLI gateway injects the owner’s user token; there is no Slack MCP. PERMALINK `…/archives/C0123/p1789080120758779` → channel `C0123`, ts `1789080120.758779` (dot before the last 6 digits); read it with `conversations.replies?channel=C0123&ts=<the link’s thread_ts if present, else that ts>`. Also `conversations.history`, `search.messages`, `users.info`, `conversations.list`, `auth.test`. ' +
-        'Never set your own `Authorization` header or ask for a token (the gateway overwrites it, so a 401 does NOT mean the credential is missing). `chat.postMessage` posts AS THE OWNER: only when they ask, and only if the token carries `chat:write` — `missing_scope` means it does not; say so, do not retry. ' +
+        'SEARCH: `search.messages` needs `search:read`; a channels-only token instead searches channels with POST `assistant.search.context` (JSON `{"query":…,"channel_types":["public_channel","private_channel"]}`) and cannot search DMs. ' +
+        'The token reads only what its scopes allow, which may exclude DMs, search and files: `missing_scope` is that limit, so tell the owner the token cannot, and do not retry or work around it. ' +
+        'Never set your own `Authorization` header or ask for a token (the gateway overwrites it, so a 401 does NOT mean the credential is missing). ' +
+        writes +
         'FILES: `url_private` bytes live on `files.slack.com`, a SEPARATE credential. Try `curl -sSL -o <path> "<url_private>"`, no auth header, then check it: `text/html` or a leading `<!DOCTYPE` is Slack’s login page — that host is not wired here; say so and stop. Operator fix: a second vault entry, same token, host `files.slack.com`, path `*`, withheld like the first (see docs/slack-user-token.md). ' +
         archive +
-        'Bottom line: never tell the owner you can’t read a Slack DM/thread/link without first trying `curl https://slack.com/api/auth.test` and the method above.';
-      summary = 'LIVE here: slack.com/api by curl with NO auth header — read DMs/channels/threads/permalinks';
+        'Bottom line: never tell the owner you can’t read a Slack thread/link without first trying `curl https://slack.com/api/auth.test` and the method above.';
+      summary =
+        'LIVE here: slack.com/api by curl with NO auth header — read the channels, threads and permalinks its scopes cover';
     } else {
       useFor =
-        'Scoped to owner-safe Slack contexts (NOT `session_mode`): the owner’s 1:1 DM or a messaging group in `slack_user_token.also_allowed_in`; withheld everywhere else. Where present, all Slack read/write is `curl https://slack.com/api/<method>` with NO auth header (the OneCLI gateway injects the user token) — `conversations.history`/`conversations.replies` for a permalink (`p1789080120758779` → ts `1789080120.758779`), `search.messages`, `users.info`, and `chat.postMessage` if the token has `chat:write`. There is no Slack MCP. ' +
+        'Scoped to owner-safe Slack contexts (NOT `session_mode`): the owner’s 1:1 DM or a messaging group in `slack_user_token.also_allowed_in`; withheld everywhere else. Where present, all Slack read/write is `curl https://slack.com/api/<method>` with NO auth header (the OneCLI gateway injects the user token) — `conversations.history`/`conversations.replies` for a permalink (`p1789080120758779` → ts `1789080120.758779`), `search.messages` and `users.info`. There is no Slack MCP. ' +
+        writes +
         archive +
         'Bottom line: confirm for the current session with `curl https://slack.com/api/auth.test` or `get_capabilities` before telling the owner you can’t read something.';
       summary =

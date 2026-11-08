@@ -34,6 +34,7 @@ import { sessionStillActive } from '../../container-runner.js';
 import { requestWake } from '../../request-wake.js';
 import { GuardDenyError, guard } from '../../guard/index.js';
 import { log } from '../../log.js';
+import { archiveTenancyOf } from '../../archive-tenancy.js';
 import { upsertArchiveMessage } from '../../message-archive.js';
 import { scrubSecrets } from '../../secret-scrubber.js';
 import {
@@ -616,20 +617,24 @@ async function archiveRoutedMessage(
   const { text } = parseMessageContent(content);
   if (!text) return;
   const sourceName = (await getAgentGroup(sourceAgentGroupId))?.name ?? sourceAgentGroupId;
-  upsertArchiveMessage({
-    id: a2aMsgId,
-    agentGroupId: targetAgentGroupId,
-    messagingGroupId: targetSession.messaging_group_id,
-    channelType: 'agent',
-    channelName: sourceName,
-    platformId: sourceAgentGroupId,
-    threadId: targetSession.thread_id,
-    role: 'user',
-    senderId: sourceAgentGroupId,
-    senderName: sourceName,
-    text,
-    sentAt: new Date().toISOString(),
-  });
+  const tenancy = await archiveTenancyOf(targetAgentGroupId);
+  upsertArchiveMessage(
+    {
+      id: a2aMsgId,
+      agentGroupId: targetAgentGroupId,
+      messagingGroupId: targetSession.messaging_group_id,
+      channelType: 'agent',
+      channelName: sourceName,
+      platformId: sourceAgentGroupId,
+      threadId: targetSession.thread_id,
+      role: 'user',
+      senderId: sourceAgentGroupId,
+      senderName: sourceName,
+      text,
+      sentAt: new Date().toISOString(),
+    },
+    tenancy,
+  );
 }
 
 /**

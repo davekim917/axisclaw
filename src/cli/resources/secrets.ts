@@ -31,7 +31,10 @@ function formatIntake(v: SecretIntakeView): string {
   return [
     `Intake ${v.intakeId} — ${v.mode} "${v.secretName}": ${v.status}${v.detail ? ` (${v.detail})` : ''}`,
     `Form sent to: ${v.deliveredTo}`,
-    `Grants:       ${[...v.groups.map((g) => `group ${g}`), ...v.workgroups.map((w) => `workgroup ${w}`)].join(', ') || '(none)'}`,
+    ...(v.clientCredentials
+      ? [`Stores:       the client-credentials pair of integration "${v.clientCredentials}", on this host`]
+      : []),
+    `Grants:       ${v.reservedFor ? `OneCLI agent ${v.reservedFor} only (lane token)` : [...v.groups.map((g) => `group ${g}`), ...v.workgroups.map((w) => `workgroup ${w}`)].join(', ') || '(none)'}`,
     `Expires:      ${formatLocalTime(v.expiresAt, TIMEZONE)}`,
   ].join('\n');
 }
@@ -71,12 +74,42 @@ registerResource({
         'Multi-part credentials: declare each part with --field \'name|Label\' (repeatable, up to 5; a trailing ? on the name makes it optional). --compose basic joins exactly two required fields into one secret, base64("<first>:<second>"), sent as "Basic {value}" by default: HTTP Basic auth, or an OAuth client ID and secret at a token endpoint. --compose separate (the default for two or more fields) stores each field as its own secret <name>-<field>, each with its own header: --field \'name|Label|Header[|Format]\', format default "{value}"; a blank optional field stores nothing. A rotation repeats the --field names (no header) and replaces only the fields filled in. Only secret values go in the form: take a user id, subdomain or account id in chat. Never ask a user to encode or combine values themselves.\n\n' +
         "From an agent with no --groups/--workgroups, a new secret is granted to the calling group's workgroup, so every sibling gets it (a group in no workgroup gets it itself); name --groups only for a key one member alone should hold. A rotation grants nothing new. A new grant takes effect at the next container start.",
       args: [
-        { name: 'name', type: 'string', description: 'Vault name, e.g. Linear-API-Key.', required: true },
+        {
+          name: 'name',
+          type: 'string',
+          description: 'Vault name, e.g. Linear-API-Key. Required unless --reserved-for.',
+        },
+        {
+          name: 'reserved_for',
+          type: 'string',
+          description:
+            'Host operator only: an approved-run-* OneCLI agent. The secret is named "<agent> token" and attached to that agent alone; needs an exact --path-pattern or --host-wide, and takes no --name, --groups or --workgroups, and no --field or --compose except --compose basic with two fields (an API that takes HTTP Basic).',
+        },
+        {
+          name: 'host_wide',
+          type: 'boolean',
+          description:
+            'With --reserved-for, new token only: send it on every path of --host-pattern, not one. Only for a lane whose token stays in host code and whose own allowlist decides what it calls: the gateway no longer limits the path. Takes no --path-pattern.',
+        },
+        {
+          name: 'entered_by',
+          type: 'string',
+          description:
+            'With --reserved-for: a namespaced user id who may enter it besides owners and global admins. They must be an admin of an agent group of a target that runs as that agent; the card goes to their DM only.',
+        },
         { name: 'rotate', type: 'boolean', description: 'Replace the value of an existing secret.' },
+        {
+          name: 'client_credentials',
+          type: 'string',
+          description:
+            'Host operator only: an existing client-credentials integration (ncl integrations add-client). The form takes its new client ID and secret, an owner or global admin enters them, and they go to the 0600 host store instead of the vault. A token is minted from the pair first, so a refused pair changes nothing. Takes no other flag.',
+        },
         {
           name: 'host_pattern',
           type: 'string',
-          description: 'Host the value is injected for, e.g. api.linear.app. Required for a new secret.',
+          multiple: true,
+          description:
+            'Host the value is injected for, e.g. api.linear.app. Required for a new secret. Repeat it (up to 4) for an API that authenticates on several hosts: one pasted value is stored once per host as <name>-1of<n> … <name>-<n>of<n>, all or none, and --rotate --name <name> rotates the whole set. host=format gives one host its own --value-format.',
         },
         { name: 'path_pattern', type: 'string', description: 'Optional path match, e.g. /v1/*.' },
         { name: 'header', type: 'string', description: 'Header to inject (default Authorization).' },
@@ -105,13 +138,22 @@ registerResource({
         'ncl secrets intake --name Exa-API-Key --host-pattern api.exa.ai --header x-api-key --value-format "{value}" --workgroups example-wg',
         "ncl secrets intake --name Example-Client --host-pattern auth.example.com --path-pattern /token --compose basic --field 'client_id|Client ID' --field 'client_secret|Client secret'",
         "ncl secrets intake --name Example-API --host-pattern api.example.com --field 'api_key|API key|X-Api-Key' --field 'api_secret?|API secret|X-Api-Secret'",
+        "ncl secrets intake --name Example-Cloud --host-pattern 'ab1.example.com=Token {value}' --host-pattern ab1.metadata.example.com --workgroups example-wg",
         'ncl secrets intake --name Linear-API-Key --rotate',
+        'ncl secrets intake --client-credentials example-looker',
+        'ncl secrets intake --reserved-for approved-run-example --host-pattern api.example.com --path-pattern /v1/things/one',
+        'ncl secrets intake --reserved-for approved-run-example --host-pattern api.example.com --host-wide',
+        "ncl secrets intake --reserved-for approved-run-example --host-pattern auth.example.com --path-pattern /oauth/token --compose basic --field 'client_id|Client ID' --field 'client_secret|Client secret'",
       ],
       handler: async (args, ctx) =>
         startSecretIntake({
-          name: String(args.name),
+          name: optionalString(args.name),
+          reservedFor: optionalString(args.reserved_for),
+          hostWide: args.host_wide === true,
+          enteredBy: optionalString(args.entered_by),
+          clientCredentials: optionalString(args.client_credentials),
           rotate: args.rotate === true || args.rotate === 'true',
-          hostPattern: optionalString(args.host_pattern),
+          hostPattern: list(args.host_pattern),
           pathPattern: optionalString(args.path_pattern),
           headerName: optionalString(args.header),
           valueFormat: optionalString(args.value_format),

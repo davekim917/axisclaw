@@ -77,8 +77,11 @@
 #
 # What a live owner DOES refresh is the run tree: it writes its artifacts
 # there continuously. Freshness is therefore
-#   max(ack mtime, newest mtime under <run>/ EXCLUDING <run>/challenger/)
-# against RENEW_FRESHNESS_SECONDS (1200 s). Measured on that same step: 507
+#   max(ack mtime, newest owner write under <run>/)
+# against RENEW_FRESHNESS_SECONDS (1200 s). "Owner write" is the controller's
+# rule, `smoke_owner_activity.py`, which also decides when an overdue owner
+# step alarms: it leaves out <run>/challenger/ and the files the controller
+# itself rewrites in <run>/controller/. Measured on that same step: 507
 # writes over 46 minutes, largest gap between writes 253 s (next 153, 126,
 # 123). 1200 s clears the worst real gap by 4.7x -- anyone tightening this
 # window needs that number, because below ~300 s it starts cutting into
@@ -93,14 +96,14 @@
 # arriving from a different directory.
 #
 # A scan that cannot complete can only make the tree look OLDER (a truncated
-# `find` sees fewer files, so its maximum can only fall), so every scan
+# walk sees fewer files, so its maximum can only fall), so every scan
 # failure degrades to "not fresh" -> no renewal. That is the safe direction,
 # and the reason is recorded in the tick's own line rather than swallowed.
 #
-# THE CEILING is OWNER_STEP_SLA_SECONDS (3600 s,
-# smoke-campaign-controller.py:150), measured from the obligation's FIRST
-# journal record -- the same clock the controller uses to call a step overdue
-# and escalate (owner_step:1975-1987). Past it this tick stops renewing, the
+# THE CEILING is the controller's owner-step SLA for that step
+# (`owner_step_sla`: 3600 s, or 10800 s for `lanes`, which walks every lane in
+# one step), measured from the obligation's FIRST journal record -- the same
+# clock the legacy-route controller uses to call a step overdue and escalate. Past it this tick stops renewing, the
 # lease lapses within its remaining TTL, and the existing overdue/escalation
 # and `pr_run_stalled` paths take over untouched. A lease that renews forever
 # would be a worse defect than the one this fixes, so the overrides
@@ -111,7 +114,7 @@
 # still writing under the run. After the owner dies it stops within one
 # freshness window (<= 1200 s), or sooner if the controller reconciles the
 # step first -- whichever comes first -- and in the worst case the ceiling
-# stops it at 3600 s from the step's first journal record. It does NOT stop
+# stops it at the step's SLA from its first journal record. It does NOT stop
 # instantly, and nothing here should be read as claiming that it does.
 #
 # DEGRADATION. Every failure path here renews nothing: no env file, kill
@@ -136,7 +139,10 @@ NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
 NOW_EPOCH="$(date -u +%s 2>/dev/null)" || NOW_EPOCH=0
 
 CEILING_MAX=3600          # = OWNER_STEP_SLA_SECONDS; the override clamps DOWN only
-FRESHNESS_MAX=1200        # 4.7x the largest measured gap between owner writes
+LANES_CEILING_MAX=10800   # = LANES_STEP_SLA_SECONDS, the same rule
+ACTIVITY_HELPER="$(dirname -- "${BASH_SOURCE[0]}")/smoke_owner_activity.py"
+FRESHNESS_MAX="$(timeout -k 2 10 python3 -I "$ACTIVITY_HELPER" --window 2>/dev/null)"
+[[ "$FRESHNESS_MAX" =~ ^[1-9][0-9]{0,4}$ ]] || FRESHNESS_MAX=0
 GATE_CALL_TIMEOUT=20      # same budget the live fire gives one `progress`
 SCAN_TIMEOUT=10           # a run tree is thousands of files; bound the walk
 MAX_RENEWALS=16           # a tick is bounded even if the journal is huge
@@ -339,6 +345,7 @@ clamp_down() { # <target-var> <env-value> <max>
   fi
 }
 clamp_down CEILING "${SMOKE_CONTROLLER_RENEW_CEILING_SECONDS:-}" "$CEILING_MAX"
+clamp_down LANES_CEILING "${SMOKE_CONTROLLER_RENEW_CEILING_SECONDS:-}" "$LANES_CEILING_MAX"
 clamp_down FRESHNESS "${SMOKE_CONTROLLER_RENEW_FRESHNESS_SECONDS:-}" "$FRESHNESS_MAX"
 
 # -- which runs have an owner step genuinely in flight ------------------------
@@ -419,21 +426,14 @@ note() { # <runId> <step> <reason>
     '. + [{runId:$r,step:$s,reason:$why}]' <<<"$RESULT_SKIPPED")"
 }
 
-# Newest mtime under the run, in epoch seconds, EXCLUDING <run>/challenger/ --
-# the other side of the campaign, whose liveness is not the coordinator's.
-# Prints 0 when it cannot answer, which the caller reads as "not fresh": a
-# truncated or failed walk can only lower the maximum, so every failure of
-# this function errs toward not renewing.
+# Newest owner write under the run, in epoch seconds (smoke_owner_activity.py).
+# Prints 0 when it cannot answer, which the caller reads as "not fresh".
 coordinator_activity_epoch() { # <run-dir>
-  local dir="$1"
+  local dir="$1" out
   [ -d "$dir" ] || { printf '0'; return 0; }
-  # `-type f` on purpose: a directory's mtime moves when an entry is added or
-  # removed in it, so counting directories would let the one-time `mkdir` of
-  # <run>/challenger/ bump <run>'s own mtime and defeat the prune. A write is
-  # a file; a directory timestamp is a side effect of one.
-  timeout -k 2 "$SCAN_TIMEOUT" \
-    find "$dir" -path "$dir/challenger" -prune -o -type f -printf '%T@\n' 2>/dev/null |
-    awk 'BEGIN { m = 0 } { v = $1 + 0; if (v > m) m = v } END { printf "%d", m }'
+  out="$(timeout -k 2 "$((SCAN_TIMEOUT + 5))" python3 -I "$ACTIVITY_HELPER" "$dir" 2>/dev/null)"
+  [[ "$out" =~ ^[0-9]+$ ]] || out=0
+  printf '%s' "$out"
 }
 
 RENEWALS=0
@@ -480,7 +480,7 @@ while IFS= read -r candidate; do
     continue
   fi
   QUIET=$((NOW_EPOCH - NEWEST))
-  if [ "$QUIET" -gt "$FRESHNESS" ]; then
+  if [ "$FRESHNESS" -le 0 ] || [ "$QUIET" -gt "$FRESHNESS" ]; then
     # Nothing coordinator-side has been written for a whole window. The owner
     # is finished or gone; the controller's overdue path owns it from here.
     note "$RUN_ID" "$STEP" \
@@ -491,8 +491,10 @@ while IFS= read -r candidate; do
     note "$RUN_ID" "$STEP" "step start time is unusable; not renewed"
     continue
   fi
-  if [ "$AGE" -gt "$CEILING" ]; then
-    note "$RUN_ID" "$STEP" "past the ${CEILING}s ceiling (${AGE}s); the overdue path owns it now"
+  STEP_CEILING="$CEILING"
+  [ "$STEP" != lanes ] || STEP_CEILING="$LANES_CEILING"
+  if [ "$AGE" -gt "$STEP_CEILING" ]; then
+    note "$RUN_ID" "$STEP" "past the ${STEP_CEILING}s ceiling (${AGE}s); the overdue path owns it now"
     continue
   fi
   if [ "$RENEWALS" -ge "$MAX_RENEWALS" ]; then

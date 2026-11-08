@@ -1,7 +1,7 @@
 /**
  * Hourly `git pull --ff-only` of each `~/plugins/<name>`, `npm ci --ignore-scripts` for each existing install whose
- * lockfile it changed, a refresh of the derived Codex surfaces, and a `PLUGIN_UPDATE_NOTIFY_JID` note if any advanced,
- * started failing, or recovered.
+ * lockfile it changed, a refresh of the derived Codex surfaces, `claude plugin update` of each host install behind
+ * its checkout, and a `PLUGIN_UPDATE_NOTIFY_JID` note if any advanced, started failing, or recovered.
  */
 import { execFile } from 'child_process';
 import fs from 'fs';
@@ -14,6 +14,7 @@ import { refreshMaterializedCodexSkills } from './codex-skill-materialize.js';
 import { getDeliveryAdapter } from './delivery.js';
 import { vendorDesignArtifactLoop } from './design-artifact-loop-vendor.js';
 import { onHostShutdown, onHostStart } from './host-lifecycle.js';
+import { isPathInside } from './inbox-safety.js';
 import { log } from './log.js';
 import { syncOpenCodeSubagents } from './opencode-sync.js';
 
@@ -23,6 +24,7 @@ const INTERVAL_MS = 60 * 60 * 1000;
 const STARTUP_DELAY_MS = 5 * 60 * 1000; // let the host settle after boot
 const GIT_PULL_TIMEOUT_MS = 30_000;
 const CODEX_MARKETPLACE_UPGRADE_TIMEOUT_MS = 60_000;
+const CLAUDE_PLUGIN_TIMEOUT_MS = 60_000;
 const NPM_CI_TIMEOUT_MS = 5 * 60_000;
 const DEFAULT_NOTIFY_TIMEOUT_MS = 60_000;
 const NPM_LOCKFILE = 'package-lock.json';
@@ -35,8 +37,18 @@ interface LockEntry {
   version?: unknown;
 }
 
+/** One row of `claude plugin list --json`. `readFromFolder` exists only for a directory marketplace. */
+interface ClaudePluginEntry {
+  id: string;
+  scope?: string;
+  version?: string;
+  readFromFolder?: string;
+  folderVersion?: string;
+}
+
 // The hourly refresh would repeat the missing-codex-binary line forever; log it once per process.
 let codexBinaryMissingLogged = false;
+let claudeBinaryMissingLogged = false;
 
 export interface PluginUpdaterDeps {
   /** Called with `PLUGIN_UPDATE_NOTIFY_JID` (channel-qualified platform id) and the text when plugins updated, started failing, or recovered. */
@@ -219,7 +231,75 @@ export async function runPluginUpdates(): Promise<UpdateResult[]> {
   if (results.some((r) => r.plugin === 'design-artifact-loop' && r.changed)) {
     vendorDesignArtifactLoopIfPresent();
   }
+  return [...results, ...(await updateHostPlugins(pluginsRoot))];
+}
+
+/**
+ * Host sessions run a copy in Claude Code's plugin cache, which no `git pull` reaches. Only checkouts this updater
+ * pulled are synced: a Git marketplace is third-party code nobody here reviewed. Runs on every tick, so an install
+ * left behind by an earlier failure catches up without a new commit. The running sessions keep their copy until restart.
+ */
+async function updateHostPlugins(pluginsRoot: string): Promise<UpdateResult[]> {
+  let entries: ClaudePluginEntry[];
+  try {
+    const { stdout } = await execFileAsync('claude', ['plugin', 'list', '--json'], {
+      timeout: CLAUDE_PLUGIN_TIMEOUT_MS,
+      encoding: 'utf-8',
+    });
+    entries = JSON.parse(stdout) as ClaudePluginEntry[];
+    if (!Array.isArray(entries)) throw new Error('claude plugin list --json did not return a list');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') {
+      if (!claudeBinaryMissingLogged) {
+        claudeBinaryMissingLogged = true;
+        log.info('Claude CLI not installed on host — skipping host plugin sync');
+      }
+      return [];
+    }
+    const msg = err instanceof Error ? err.message : String(err);
+    log.warn('Host plugin listing failed', { err: msg });
+    return [{ plugin: 'claude plugin list', changed: false, error: msg }];
+  }
+
+  const results: UpdateResult[] = [];
+  // Sequential: every update rewrites the same installed_plugins.json.
+  const fromCheckout = (e: ClaudePluginEntry) => e.readFromFolder && isPathInside(pluginsRoot, e.readFromFolder);
+  for (const entry of entries.filter((e) => e.scope === 'user' && fromCheckout(e))) {
+    const behind = entry.folderVersion !== undefined && entry.folderVersion !== entry.version;
+    results.push(behind ? await updateHostPlugin(entry.id) : { plugin: entry.id, changed: false });
+  }
   return results;
+}
+
+async function updateHostPlugin(id: string): Promise<UpdateResult> {
+  try {
+    const { stdout } = await execFileAsync('claude', ['plugin', 'update', id, '--scope', 'user', '--json'], {
+      timeout: CLAUDE_PLUGIN_TIMEOUT_MS,
+      encoding: 'utf-8',
+    });
+    const { updateOutcome, message } = JSON.parse(stdout) as { updateOutcome?: string; message?: string };
+    if (updateOutcome !== 'updated' && updateOutcome !== 'up_to_date') {
+      throw new Error(message ?? `claude plugin update returned ${updateOutcome}`);
+    }
+    if (updateOutcome === 'updated') log.info('Host plugin updated', { plugin: id, message });
+    return { plugin: id, changed: updateOutcome === 'updated' };
+  } catch (err) {
+    const msg = updateFailureMessage(err);
+    log.warn('Host plugin update failed', { plugin: id, err: msg });
+    return { plugin: id, changed: false, error: msg };
+  }
+}
+
+/** A refused update exits non-zero and carries its reason in the JSON on stdout, which `err.message` omits. */
+function updateFailureMessage(err: unknown): string {
+  const stdout = (err as { stdout?: string })?.stdout;
+  try {
+    const { message } = JSON.parse(stdout ?? '') as { message?: string };
+    if (message) return message;
+  } catch {
+    // Not the CLI's JSON (a timeout or a crash), so the process error is the reason.
+  }
+  return err instanceof Error ? err.message : String(err);
 }
 
 /**

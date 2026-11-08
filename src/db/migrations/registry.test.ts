@@ -141,6 +141,15 @@ describe('central migration registry', () => {
       'workgroup-access',
       'wiring-engage-senders',
       'previews',
+      'open-ask-marks',
+      'work-outcome-delivered-at',
+      'mobile-devices',
+      'approval-card-copies',
+      'thread-title-source',
+      'mcp-oauth-client-credentials',
+      'mobile-send-keys',
+      'discord-relay-posts',
+      'workgroup-approvals-channel',
     ]);
     const liveSchema = schemaObjects(live);
     // Canary: two empty snapshots compare equal, so assert the query actually

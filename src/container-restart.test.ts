@@ -552,16 +552,19 @@ describe('repository mount reconciliation', () => {
     const sessions = Array.from({ length: 250 }, (_, index) => makeSession(`s${index}`, 'g1'));
     mockIsContainerRunning.mockReturnValue(false);
     let macrotasksObserved = 0;
-    const tick = setInterval(() => {
+    let handle: NodeJS.Immediate;
+    const tick = () => {
       macrotasksObserved += 1;
-    }, 0);
+      handle = setImmediate(tick);
+    };
+    handle = setImmediate(tick);
 
     try {
       const quiescence = await quiesceSessionsForRepositoryMounts([...sessions] as never, 'repository-publish:req-big');
       expect(quiescence.barrierSessions).toHaveLength(250);
-      expect(macrotasksObserved).toBeGreaterThan(0);
+      expect(macrotasksObserved).toBeGreaterThanOrEqual(250);
     } finally {
-      clearInterval(tick);
+      clearImmediate(handle!);
     }
   });
 

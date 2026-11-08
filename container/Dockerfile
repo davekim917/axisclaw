@@ -43,7 +43,7 @@ ARG GWS_VERSION=0.22.5
 ARG CODEX_VERSION=0.163.0
 ARG OPENCODE_VERSION=1.18.34
 ARG WIX_CLI_VERSION=1.1.256
-ARG DBT_MCP_VERSION=2.5.0
+ARG DBT_MCP_VERSION=2.10.0
 ARG PIP_VERSION=26.2.1
 ARG SETUPTOOLS_VERSION=84.0.0
 ARG WHEEL_VERSION=0.48.0
@@ -163,7 +163,8 @@ RUN python3 -m venv /opt/atlassian-venv \
 # + Admin API + dbt CLI/LSP). Requires Python >=3.12; node:22-slim (bookworm)
 # only ships 3.11, so we use uv to install a managed Python 3.12 and isolate
 # dbt-mcp's deps. uv lives in its own venv to match the snow/dbt/atlassian
-# isolation pattern.
+# isolation pattern. uv resolves dbt-mcp's dependencies fresh on each build, so
+# the import check fails the build when one breaks its import, not the spawn.
 RUN python3 -m venv /opt/uv-venv \
     && /opt/uv-venv/bin/pip install --no-cache-dir --upgrade "pip==${PIP_VERSION}" "setuptools==${SETUPTOOLS_VERSION}" "wheel==${WHEEL_VERSION}" \
     && /opt/uv-venv/bin/pip install --no-cache-dir "uv==${UV_VERSION}" \
@@ -173,7 +174,8 @@ RUN python3 -m venv /opt/uv-venv \
        UV_TOOL_BIN_DIR=/usr/local/bin \
        UV_PYTHON_INSTALL_DIR=/opt/uv-python \
        uv tool install --python 3.12 "dbt-mcp==${DBT_MCP_VERSION}" \
-    && chmod -R a+rX /opt/uv-tools /opt/uv-python
+    && chmod -R a+rX /opt/uv-tools /opt/uv-python \
+    && /opt/uv-tools/dbt-mcp/bin/python -c "import dbt_mcp.main"
 
 # AWS CLI v2 (isolated from pip to avoid version churn)
 RUN ARCH=$(uname -m) \
@@ -493,6 +495,22 @@ RUN mv /pnpm/claude /pnpm/claude-real && test -x /pnpm/claude-real
 COPY --chmod=0755 claude-review-wrapper.sh /pnpm/claude
 RUN test -x /pnpm/claude
 
+# ---- Source taps --------------------------------------------------------------
+# Record data-source calls to the per-container ledger the reply's sources footer is built from, only in a container
+# whose group turned the footer on; otherwise each tap is a stat and a pass-through. A .pth in each interpreter's own
+# site dir, not PYTHONPATH or a sitecustomize, so no existing startup hook or module is shadowed.
+COPY --chmod=0755 source-taps/python/ /opt/nanoclaw-sources/python/
+RUN for py in /usr/bin/python3 /opt/snow-venv/bin/python /opt/dbt-venv/bin/python /opt/uv-venv/bin/python; do \
+      site="$("$py" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')" && \
+      mkdir -p "$site" && cp /opt/nanoclaw-sources/python/nanoclaw-source-tap.pth "$site/" || exit 1; \
+    done
+RUN mv /pnpm/gws /pnpm/gws-real && test -x /pnpm/gws-real
+COPY --chmod=0755 source-taps/gws-record.mjs /opt/nanoclaw-sources/gws-record.mjs
+COPY --chmod=0755 source-taps/gws-shim.sh /pnpm/gws
+# Ahead of Debian's /usr/bin/psql on PATH; the recorder it starts is part of the mounted runner source.
+RUN test -x /usr/bin/psql && test ! -e /usr/local/bin/psql
+COPY --chmod=0755 source-taps/psql-shim.sh /usr/local/bin/psql
+
 # ---- ncl CLI wrapper ----------------------------------------------------------
 # Actual script lives in the mounted source at /app/src/cli/ncl.ts.
 RUN printf '#!/bin/sh\nexec bun /app/src/cli/ncl.ts "$@"\n' > /usr/local/bin/ncl && \
@@ -500,6 +518,12 @@ RUN printf '#!/bin/sh\nexec bun /app/src/cli/ncl.ts "$@"\n' > /usr/local/bin/ncl
 
 # ---- Entrypoint --------------------------------------------------------------
 COPY --chmod=0755 entrypoint.sh /app/entrypoint.sh
+
+# Codex's system layer: the destructive-action guard chain and the pin that keeps hooks on. Root-owned so no codex
+# home, flag or config the agent controls can remove or disable it.
+COPY --chown=root:root --chmod=0644 codex-system/hooks.json codex-system/requirements.toml codex-system/hook-bunfig.toml /etc/codex/
+# --chmod also lands on the directory COPY creates, which would leave node unable to traverse it.
+RUN chmod 0755 /etc/codex
 
 # ---- Workspace + permissions -------------------------------------------------
 # Remap the `node` user+group to UID/GID 1001 before any chowns so the
@@ -548,7 +572,12 @@ RUN unreadable="$(find /opt/remotion \( -type f ! -readable -o -type d ! -execut
     && test -r /app/puppeteer-config.json \
     && test -x /app/entrypoint.sh \
     && test -x /usr/local/bin/hex-wrapper.sh \
-    && test -x /opt/remotion/new-video.sh
+    && test -x /opt/remotion/new-video.sh \
+    && test -r /etc/codex/hooks.json \
+    && ! test -w /etc/codex \
+    && ! test -w /etc/codex/hooks.json \
+    && ! test -w /etc/codex/requirements.toml \
+    && ! test -w /etc/codex/hook-bunfig.toml
 # The runtime cwd is /workspace/agent (agent-runner's CWD constant, passed to
 # every provider). This WORKDIR only sets the entrypoint process's cwd, but it
 # must still name a path that exists inside the session-dir bind at /workspace:

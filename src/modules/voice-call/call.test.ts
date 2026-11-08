@@ -18,7 +18,7 @@ interface Harness {
   written: Promise<void>;
 }
 
-async function connect(recent: FeedEvent[] = []): Promise<Harness> {
+async function connect(recent: FeedEvent[] = [], group = false): Promise<Harness> {
   const h = {
     appended: [],
     injected: [],
@@ -54,7 +54,12 @@ async function connect(recent: FeedEvent[] = []): Promise<Harness> {
     caption: (role, text, done) => h.captions.push(done ? `${role}:done` : `${role}:${text}`),
     ended: (text) => h.ended.push(text),
   };
-  h.bridge = new VoiceCallBridge({ agentName: 'Atlas', callerName: 'Rae Doe' }, ports);
+  h.bridge = new VoiceCallBridge(
+    group
+      ? { agentName: 'Atlas', callerName: 'the group', group: true, platform: 'Slack' }
+      : { agentName: 'Atlas', callerName: 'Rae Doe', platform: 'Slack' },
+    ports,
+  );
   expect(await h.bridge.start('v=0 offer')).toBe('v=0 answer');
   return h;
 }
@@ -65,6 +70,26 @@ const say = (h: Harness, text: string) => {
 };
 
 describe('VoiceCallBridge', () => {
+  it('tells a group voice who is on the call, greets one person by name, and announces only one-to-several crossings', async () => {
+    const h = await connect([], true);
+    h.live({ type: 'started' });
+    h.bridge.peopleOnCall(['Rae']);
+    h.bridge.audioConnected();
+    h.bridge.peopleOnCall(['Sam', 'Rae']);
+    h.bridge.peopleOnCall(['Rae', 'Sam']);
+    h.bridge.peopleOnCall(['Rae', 'Sam', 'Lee']);
+    h.bridge.peopleOnCall(['Rae']);
+    expect(h.appended.map(({ text, channel }) => [channel, text])).toEqual([
+      ['commentary', 'On the call: Rae. One person: everything they say is to you.'],
+      ['speakable', 'The call just connected. Greet Rae with exactly: "Hi Rae, it\'s Atlas."'],
+      ['commentary', 'On the call: Rae and Sam. 2 people: respond only when someone says your name.'],
+      ['speakable', 'Sam joined the call. In one short sentence, tell everyone to say your name when they need you.'],
+      ['commentary', 'On the call: Lee, Rae and Sam. 3 people: respond only when someone says your name.'],
+      ['commentary', 'On the call: Rae. One person: everything they say is to you.'],
+      ['speakable', 'Lee and Sam left the call. In one short sentence, tell Rae they no longer need to say your name.'],
+    ]);
+  });
+
   it('greets only once the voice is up and the caller can hear it', async () => {
     const h = await connect();
     h.live({ type: 'started' });
@@ -86,7 +111,7 @@ describe('VoiceCallBridge', () => {
     const opened = new Promise<void>((r) => (release = r));
     let agent!: (event: FeedEvent) => void;
     const bridge = new VoiceCallBridge(
-      { agentName: 'Atlas', callerName: 'Rae Doe' },
+      { agentName: 'Atlas', callerName: 'Rae Doe', platform: 'Slack' },
       {
         openLive: async () => {
           await opened;
@@ -288,7 +313,7 @@ describe('VoiceCallBridge', () => {
     expect(h.liveClosed).toBe(true);
     expect(h.injected[1]).toEqual({ text: expect.stringContaining('Caller: oh and open a PR when done'), wake: true });
     expect(h.injected[1].text).toContain('Rae Doe ended the voice call.');
-    expect(h.mirrored[h.mirrored.length - 1]).toBe('📞 Voice call ended.');
+    expect(h.mirrored[h.mirrored.length - 1]).toBe('📞 Voice call with Atlas ended.');
     expect(h.ended).toEqual(['Call ended.']);
   });
 
@@ -335,7 +360,10 @@ describe('VoiceCallBridge', () => {
       caption: () => undefined,
       ended: () => undefined,
     };
-    const bridge = new VoiceCallBridge({ agentName: 'Pixel', callerName: 'the group', group: true }, ports);
+    const bridge = new VoiceCallBridge(
+      { agentName: 'Pixel', callerName: 'the group', group: true, platform: 'Slack' },
+      ports,
+    );
     await bridge.start('v=0 offer');
 
     live({ type: 'delegation', id: 'd-1', text: 'Pixel, deploy the build.' });
@@ -367,7 +395,10 @@ describe('VoiceCallBridge', () => {
       caption: () => undefined,
       ended: () => undefined,
     };
-    const bridge = new VoiceCallBridge({ agentName: 'Pixel', callerName: 'the group', group: true }, ports);
+    const bridge = new VoiceCallBridge(
+      { agentName: 'Pixel', callerName: 'the group', group: true, platform: 'Slack' },
+      ports,
+    );
     bridge.end({ dropped: false, reason: 'ended' });
     await expect(bridge.start('v=0 offer')).rejects.toThrow(/ended/);
     expect([feeds, lives]).toEqual([0, 0]);

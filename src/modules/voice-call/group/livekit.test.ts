@@ -15,7 +15,8 @@ vi.mock('../../../container-runtime.js', () => ({
   },
 }));
 
-const { ensureLiveKit, stopLiveKit, LIVEKIT_INTERNAL_URL } = await import('./livekit.js');
+const { ensureLiveKit, stopLiveKit, deleteRoom, removeParticipant, LIVEKIT_INTERNAL_URL } =
+  await import('./livekit.js');
 
 beforeEach(() => {
   calls.length = 0;
@@ -37,5 +38,22 @@ describe('room server', () => {
     expect(new URL(LIVEKIT_INTERNAL_URL).hostname).toBe(name);
     const removed = calls.filter((args) => args[0] === 'rm').map((args) => args.slice(2));
     expect(removed).toEqual([[name], [name]]);
+  });
+
+  it('signs each room-service call with the grant LiveKit checks for it', async () => {
+    const grants: Record<string, unknown> = {};
+    vi.stubGlobal('fetch', async (url: string, init: { headers?: Record<string, string> }) => {
+      if (!init.headers) return new Response('ok');
+      const token = init.headers.authorization.replace('Bearer ', '');
+      grants[url.split('/').pop()!] = JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString()).video;
+      return new Response('{}');
+    });
+    await ensureLiveKit();
+    await removeParticipant('room-1', 'p-1');
+    await deleteRoom('room-1');
+    await stopLiveKit();
+
+    expect(grants.RemoveParticipant).toEqual({ room: 'room-1', roomAdmin: true });
+    expect(grants.DeleteRoom).toEqual({ room: 'room-1', roomCreate: true });
   });
 });

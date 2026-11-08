@@ -28,7 +28,7 @@ import type { Session } from '../../types.js';
 import { upsertUser } from '../permissions/db/users.js';
 import { upsertUserDm } from '../permissions/db/user-dms.js';
 import { grantRole } from '../permissions/db/user-roles.js';
-import { requestApproval } from './primitive.js';
+import { requestApproval, requestApprovalOutcome } from './primitive.js';
 import { canAnswerApproval } from './response-handler.js';
 
 vi.mock('../../container-runner.js', async (importOriginal) => ({
@@ -220,5 +220,72 @@ describe('a card bound to its recipient', () => {
     for (const [user, expected] of Object.entries(canAnswer)) {
       expect(await canAnswerApproval(row, user), user).toBe(expected);
     }
+  });
+});
+
+describe('a card goes out through the bot that owns its conversation', () => {
+  let sentThrough: Array<string | undefined>;
+
+  beforeEach(() => {
+    sentThrough = [];
+    setDeliveryAdapter({
+      deliver: async (_channelType, _platformId, _threadId, _kind, _content, _files, instance) => {
+        sentThrough.push(instance);
+        return 'pm-1';
+      },
+    });
+  });
+
+  const ask = (s: Session, deliveryTarget: 'thread' | 'admin') =>
+    requestApprovalOutcome({
+      session: s,
+      agentName: 'Agent',
+      action: 'test_action',
+      payload: {},
+      title: 'Test Approval',
+      question: 'Approve the thing?',
+      deliveryTarget,
+    });
+
+  it("posts a thread card through the thread's own bot and records it for later edits", async () => {
+    await createMessagingGroup({
+      id: 'mg-work',
+      channel_type: 'slack',
+      platform_id: 'C-work',
+      instance: 'acme-bot',
+      name: 'Work',
+      is_group: 1,
+      unknown_sender_policy: 'strict',
+      created_at: now(),
+    });
+    const threaded: Session = { ...session, id: 'sess-thread', messaging_group_id: 'mg-work', thread_id: 'T-1' };
+    await createSession(threaded);
+
+    expect(await ask(threaded, 'thread')).toBe('posted');
+    expect(sentThrough).toEqual(['acme-bot']);
+    expect((await getPendingApprovalsByAction('test_action'))[0].instance).toBe('acme-bot');
+  });
+
+  it("posts an approver's DM card through the bot that DM belongs to", async () => {
+    await createMessagingGroup({
+      id: 'mg-dm-named',
+      channel_type: DM_CHANNEL,
+      platform_id: 'D-admin-named',
+      instance: 'acme-bot',
+      name: 'Admin DM (acme-bot)',
+      is_group: 0,
+      unknown_sender_policy: 'strict',
+      created_at: now(),
+    });
+    await upsertUserDm({
+      user_id: 'slack:admin-1',
+      channel_type: DM_CHANNEL,
+      messaging_group_id: 'mg-dm-named',
+      resolved_at: now(),
+    });
+
+    expect(await ask(session, 'admin')).toBe('posted');
+    expect(sentThrough).toEqual(['acme-bot']);
+    expect((await getPendingApprovalsByAction('test_action'))[0].instance).toBe('acme-bot');
   });
 });

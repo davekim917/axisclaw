@@ -101,6 +101,16 @@ remainder; do not restart completed lanes or pretend its inherited evidence is
 new. A failed resume is not authority to silently replay or switch transports.
 A recovered root or matching runtime-home path alone never proves same-child
 continuity; verify a successful same-child resume or mark it unavailable.
+**An idle owner is handed off, not resumed.** When the owner's latest record
+is a final answer more than an hour old, with nothing in flight (a deploy wait,
+the challenger window, a human gate), and its remaining work becomes
+actionable, start one fresh owner instead of resuming it, because a resume
+re-reads its whole history at cache-write price. An owner still working is not
+idle, however old its previous answer. Give the new owner the original brief, the
+run record, the artifacts the old owner left (preliminary, evidence index) and
+the exact remaining work. Record one run-record line: old handle, artifacts
+handed over, remaining work. This is the normal path between phases, not a
+recovery: it needs no recovery decision and is never a reason for `BLOCKED`.
 Other owner replacements require the same explicit, evidence-backed recovery
 decision and the existing run-ownership rules. No parallel duplicate owner.
 
@@ -188,6 +198,40 @@ private write-once verdict, releases the lease, and commits private terminal
 state. Exact retries reconcile a crash between those writes without changing
 the verdict, timestamp, or digest; a second, different verdict is always
 refused.
+
+**A task run walks its own frozen preview, never shared dev, wherever the
+develop gate runs in freeze-handoff mode.** Shared dev redeploys whenever the
+tracked branch moves, and a lane that ran after the move ends BLOCKED.
+Holding merges for the length of a walk only moves that cost onto every builder.
+With the install env file sourced, cut a walk preview for the build you mean
+to test, and claim the run on the walk's head:
+
+```bash
+bash /app/skills/smoke-test/scripts/smoke-freeze-pr.sh --walk <run-id> <develop-sha>
+bash /workspace/agent/smoke-pr-gate.sh wait-settled <prNumber> --head <freezeSha>
+bash /workspace/agent/smoke-pr-gate.sh task-claim <run-id> <freezeSha>
+```
+
+Freeze identity on the settled result's preview pair: run
+`smoke-pair-identity.sh start` with `SMOKE_GATE_FRONTEND_SERVICE` and
+`SMOKE_GATE_BACKEND_SERVICE` set to `frontendPreviewId` and `backendPreviewId`
+(the shared gate env names the develop pair, which is the wrong one here),
+under the install's own preview provider. On Render (the default) the ids are
+`srv-…` service ids and the freeze records exact deploy ids. Use
+`SMOKE_PREVIEW_PROVIDER=static` only on a URL preview host, where they are
+URLs; a static freeze of `srv-…` ids refuses with `REFUSED: identity
+unreadable/invalid — nothing frozen`, which no retry fixes. Then point every lane, the e2e
+lane included, at `frontendPreviewUrl` and `backendPreviewUrl`. A walk
+preview shares the base's data plane, so seats, grants and write rules are
+unchanged. `poll` never campaigns on a walk PR, so `task-finish` stays
+the run's only verdict. After `task-finish`, run `smoke-freeze-pr.sh close-walk
+<prNumber>`; closing the PR deletes the preview. `poll` closes a walk PR still
+open after `SMOKE_GATE_WALK_MAX_SECONDS` (default 6h) and records it in
+`walk-closures.jsonl`; a close that fails wakes `pr_walk_close_failed` once
+per walk head. `--walk` refuses while `SMOKE_GATE_WALK_MAX_OPEN` (default 2)
+walk PRs are open. A walk that needs something only shared dev
+has, such as a dev-only callback URL, stays on dev and names that in its run
+record.
 
 `smoke-run-scaffold.sh` and `smoke-evidence-barrier.sh` are always invoked
 directly (never through a wrapper) and read those same two env vars from
@@ -357,6 +401,16 @@ python3 $L status   [<seat-email>]
 The holder is an agent group (`groupName` in the host-owned
 `/workspace/agent/container.json`), so the lease separates the coordinator's
 group from the challenger's; it does not separate two sessions of one group.
+
+**A lane that changes state a seat shares across its runs leases the seat to the
+run.** Undo acts across a user's whole history, and credits draw on one pool, so
+two runs on one seat can undo each other's work with no product fault. Add
+`--run <run-id>` to `grant`, and export `SMOKE_SEAT_RUN=<run-id>` in every shell
+that asks for the seat's password or releases it. `check` then refuses any other
+run with `reason=leased-to-run`, which is seat unavailable as above: wait or use
+another seat, and never retry the login. A `transfer` keeps the run unless it
+names another. An expired lease frees the seat, so set
+`--until` to the run's real end.
 The ledger is `qa-coordinator/seat-leases/` under the mounted workgroup root.
 A lease past `--until` no longer binds, `status` shows it `expired`, and it can
 be re-granted but not transferred or released.
@@ -423,6 +477,16 @@ is refused.
 `h.own(tag, seat, create_path, id, name)` still ledgers a QA fixture it reads
 back by id and exact name (`<run-dir>/write-scope-fixtures.ndjson`), for
 cleanup; no write needs it.
+A scope may list `ownedDeletes` entries
+(`{"path", "read", "items", "require"}`) that let DELETE, and no other method,
+past a deny on `path` for an item this run created. `path` names the item id as
+`(?P<item>...)`, `read` is the parent read built from `path`'s groups, `items`
+the list in that read, and `require` maps each field to the values that mean
+unused. When `read` returns the item itself (`GET /routes/{item}`), `items`
+names that object; its `id` must equal the item. Ledger each created item with `h.own_item(tag, seat, path)`, which
+reads it unused first. The delete then goes only if the path is in the ledger
+and a fresh read on the deleting seat still finds it unused; `check` reports
+`owned-delete-unread`, since it cannot read.
 A refusal sends nothing, saves `<tag>.json` with `harnessBlocked: true` (password,
 secret and token fields and query values redacted, as in every saved call),
 logs
@@ -499,6 +563,17 @@ python3 /app/skills/smoke-test/scripts/smoke-acceptance.py extract <run-dir>
 It writes `intent/acceptance.json` (`origin: pr-body`; freeze campaigns
 prefix ids `pr<n>/`). An invalid block, or none, leaves `origin: absent` with
 the reasons, and the acceptance lane derives the contract (below).
+
+*(contract)* A freeze campaign adds `--carry-from <run-root>/<baselineRunId>`
+(`campaignRange.baselineRunId`). This writes the baseline run's unresolved
+obligations to `carried`: every item it did not end met or ruled `changed`,
+plus whatever it still carried. A carried obligation needs no row. It stays on
+the report as open until this campaign resolves it with a ruling. A `met` on it
+needs a ruling, the same as a disputed one, so a requirement an earlier
+campaign cut or couldn't prove is never quietly certified. A derived contract
+keeps the `carried` list `extract` wrote. Freeze ranges are disjoint, so this run's items
+never reuse a carried id: `extract` refuses one that does, and `check` stops
+on a contract that holds one.
 
 Re-hash the live bodies when the acceptance lane runs. A mismatch is **not**
 fatal and does not void the run: record it on the acceptance result as
@@ -596,6 +671,27 @@ exit 4 from `start` means this run already froze an identity: never re-freeze
 by calling `start` again. Reachability checks (`smoke-build-identity.sh`'s
 bundle/host and `/healthz`) stay separate from identity — they answer "is
 something serving", not "is it the pair this run claimed."
+
+**One exception, at `finish` only: the pair moved after the evidence
+closed.** When `finish`'s own pre-publication read finds the pair moved (drift,
+never a source mismatch), it exits 0 instead of 3 if every check at the
+current freeze generation is `ok`, at least one `markers/*.json` exists, and
+the newest `ok` check's `readAt` is strictly later than the modification time
+of every `markers/*.json` and of `challenger/challenge.complete.json` if it
+exists (`readAt` is whole seconds, so a file written in the check's own second
+counts as after it). It then appends nothing to `identity-checks.ndjson` and
+writes `coordinator/identity-moved-after-evidence.json` once, naming the
+frozen pair, the live pair, that check's `readAt` and the newest evidence
+mtime: the run record and the verdict must cite both pairs. A move to yet
+another pair after that record exists is exit 3, and a return to the frozen
+pair is an ordinary `ok`. So, as soon as every lane marker and the
+challenger's `challenge.complete.json` are written, the coordinator records a
+`check`. A controller campaign already does this: it is the synthesis brief's
+`synthesis` check. A task run records it by hand, labelled `evidence-closed`.
+That check closes the evidence window: dev moving after it no longer blocks
+the run. A `check` still records any move as drift, and a later `ok` never
+clears it, so a lane whose own start or end
+`check` saw the move still finishes BLOCKED.
 
 A PR contract the scaffold writes carries `pairIdentity: "required"`, and
 `smoke-evidence-barrier.sh` then enforces this cadence at `lanes` and
@@ -739,6 +835,15 @@ journey can rescue a path it hides: keep each exclusion narrow and reasoned.
 release notes) and on any `consumes` glob an exclusion shadows.
 A worker walks it from the catalogue alone, and a backend-only change selects
 the screens that consume it.
+
+**Core flows.** A journey with `maxIntervalDays` is on the floor, and a journey
+marked `coreFlow: true` is a core flow without being walked on the floor's
+cadence. Together they are the install's core-flow list, which source review
+reads as its trigger list: `smoke-journeys.py core-flows <catalogue>` prints it.
+Use `coreFlow` for a flow no agent can walk, such as a `native-manual` one. A
+native-manual floor journey would be due in every campaign and go overdue, and
+`validate` warns when it finds one. Marking, unmarking or changing a core flow
+needs `--floor-authority`, the same as the floor.
 
 For a freeze campaign the gate matches `campaignRange`'s file list against the
 catalogue and states the result as `journeys` in `check`, the
@@ -898,7 +1003,9 @@ the next campaign could plausibly notice, cause at least one of:
 4. a customer's first successful use to fail — signup, login, checkout, the
    first screen after purchase;
 5. an irreversible outbound effect to fire wrongly — an email sent, a webhook
-   delivered, a document filed, a record published.
+   delivered, a document filed, a record published;
+6. a figure a customer reads to differ from its source — a total, rate, price or
+   forecast on screen or in an export that is wrong with no error.
 
 Second, the **silence test**: name what watches this journey today. If its
 failure is *loud* — CI goes red, an exception pages somebody, the app is
@@ -911,7 +1018,7 @@ cut it with the silence test until it can.
 
 Both tests must hold, and together they settle an unlisted journey without
 anyone having to ask: name the consequence, name the watcher. If none of the
-five fit, it is ordinary changed-surface scope. If one fits and nothing watches
+six fit, it is ordinary changed-surface scope. If one fits and nothing watches
 it, it is floor-worthy but **not yet on the floor** — record it as a floor
 nomination in the run record, name it on the report, and do not start running
 it. Changing the floor is a human's call — `publish` refuses one without
@@ -1281,7 +1388,8 @@ context only: full-page stitching misplaces fixed/sticky headers and drawers
 and has produced false BROKEN findings. A tile badged `unsettled` is not
 evidence of breakage on its own. A capture whose final `location.pathname`
 is not the shot's `path` (or its declared `finalPath`, for a `steps` click
-that navigates on purpose) fails with both paths named — a bounce to a login
+that navigates on purpose) fails with both paths named, and so does a capture
+that didn't come back at the width it's labelled — a bounce to a login
 route is never graded, and on the baseline it is a failed diff, never
 `changed`.
 
@@ -1500,7 +1608,8 @@ served-payload change). If it does:
 from `intent/acceptance.json` (§1 `extract`). If it reads `origin: absent`, or `items` is empty while the
 diff cross-check above found a user-facing consumer, derive the items yourself
 from the frozen request sources — never the diff, never the PR prose — into
-the same file with `origin: derived` and every item `derived: true`. Then
+the same file with `origin: derived` and every item `derived: true`. `check`
+stops on a derived contract that names a `pr-body` source. Then
 write `evidence/<lane>/acceptance-results.json`, one row per item:
 
 ```json
@@ -1543,6 +1652,12 @@ stop, not a clean zero: the JSON carries `stopped: "<why>"`, and the report
 sentence reads `Acceptance: present(n) — stopped: <why>, nothing checked`
 instead of zero counters (an absent contract keeps `Acceptance: absent`).
 
+A `pr-body` source is the builder's description of the work, not the
+requester's words. `check` lists those items as `builderClaims`, and the report
+sentence ends `, n builder claims`. `met` on one means the build does what the
+builder said, never that the request was met: say which in the verdict. Quote
+the request instead whenever a frozen request source covers the item.
+
 **This lane runs in addition to the diff-derived lanes above, never instead
 of them.** A defect never promised as behavior is the seam lanes' to catch;
 whether the feature does what was asked is this lane's. Neither substitutes
@@ -1572,9 +1687,31 @@ sources alone — never the diff, never the PR prose — into
 "observable":"…"}]`) *before* reading `intent/acceptance.json`, the same
 ordering discipline as the disposition. Then `challenger/acceptance-check.json`
 maps both ways: each obligation `covered|narrowed|missing` (item id if any),
-each item `supported|narrowed|unsupported`. A `met` on a narrowed or
+each item `supported|narrowed|unsupported` (`{"items":[{"itemId":"AC1",
+"status":"narrowed"}]}`; `check` reads it, and calls one it can't read
+unreadable). A `met` on a narrowed or
 unsupported item never covers an obligation; those stay as diagnostics.
 `missing` obligations are Untested-line entries and `DISSENT` inputs.
+
+*(contract)* **One adjudicated result.** Raw rows stay as observed; never edit
+them, and never leave a correction only in prose. Before synthesis, the
+coordinator rules on every `met` item the challenger marked narrowed or
+unsupported, and on any row synthesis overrules, in
+`coordinator/acceptance-rulings.json`:
+
+```json
+[{"itemId":"AC4","outcome":"met|not_met|changed|deferred|unproved",
+  "why":"…","decidedBy":"who agreed, and where","followUp":"#123"}]
+```
+
+`check` reads a ruling over its row and returns the result as `outcomes`, which
+is what a report or a later campaign reuses, never the raw rows. A disputed `met`
+with no ruling reads `unruled` there, and `check` fails until it has one. `changed` means
+someone with the authority agreed to different behaviour, so it needs `decidedBy`.
+`deferred` also needs `followUp`, an issue labelled `deferred-requirement`: a
+release-head campaign lists every open one on its Untested line, so a cut survives
+until it's built or withdrawn. `changed`, `deferred` and `unproved` never count
+as `met`.
 
 ## 4. Challenge every candidate finding
 
@@ -1752,6 +1889,8 @@ screenshots:
 - Floor: <entries walked and their outcome; each blocked entry with its
   blocker; or "floor undeclared">
 - Frontend: <journeys completed>, <n> screenshots and <n> clips (attached)
+- Data: <how recent the data behind the tested screens is, per the deployment's
+  standing instructions, or "no data read"; a verdict on old data must say so>
 - Findings: <each in one plain-language line with severity, or "none confirmed">
 - Fixes: <PRs and deployed SHAs, or none>
 - Untested: <explicit list, or "nothing in scope"; *(contract)* plus the
@@ -1912,9 +2051,10 @@ do its job without. Both used to stay in the controller's own journal.
   `wake.json` and asks for an `adopt`, which is a no-op when the contract
   already names the caller.
 
-#### The claim renewer (required alongside the live controller)
+#### The claim renewer (required alongside the live controller, unless every claim is phase-dispatch)
 
-A live controller needs a second, script-only series: `scripts/smoke-controller-renew.sh`.
+A live controller needs a second, script-only series: `scripts/smoke-controller-renew.sh`,
+unless the conditions below let it retire.
 
 ```bash
 ncl tasks create --name smoke-controller-renew \
@@ -1931,12 +2071,34 @@ and the owner is refused `progress` as a claimant mismatch. On PR #2022 that
 cost a 13-lane step four lane markers and finished the run `BLOCKED`
 (a lease that expired mid-step).
 
+**Phase-dispatch installs can retire it.** A phase-dispatch owner step runs
+in its own session, so it never holds up the controller's series, and every
+fire stamps `progress` for its runs; the renewer then only bridges the gap
+between two fires. The fire skips the heartbeat and records `renewer.state:
+"covered"` (claiming as usual and closing any recorded renewer outage) when
+all of these hold: the owner-dispatch cutover is configured and enabled, so a
+new claim takes the phase-dispatch route; every run holding a slot, whoever
+claimed it, would take that route (the controller's `owner_route_for`); the gate's `liveness` verb reports a lease TTL and liveness
+window (`SMOKE_GATE_LEASE_TTL_SECONDS`, `SMOKE_GATE_PROGRESS_STALE_SECONDS`)
+of at least 3600 seconds; and each claimed run's `progress` stamp this fire
+renewed its lease for that long. Otherwise the heartbeat rules above apply,
+and `renewer.notCovered` names the condition that failed. A legacy-route claim
+always needs the renewer: its owner turn blocks the series for the whole step.
+The cost: a controller that stops firing holds its slot for up to that TTL,
+and its run goes reclaimable (and `pr_run_stalled` rings) that much later,
+about an hour instead of 15–30 minutes. Both values apply to every lease the
+PR gate issues, task-scoped runs included.
+
 **The live controller will not claim a new campaign without it.** Every tick
 writes `<out-dir>/renewer/heartbeat.json`. Before each poll, the live
-controller reads it and skips the poll unless the last tick is under 11 minutes
-old and ended `ok` or `idle`. A tick ending `renew-failed` (gate `progress`
-calls that did not renew) stops claiming at once, but is alarmed only from the
-second in a row, since one is usually a busy lock or a race. It posts one alarm per outage (a
+controller reads it and polls `--recovery-only` unless the last tick is under
+11 minutes old and ended `ok` or `idle`. That poll keeps every alarm duty and
+the same-run recovery, and never opens a campaign: a lapsed lease is what makes
+the renewer's `progress` fail, and only a recovery clears a lapsed lease, so
+stopping it would leave each waiting on the other. A tick ending `renew-failed`
+(gate `progress` calls that did not renew) stops claiming at once, but is
+alarmed only from the second in a row, since one is usually a busy lock or a
+race. It posts one alarm per outage (a
 later outage the same day alarms again), with
 different wording for each case, because each has a different fix:
 
@@ -1961,8 +2123,10 @@ five of these hold:
 3. the coordinator side of the run tree written to within the last 1200
    seconds — this is what says the step is still being *worked*;
 4. an open `run/claim` obligation carrying the owner token;
-5. the step younger than the 3600-second ceiling (`OWNER_STEP_SLA_SECONDS`,
-   the same clock the controller calls a step overdue on).
+5. the step younger than its ceiling, the controller's owner-step SLA (the
+   same clock the legacy route calls a step overdue on): 3600 seconds, or
+   10800 for `lanes`, because a full campaign walks every lane in that one
+   step.
 
 Condition 3 is not redundant with condition 2. **The ack is written once and
 never refreshed** — the router creates it, the controller only tests it for
@@ -1971,7 +2135,11 @@ continues through `continue_work` resumes in-session without re-running the
 router's first act. Its mtime is the time of the first wake and nothing else,
 so an owner that crashes after acking would otherwise be renewed all the way
 to the ceiling. Freshness is therefore measured as `max(ack mtime, newest
-mtime under <run>/ excluding <run>/challenger/)`. Measured on PR #2022's
+owner write under <run>/)`, where an owner write is the controller's rule in
+`scripts/smoke_owner_activity.py`: any regular file except `<run>/challenger/`
+and the files the controller itself writes in `<run>/controller/`
+(`barrier-*.json` is rewritten every fire its barrier refuses, so it would keep
+a dead lanes owner fresh). Measured on PR #2022's
 46-minute lanes step: 507 writes, largest gap between them 253 s — 1200 s
 clears that by 4.7×. **`<run>/challenger/` is excluded on purpose**: the
 challenger runs in its own session with its own lifetime, and the lease being
@@ -1982,7 +2150,7 @@ dead owner's claim open.
 writing under the run. After the owner dies it stops within one freshness
 window (≤ 1200 s), or sooner if the controller reconciles the step to `done`
 or `abandoned` first — whichever comes first — and in the worst case the
-3600-second ceiling stops it. It does not stop instantly. Both windows have
+step's ceiling stops it. It does not stop instantly. Both windows have
 env overrides (`SMOKE_CONTROLLER_RENEW_FRESHNESS_SECONDS`,
 `SMOKE_CONTROLLER_RENEW_CEILING_SECONDS`) that can only clamp them **down**;
 an out-of-range value is ignored rather than honoured upward.
@@ -2013,7 +2181,8 @@ tick a no-op.
    "gaps": [{"lane": "<laneId>", "disposition": "not-blocking:<reason>"}],
    "dissents": [{"id": "<challenger dissent id>", "disposition": "refuted:<run-relative evidence path>"}],
    "holdDisposition": {"runId": "<held run>", "disposition": "resolved|not-in-range|carried",
-                       "evidence": "<run-relative evidence path>"}}
+                       "evidence": "<run-relative evidence path>"},
+   "dataDate": "<one line under 200 characters, e.g. \"Client A invoices to 2026-09-11, read 2026-11-03\"; the controller prints it as the verdict's Data line and cuts anything longer>"}
   ```
 
   Give every confirmed finding, every lane without a passing marker, and
@@ -2156,6 +2325,34 @@ before any marker only when that answer still says `contractAdoptionRequired`
 true (or `null`); then synthesize from the evidence on disk and `finish`. If the campaign is moot (PR closed, head moved),
 `claim` the run id the same way and `release` it. `null` for the disposition
 and contract fields means `SMOKE_GATE_RUN_ROOT` is unwired, not "absent".
+
+**A phase-dispatched owner step is overdue when it stalls, not when it is
+slow.** Past its SLA (3600 seconds, 10800 for `lanes`) the controller raises
+`controller_obligation_overdue` (`owner-dispatch:<step>`) only if no owner write
+has landed under the run in the last 1200 seconds, by the same rule the claim
+renewer uses (`scripts/smoke_owner_activity.py`). Past twice the SLA it raises it
+however busy the owner looks, so an owner looping on live writes still surfaces.
+A run tree it cannot scan counts as quiet. The legacy brief route still alarms
+at the SLA, because that is where its claim renewer stops renewing.
+
+**A run nobody is working ends itself (`no-lane-work`).** `challenger-timeout`
+is refused once a disposition is filed, and the synthesis safety net sits behind
+the lanes barrier, so a run whose challenger filed before any lane finished used
+to be re-offered its lanes step for hours, reclaimed each time its lease lapsed,
+while a new `claim` was refused. The controller now finishes it `BLOCKED`,
+through `finish`, with the failed check `no-lane-work: ...` in the verdict post
+and the PR's run record, when all of these hold: the challenger deadline has
+passed, `challenger/disposition.md` is filed, the lanes barrier is not ready, no
+marker exists, and there is positive evidence nothing is running. That evidence
+is `disposition: BLOCKED` in `challenger/challenge.complete.json`, or the host
+reporting the phase-dispatched lanes owner's session settled with no new
+dispatch pending. A `progress` stamp is not evidence, because the controller's
+own keepalive stamps every fire. So a running owner, a status the host cannot
+report, and a brief-route owner (which has no host status) all keep the slot.
+A `BLOCKED` ending writes no marker and touches no hold, so nothing carries
+forward, and the slot is free for an ordinary `claim`. With no disposition
+filed, `challenger-timeout` ends the run at the deadline as before, even with a
+lane running.
 
 **A `--takeover` does not stop the incumbent; it only stops it from *counting*.**
 The gate records who it displaced, so the displaced run's next `progress`,
@@ -2544,7 +2741,8 @@ in-tree core reach-in. Verify that integration with `ncl tasks get` plus one
 live gated fire that completes with no provider output; never reproduce the
 registration through raw SQL. Configure `quietStatus: true` plus a `chatLimit`
 sized to the run's real posting contract — the root, one reply per browser lane
-whose evidence became durable, the verdict, and the fix hand-off. `chatLimit: 1`
+whose evidence became durable, the verdict, the fix hand-off, and on a run whose
+root assigned seats at handover, the seat hand-off. `chatLimit: 1`
 contradicts that contract and physically drops the verdict; around 8 fits it.
 
 Know what the cap does and does not reach before relying on it. It is a hard
@@ -2566,11 +2764,14 @@ short three markers") are defects, not diligence — whether posted by the
 coordinator, the challenger, or a worker relaying through either. The
 legitimate posts for one run are exactly the ones already named above: the
 root post, one reply per browser lane whose evidence became durable, the
-verdict, and the fix hand-off. Nothing else earns a message; put it in the
+verdict, the fix hand-off, and the one seat hand-off a root's seat plan named
+(the coordinator transfers the leases first, then mentions the challenger).
+Nothing else earns a message; put it in the
 final report instead, or not at all. This is checkable after the fact without
 reading intent: count the thread's posts and subtract one for the root, one
-per browser lane, one for the verdict, and one per fix hand-off — anything
-left over is narration that should not have posted.
+per browser lane, one for the verdict, one per fix hand-off, and one for a
+named seat hand-off — anything left over is narration that should not have
+posted.
 
 Run a changed-surface `audit` for each settled develop SHA. Any user-visible
 change must include a real-browser frontend lane even when the diff looks
@@ -2931,6 +3132,10 @@ print `{"ok":true}` and exit 0, or exit 1 with the key names
 `config` returns before the gate creates its state dir, takes a lock, reads
 state or calls anything remote. The freeze helper runs under the develop
 wrapper's environment, so the develop gate's `config` covers its keys too.
+`bash /workspace/agent/smoke-pr-gate.sh liveness` is as side-effect-free and
+prints the lease TTL and liveness window in force,
+`{"ok":true,"leaseTtlSeconds":…,"progressStaleSeconds":…}` (a refused value
+reads as its default); the live controller judges renewer coverage by it.
 The two env files must state the three prefixes identically, and this is
 enforced: with the freeze handoff on, the develop gate reads the PR gate's env
 file (`SMOKE_CONTROLLER_ENV_FILE`, default `/workspace/agent/smoke-gate-env.sh`)

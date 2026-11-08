@@ -1,0 +1,2 @@
+# Passed to the guard hook's bun as --config. Naming a config stops bun from loading a bunfig.toml (and its
+# `preload`) from the caller's working directory. Intentionally empty.

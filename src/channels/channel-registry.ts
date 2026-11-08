@@ -108,12 +108,13 @@ export function createChannelDeliveryAdapter(): ChannelDeliveryAdapter {
       content: string,
       files?: OutboundFile[],
       instance?: string,
+      workstreamThread?: boolean,
     ): Promise<string | undefined> {
       const adapter = getChannelAdapterExact(instance ?? channelType);
       if (!adapter) {
         throw new MissingChannelAdapterError(channelType, instance);
       }
-      return adapter.deliver(platformId, threadId, { kind, content: JSON.parse(content), files });
+      return adapter.deliver(platformId, threadId, { kind, content: JSON.parse(content), files, workstreamThread });
     },
     async setTyping(
       channelType: string,
@@ -134,7 +135,8 @@ export function createChannelDeliveryAdapter(): ChannelDeliveryAdapter {
       instance?: string,
     ): Promise<void> {
       const adapter = getChannelAdapterExact(instance ?? channelType);
-      await adapter?.deleteMessage?.(platformId, threadId, messageId);
+      if (!adapter) throw new MissingChannelAdapterError(channelType, instance);
+      await adapter.deleteMessage?.(platformId, threadId, messageId);
     },
     async postParent(channelType: string, platformId: string, text: string): Promise<{ messageId: string }> {
       const adapter = getChannelAdapterExact(channelType);

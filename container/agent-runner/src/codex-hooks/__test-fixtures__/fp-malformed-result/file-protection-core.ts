@@ -6,7 +6,7 @@
  * tool a non-(string|null) result is untrusted → DENY.
  *
  * Loaded by runner.ts loadFileProtectionCore (derives this path from the dir of
- * NANOCLAW_DESTRUCTIVE_GUARD_CORE).
+ * setGuardCorePathsForTest({ destructive })).
  */
 export const EDIT_TOOLS = new Set(['Edit', 'MultiEdit', 'Write', 'apply_patch', 'edit', 'write']);
 

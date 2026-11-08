@@ -32,6 +32,18 @@ export function getRecentInboundChatSenders(db: Database.Database, limit: number
     .all(limit) as InboundChatSenderRow[];
 }
 
+/** Oldest first: how a session opened, which the newest-first read above loses in a long thread. */
+export function getEarliestInboundChats(db: Database.Database, limit: number): InboundChatSenderRow[] {
+  return db
+    .prepare(
+      `SELECT kind, timestamp, content, channel_type, platform_id, thread_id FROM messages_in
+       WHERE kind IN ('chat', 'chat-sdk')
+       ORDER BY timestamp ASC
+       LIMIT ?`,
+    )
+    .all(limit) as InboundChatSenderRow[];
+}
+
 export interface ChannelDestination {
   channel_type?: string;
   platform_id?: string;
@@ -68,6 +80,7 @@ export function getTaskOccurrenceSeriesId(db: Database.Database, occurrenceId: s
 export interface RoutedTaskRow {
   channel_type: string;
   platform_id: string;
+  thread_id: string | null;
   content: string;
 }
 
@@ -80,7 +93,7 @@ export function getLatestRoutedTaskRow(db: Database.Database, seriesId: string):
   return (
     (db
       .prepare(
-        `SELECT channel_type, platform_id, content
+        `SELECT channel_type, platform_id, thread_id, content
            FROM messages_in
           WHERE kind = 'task'
             AND series_id = ?
@@ -90,6 +103,15 @@ export function getLatestRoutedTaskRow(db: Database.Database, seriesId: string):
           LIMIT 1`,
       )
       .get(seriesId) as RoutedTaskRow | undefined) ?? null
+  );
+}
+
+/** Cancelling clears a row's recurrence, so a cancelled recurring series reads as one-shot. */
+export function isRecurringTaskSeries(db: Database.Database, seriesId: string): boolean {
+  return (
+    db
+      .prepare("SELECT 1 FROM messages_in WHERE kind = 'task' AND series_id = ? AND recurrence IS NOT NULL LIMIT 1")
+      .get(seriesId) !== undefined
   );
 }
 

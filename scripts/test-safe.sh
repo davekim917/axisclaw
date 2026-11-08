@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # The one supported way to run vitest (or the typed lint) on a host that also runs production:
 # one run at a time under a host-wide lock, at idle IO priority and nice 10, on two workers at most.
+# Idle priority stalls any test during a host IO burst, so vitest's limits are three times their defaults.
 #
 #   scripts/test-safe.sh <test files or filters...> [vitest flags]
 #   scripts/test-safe.sh lint
@@ -31,10 +32,20 @@ if [ "${1:-}" = lint ]; then
   [ "$#" -eq 1 ] || die "'lint' takes no further arguments"
   cmd=(pnpm run lint)
 else
+  test_timeout=(--testTimeout=15000)
+  hook_timeout=(--hookTimeout=30000)
   for arg in "$@"; do
     case "$arg" in
       --maxWorkers* | --max-workers* | --minWorkers* | --min-workers*)
         die "set TEST_SAFE_MAX_WORKERS=1 instead of passing $arg"
+        ;;
+      # vitest refuses a repeated option rather than taking the last one, so a caller's flag replaces the default.
+      --testTimeout* | --test-timeout*) test_timeout=() ;;
+      --hookTimeout* | --hook-timeout*) hook_timeout=() ;;
+      # vitest.config.ts already scales both further under coverage, and a flag here would lower them.
+      --coverage | --coverage.*)
+        test_timeout=()
+        hook_timeout=()
         ;;
     esac
   done
@@ -44,7 +55,7 @@ else
   esac
   vitest="$root/node_modules/.bin/vitest"
   [ -x "$vitest" ] || die "$vitest is missing: run 'pnpm install --frozen-lockfile --offline' in this checkout first"
-  cmd=("$vitest" run --maxWorkers="$workers" "$@")
+  cmd=("$vitest" run --maxWorkers="$workers" "${test_timeout[@]}" "${hook_timeout[@]}" "$@")
 fi
 
 cd "$root"

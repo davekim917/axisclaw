@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { migration077 } from '../src/db/migrations/077-choice-receipts.js';
 import { moduleApprovalsPendingApprovals } from '../src/db/migrations/module-approvals-pending-approvals.js';
-import { ARCHIVE_UPSERT_SQL } from '../src/message-archive.js';
+import { ARCHIVE_UPSERT_SQL, initArchiveSchema } from '../src/message-archive.js';
 import { INBOUND_SCHEMA, OUTBOUND_SCHEMA } from '../src/mailbox/sqlite/schema.js';
 
 import {
@@ -90,16 +90,7 @@ function createArchiveDb(
   ],
 ): void {
   const db = new Database(file);
-  // Query columns mirror `src/message-archive.ts:113-128`; rows go through
-  // the real sole-writer statement from `src/message-archive.ts:312-319`.
-  db.exec(`
-    CREATE TABLE messages_archive (
-      id TEXT PRIMARY KEY, agent_group_id TEXT NOT NULL, messaging_group_id TEXT,
-      channel_type TEXT NOT NULL, channel_name TEXT, platform_id TEXT, thread_id TEXT,
-      role TEXT NOT NULL, sender_id TEXT, sender_name TEXT, text TEXT NOT NULL,
-      sent_at TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now'))
-    )
-  `);
+  initArchiveSchema(db);
   const insert = db.prepare(ARCHIVE_UPSERT_SQL);
   for (const row of rows) {
     insert.run({
@@ -113,6 +104,7 @@ function createArchiveDb(
       role: 'assistant',
       senderId: 'ag-fixture',
       senderName: 'assistant',
+      senderIsBot: 1,
       text: 'synthetic private archive text',
       sentAt: row.sentAt,
     });
@@ -463,6 +455,7 @@ describe('collectOperatorAttentionEvidence', () => {
         role: 'assistant',
         senderId: 'ag-fixture',
         senderName: 'assistant',
+        senderIsBot: 1,
         text: 'private old queued response',
         sentAt: '2026-09-02T00:00:00.000Z',
       });
@@ -489,6 +482,7 @@ describe('collectOperatorAttentionEvidence', () => {
         role: 'assistant',
         senderId: 'ag-fixture',
         senderName: 'assistant',
+        senderIsBot: 1,
         text: 'private future response',
         sentAt: '2026-10-01T00:00:00.000Z',
       });

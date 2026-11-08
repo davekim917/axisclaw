@@ -7,19 +7,15 @@ import path from 'node:path';
 import {
   MAX_CLAUDE_REVIEW_OUTPUT_BYTES,
   MAX_CLAUDE_REVIEW_REQUEST_BYTES,
+  ORIGINAL_CLAUDE_CLI,
   reviewCliArgs,
   type ClaudeReviewRequest,
   type ClaudeReviewResponse,
   validateClaudeReviewRequest,
 } from './claude-review-contract.js';
 import { isPreInferenceCredentialFailure } from '../providers/claude-review-classification.js';
+import { activeCredentialRing, type CredentialSlot } from '../providers/claude-credential-ring.js';
 import { ANTHROPIC_KEY_RE, OAUTH_KEY_RE } from '../providers/secret-env.js';
-
-interface CredentialSlot {
-  name: string;
-  value: string;
-  envName: 'ANTHROPIC_API_KEY' | 'CLAUDE_CODE_OAUTH_TOKEN';
-}
 
 interface RunningReview {
   cancel: (reason: string) => void;
@@ -37,31 +33,6 @@ export interface ClaudeReviewServiceOptions {
   getEnv?: () => NodeJS.ProcessEnv;
   socketParent?: string;
   onDiagnostic?: (message: string) => void;
-}
-
-function credentialRing(env: NodeJS.ProcessEnv): CredentialSlot[] {
-  const family: CredentialSlot['envName'] | null = env.ANTHROPIC_API_KEY
-    ? 'ANTHROPIC_API_KEY'
-    : env.CLAUDE_CODE_OAUTH_TOKEN
-      ? 'CLAUDE_CODE_OAUTH_TOKEN'
-      : null;
-  if (!family) return [];
-
-  const fallback = family === 'ANTHROPIC_API_KEY' ? /^ANTHROPIC_API_KEY_(\d+)$/ : /^CLAUDE_CODE_OAUTH_TOKEN_(\d+)$/;
-  const slots = [
-    { name: family, value: env[family] ?? '', envName: family },
-    ...Object.entries(env)
-      .filter(([name, value]) => fallback.test(name) && typeof value === 'string' && value.length > 0)
-      .sort(([left], [right]) => Number(left.match(fallback)![1]) - Number(right.match(fallback)![1]))
-      .map(([name, value]) => ({ name, value: value!, envName: family })),
-  ];
-  const seen = new Set<string>();
-  return slots.filter((slot) => {
-    // OneCLI uses placeholder as an intentional non-credential sentinel.
-    if (!slot.value || slot.value === 'placeholder' || seen.has(slot.value)) return false;
-    seen.add(slot.value);
-    return true;
-  });
 }
 
 function childEnv(snapshot: NodeJS.ProcessEnv, slot: CredentialSlot | undefined): NodeJS.ProcessEnv {
@@ -229,7 +200,7 @@ export async function startClaudeReviewService(options: ClaudeReviewServiceOptio
   const privateDir = fs.mkdtempSync(path.join(options.socketParent ?? os.tmpdir(), 'nanoclaw-claude-review-'));
   fs.chmodSync(privateDir, 0o700);
   const socketPath = path.join(privateDir, 'review.sock');
-  const executable = options.executable ?? '/pnpm/claude-real';
+  const executable = options.executable ?? ORIGINAL_CLAUDE_CLI;
   const getEnv = options.getEnv ?? (() => process.env);
   const sockets = new Set<net.Socket>();
   const running = new Set<RunningReview>();
@@ -254,7 +225,7 @@ export async function startClaudeReviewService(options: ClaudeReviewServiceOptio
       }
 
       const snapshot = { ...getEnv() };
-      const slots = credentialRing(snapshot);
+      const slots = activeCredentialRing(snapshot);
       const diagnostics: string[] = [];
       for (let index = 0; index < Math.max(slots.length, 1); index++) {
         if (disconnected || stopping || socket.destroyed) return;
@@ -271,7 +242,7 @@ export async function startClaudeReviewService(options: ClaudeReviewServiceOptio
         }
         if (attempt.cancelled || disconnected || stopping || socket.destroyed) return;
         if (index < slots.length - 1 && isPreInferenceCredentialFailure(attempt.response.stdout)) {
-          const message = `Claude review credential ${slot.name} hit a pre-inference limit; retrying ${slots[index + 1].name}`;
+          const message = `Claude review credential ${slot.name} was refused before inference; retrying ${slots[index + 1].name}`;
           diagnostics.push(message);
           options.onDiagnostic?.(message);
           continue;

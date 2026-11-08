@@ -129,7 +129,7 @@ vi.mock('./attachment-downloader.js', async (importOriginal) => ({
 
 vi.mock('./modules/bash-gate/index.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./modules/bash-gate/index.js')>()),
-  cancelPendingGatesForSession: vi.fn(),
+  offerGateWithdraw: vi.fn(async () => undefined),
   sessionHasActiveGates: vi.fn(() => false),
 }));
 
@@ -164,11 +164,6 @@ vi.mock('./flag-parser.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./flag-parser.js')>()),
   parseMessageFlags: vi.fn(() => ({ intent: undefined, errors: [], warnings: [], cleanedText: null })),
   formatFlagConfirmation: vi.fn(() => null),
-}));
-
-vi.mock('./topic-title.js', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('./topic-title.js')>()),
-  maybeRenameNewThread: vi.fn(),
 }));
 
 vi.mock('./modules/permissions/db/user-roles.js', async (importOriginal) => ({
@@ -608,6 +603,63 @@ describe('flag dispatcher wake gate', () => {
     await routeInbound(event);
 
     expect(parseMessageFlags).toHaveBeenCalledWith(expect.any(String), 'codex');
+  });
+});
+
+describe('a message while a gate card waits', () => {
+  afterEach(async () => {
+    const gates = await import('./modules/bash-gate/index.js');
+    vi.mocked(gates.sessionHasActiveGates).mockReturnValue(false);
+  });
+
+  async function routeWithOpenGate(event: InboundEvent, agentOverrides: Parameters<typeof makeAgent>[0] = {}) {
+    const { getAgentGroup } = await import('./db/agent-groups.js');
+    const gates = await import('./modules/bash-gate/index.js');
+    vi.mocked(gates.sessionHasActiveGates).mockReturnValue(true);
+    vi.mocked(getMessagingGroupWithAgentCount).mockResolvedValue({ mg: makeMg(), agentCount: 1 });
+    vi.mocked(getMessagingGroupAgents).mockResolvedValue([makeAgent(agentOverrides)]);
+    vi.mocked(getAgentGroup).mockResolvedValue({
+      id: 'ag-1',
+      name: 'Example Assistant',
+      folder: 'example-retail',
+      agent_provider: null,
+      created_at: new Date().toISOString(),
+    });
+    vi.mocked(resolveSession).mockResolvedValue({
+      session: {
+        id: 's-1',
+        agent_group_id: 'ag-1',
+        messaging_group_id: 'mg-1',
+        thread_id: null,
+        agent_provider: null,
+        status: 'active',
+        container_status: 'running',
+        last_active: null,
+        created_at: new Date().toISOString(),
+      },
+      created: false,
+    });
+    await routeInbound(event);
+    return vi.mocked(gates.offerGateWithdraw);
+  }
+
+  it('offers Withdraw for a message that wakes the agent, and cancels nothing', async () => {
+    const offer = await routeWithOpenGate(makeChatEvent('go on with the other task'));
+    expect(offer).toHaveBeenCalledTimes(1);
+    expect(offer.mock.calls[0]).toEqual(['s-1', 'u1']);
+  });
+
+  it('offers nothing for a bot’s message', async () => {
+    const event = makeChatEvent('done');
+    event.message.content = JSON.stringify({ text: 'done', author: { isBot: true } });
+    expect(await routeWithOpenGate(event)).not.toHaveBeenCalled();
+  });
+
+  it('offers nothing for a message that does not wake the agent', async () => {
+    const event = makeChatEvent('chatter', { message: { ...makeChatEvent('chatter').message, isMention: false } });
+    expect(
+      await routeWithOpenGate(event, { engage_mode: 'mention', ignored_message_policy: 'accumulate' }),
+    ).not.toHaveBeenCalled();
   });
 });
 

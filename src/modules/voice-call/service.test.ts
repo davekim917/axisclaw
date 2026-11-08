@@ -414,6 +414,24 @@ describe('the call link', () => {
     expect(svc.getVoiceCall(id)).toBeNull();
   });
 
+  it('logs the microphone report the page sends with /connected', async () => {
+    const { log } = await import('../../log.js');
+    await svc.mintVoiceCall({ sessionId: 'sess-1', agentGroupId: 'ag-atlas' });
+    const id = linkId();
+    const origin = `https://${id}.calls.example.test`;
+    const { token } = JSON.parse((await request(id, 'POST', '/offer?t=', { origin, body: { sdp: 'v=0 offer' } })).body);
+    vi.mocked(log.info).mockClear();
+
+    const mic = { echoCancellation: true, noiseSuppression: 'yes', browser: 'android-chrome', label: 'Example Mic' };
+    expect((await request(id, 'POST', `/connected?t=${token}`, { origin, body: mic })).status).toBe(200);
+
+    const lines = vi.mocked(log.info).mock.calls.map(([msg, fields]) => [msg, fields]);
+    expect(lines.filter(([msg]) => msg === 'Voice call: microphone')).toEqual([
+      ['Voice call: microphone', { callId: id.slice(0, 8), echoCancellation: true, browser: 'android-chrome' }],
+    ]);
+    expect(lines.filter(([msg]) => msg === 'Voice call audio connected')).toHaveLength(1);
+  });
+
   it('expires unused after the ring window', async () => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
     try {
@@ -554,6 +572,14 @@ describe('a claimed call', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('cannot ping a channel with what was said on the call', async () => {
+    const call = await claim();
+    svc.connectVoiceAudio(call);
+    h.liveEvent!({ type: 'delegation', id: 'd1', text: 'Tell @everyone the run passed.' });
+    await vi.waitFor(() => expect(h.deliveries.some((d) => d.text.includes('(voice):'))).toBe(true));
+    expect(h.deliveries.map((d) => d.text).join('\n')).not.toContain('@everyone');
   });
 
   it('counts a request as delivered once written, even when waking the container fails', async () => {

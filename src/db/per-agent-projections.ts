@@ -298,7 +298,7 @@ function readArchiveScopeSignatureOnce(
       mutations = marks.mutations;
     } catch {
       // No `archive_row_marks` table: fail closed; null never compares equal, so every spawn rebuilds until
-      // `initSchema` creates it.
+      // `initArchiveSchema` creates it.
       mutations = null;
     }
     return { count: rows.count, maxRowid: rows.maxRowid, mutations };

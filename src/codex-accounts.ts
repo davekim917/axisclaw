@@ -3,8 +3,8 @@
  * them a container recently found at their quota wall, so the next spawn starts on an account that still has room
  * instead of paying a second app-server start to rediscover the wall.
  *
- * The marks are in memory on purpose: each is a one-hour hint, a wrong or lost one costs a single in-container
- * rotation, and a host restart forgetting it is the same as the hint expiring.
+ * The marks are in memory on purpose: each is a hint that lasts until the reported reset (or an hour), a wrong or
+ * lost one costs a single in-container rotation, and a host restart forgetting it is the same as the hint expiring.
  */
 import fs from 'fs';
 import os from 'os';
@@ -57,16 +57,26 @@ export interface CodexAccount {
   containerPath: string;
 }
 
-/**
- * An account's quota can be reset early, and only a running app-server can read it, so the mark expires and
- * containers start on the account again until one of them reports it spent.
- */
+/** The mark's length when the container measured no reset; only a running app-server can read the quota. */
 export const CODEX_ACCOUNT_RETRY_MS = 60 * 60_000;
 
 const exhaustedUntil = new Map<string, number>();
 
-export function markCodexAccountExhausted(hostHome: string, nowMs: number = Date.now()): void {
-  exhaustedUntil.set(hostHome, nowMs + CODEX_ACCOUNT_RETRY_MS);
+/** A reported reset further out than this is treated as this far: no Codex window we know is longer than a week. */
+export const CODEX_ACCOUNT_MARK_MAX_MS = 7 * 24 * 60 * 60_000;
+
+export function markCodexAccountExhausted(
+  hostHome: string,
+  nowMs: number = Date.now(),
+  resetAt: string | null = null,
+): number {
+  const reset = resetAt ? Date.parse(resetAt) : Number.NaN;
+  const until =
+    Number.isFinite(reset) && reset > nowMs
+      ? Math.min(reset, nowMs + CODEX_ACCOUNT_MARK_MAX_MS)
+      : nowMs + CODEX_ACCOUNT_RETRY_MS;
+  exhaustedUntil.set(hostHome, until);
+  return until;
 }
 
 export function isCodexAccountExhausted(hostHome: string, nowMs: number = Date.now()): boolean {

@@ -1,9 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { Worker } from 'node:worker_threads';
 
 import { DATA_DIR } from './config.js';
+import { startHostWorker } from './host-worker.js';
 import {
   createStorageStatusReport,
   resolveStoragePolicy,
@@ -41,23 +40,8 @@ interface StorageWorkerResponse {
 export type StorageWorkerFactory = () => WorkerLike;
 
 function createWorker(): WorkerLike {
-  const runningTypeScript = import.meta.url.endsWith('.ts');
-  const workerUrl = new URL(
-    runningTypeScript ? './storage-maintenance-worker-thread.ts' : './storage-maintenance-worker-thread.js',
-    import.meta.url,
-  );
-  const workerData = { dbPath: path.join(DATA_DIR, 'v2.db') };
-  if (runningTypeScript) {
-    // Node 20 does not apply `--import tsx` hooks to a file-backed Worker, so tsx is registered in an eval bootstrap.
-    const entryPath = fileURLToPath(workerUrl);
-    const parentPath = fileURLToPath(import.meta.url);
-    const bootstrap = `const { require: tsxRequire } = require('tsx/cjs/api'); tsxRequire(${JSON.stringify(entryPath)}, ${JSON.stringify(parentPath)});`;
-    return new Worker(bootstrap, { eval: true, workerData, execArgv: [] });
-  }
-  return new Worker(workerUrl, {
-    workerData,
-    // Never inherit parent-only flags such as `--input-type=module`: Node rejects them for a file-URL Worker.
-    execArgv: [],
+  return startHostWorker('./storage-maintenance-worker-thread', import.meta.url, {
+    workerData: { dbPath: path.join(DATA_DIR, 'v2.db') },
   });
 }
 
@@ -219,8 +203,17 @@ export async function assertStorageAdmissionInBackground(activeSessionIds: strin
       report: createStorageStatusReport(policy, usage),
     };
   }
+  // The worker answers one message at a time, so a queued admission waits out a whole maintenance pass. Below the
+  // refuse line that wait can only end in "allowed"; the hourly pass still does the cleanup.
+  if (usage.usagePct < policy.admissionRefusePct) {
+    return {
+      allowed: true,
+      reason: 'below-refuse-threshold',
+      report: createStorageStatusReport(policy, usage),
+    };
+  }
 
-  // Only pressure cases enter the serialized queue, so admission observes a running pass instead of racing it.
+  // Only usage that could be refused enters the serialized queue, so a refusal observes a running pass instead of racing it.
   return backgroundStorageMaintenance.assertAdmission(activeSessionIds);
 }
 

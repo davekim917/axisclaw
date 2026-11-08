@@ -11,7 +11,7 @@ Before this change the receipt named only the repository, PR, base and head. A r
 In the session of any group that posts warning cards, look for either refusal:
 
 - `request_choice failed: a warning card needs approvalScope.holds: the exact hold codes its Go accepts` (host or runner): the card omitted `holds`, or passed an empty list.
-- `request_choice failed: approvalScope is malformed`: `holds` repeats a code, has more than 12, or holds something other than a `hold:` code of letters, digits and `_ . : / @ + -`.
+- `request_choice failed: approvalScope is malformed`: `holds` repeats a code, has more than 24, or holds something other than a `hold:` code of letters, digits and `_ . : / @ + -`.
 
 A warning card that was still open when the host deployed has no `holds`. Its click now carries no `release_scope`, so it never counts as a release decision.
 

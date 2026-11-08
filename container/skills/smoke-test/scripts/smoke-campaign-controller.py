@@ -51,7 +51,8 @@ synthesis.json (the owner's machine-readable verdict; new contract, s2):
    laneGenerations:{<laneId>:<gen>},
    findings:[{id, blocking:bool, confirmed:bool, disposition, existingIssue?}],
    gaps:[{lane, disposition}], dissents:[{id, disposition}],
-   holdDisposition:{runId, disposition: resolved|not-in-range|carried, evidence}}
+   holdDisposition:{runId, disposition: resolved|not-in-range|carried, evidence},
+   dataDate: one line for the verdict post}
   A closed disposition is `fixed-verified`, `not-blocking:<reason>` or
   `refuted:<run-relative evidence path>` (nonempty regular file in the run).
   The controller enumerates gaps, confirmed findings and dissent ITSELF
@@ -113,7 +114,7 @@ import time
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.dont_write_bytecode = True  # smoke-acceptance.test.sh rejects __pycache__ beside the scripts
 sys.path.insert(0, SCRIPT_DIR)
-import smoke_run_id  # noqa: E402
+import smoke_owner_activity, smoke_run_id  # noqa: E402
 BARRIER = os.path.join(SCRIPT_DIR, "smoke-evidence-barrier.sh")
 PAIR_IDENTITY = os.path.join(SCRIPT_DIR, "smoke-pair-identity.sh")
 READ_ONLY_COMMANDS = {("bash", BARRIER)}
@@ -183,6 +184,16 @@ PUBLICATION_REDRIVE_SECONDS = 86400
 # Journal kinds whose obligations must all be receipted before a GO finish.
 PRE_FINISH_KINDS = ("send", "gh", "dispatch")
 OWNER_STEP_SLA_SECONDS = 3600
+# A full campaign's lanes step walks every lane in one owner step and takes
+# hours. Its SLA stays under the gate's whole-run overrun alarm
+# (SMOKE_GATE_ACTIVE_STALE_SECONDS, 4 h), which remains the backstop.
+LANES_STEP_SLA_SECONDS = 10800
+
+
+def owner_step_sla(step):
+    return LANES_STEP_SLA_SECONDS if step == "lanes" else OWNER_STEP_SLA_SECONDS
+
+
 # A phase dispatch whose admission this controller still cannot confirm after
 # this long is alarmed (controller_dispatch_unconfirmed). Replaying the same
 # event is safe and stays the recovery, but it is silent: pr2121 replayed its
@@ -820,6 +831,7 @@ def run_read_only(argv, timeout=60):
 
 # Chat language for the machine verdicts (SKILL.md s8): a human never reads a
 # bare token.
+DATA_DATE_MAX = 200
 VERDICT_CHAT = {
     "GO": "Safe to ship",
     "NO_GO": "Do not ship this build",
@@ -838,6 +850,9 @@ GATE_ALARM_TEXT = {
     "pr_run_overrun": ("The smoke campaign {runId} on PR #{pr} has held its slot for {ageHours} hours, past its time "
                        "limit, and is still stamping progress. Check whether it is stuck before it blocks the next PR."),
     "pr_preflight_failed": "PR #{pr}'s preflight check failed ({reason}); no campaign.",
+    "pr_walk_close_failed": ("Walk preview PR #{pr} has been open past its limit and closing it failed, so its "
+                             "preview keeps billing. Close it by hand (`smoke-freeze-pr.sh close-walk {pr}`) and "
+                             "fix what refused the close."),
     "coordinator_lease_unavailable": "The PR smoke watcher could not take the coordinator lease.",
     # The claim renewer's liveness (#1031; smoke-controller-live-worker.py,
     # renewer_gate). One per case, because each needs a different fix. All four
@@ -950,8 +965,10 @@ OWNER_BRIEF = {
         "pair-identity note above names), run the synthesis barrier, then write {run}/coordinator/synthesis.md "
         "and {run}/synthesis.json "
         "(the skill's machine-readable verdict file: your verdict, the frozen sourceSha, laneGenerations from the "
-        "contract, and a disposition for every confirmed finding, every lane without a passing marker and every "
-        "challenger dissent id -- leave one open rather than change the verdict to fit). Write {run}/run-record.md "
+        "contract, `dataDate`: one line saying how recent the data behind the tested screens is, per the deployment's "
+        "standing instructions, or that the run read no data, and a disposition for every confirmed finding, every "
+        "lane without a passing marker and every challenger dissent id -- leave one open rather than change the "
+        "verdict to fit). Write {run}/run-record.md "
         "(the run record the controller posts as the PR comment: lane detail, design check, recovery history). Write "
         "{run}/controller/verdict-bullets.md: at most three plain-language bullets for the verdict post (what "
         "blocks or was proven; what was not challenged or not demonstrable; the next owner). Every confirmed "
@@ -970,6 +987,14 @@ OWNER_BRIEF = {
         "verdict-bullets.md, and for every confirmed finding either \"existingIssue\" on its synthesis.json entry "
         "or an issue file)."),
 }
+
+
+def data_date_line(synthesis):
+    stamp = synthesis.get("dataDate") if isinstance(synthesis, dict) else None
+    stamp = " ".join(stamp.split()) if isinstance(stamp, str) else ""
+    if len(stamp) > DATA_DATE_MAX:
+        stamp = stamp[:DATA_DATE_MAX].rsplit(" ", 1)[0][:DATA_DATE_MAX - 1] + "…"
+    return "- Data: {}".format(stamp or "date not recorded")
 
 
 class EffectLayer:
@@ -1190,8 +1215,9 @@ class EffectLayer:
             if failed:
                 bullets = ["- Not cleared: {}".format("; ".join(str(f) for f in failed[:2]))] + bullets[:2]
             bullets = [b if b.startswith(("-", "*", "•")) else "- " + b for b in bullets]
-            text = "**{} — {}**\n{}\n- Full run record: the run-record comment on {}\n{}".format(
-                pr_line, VERDICT_CHAT.get(verdict, verdict), "\n".join(bullets), pr_line, tail).replace("\n\n", "\n")
+            text = "**{} — {}**\n{}\n{}\n- Full run record: the run-record comment on {}\n{}".format(
+                pr_line, VERDICT_CHAT.get(verdict, verdict), "\n".join(bullets), data_date_line(syn), pr_line,
+                tail).replace("\n\n", "\n")
             return text, []
         if slot.startswith("alarm:"):
             trig = hint.get("trigger") or "alarm"
@@ -1516,6 +1542,7 @@ class EffectLayer:
                     run_id, (claim["sha"] or "")[:12], VERDICT_CHAT.get(verdict, verdict or "no verdict"))]
         for f in hint.get("failedChecks") or []:
             head.append("- Not cleared: {}".format(f))
+        head.append(data_date_line(read_json_file(os.path.join(run, "synthesis.json"))[0]))
         for rel in ("run-record.md", "synthesis.md", os.path.join("coordinator", "synthesis.md")):
             text = self._read_text(os.path.join(run, rel))
             if text:
@@ -2423,6 +2450,17 @@ class RunView:
     def isdir(self, rel):
         return self.exists and os.path.isdir(self.path(rel))
 
+    def no_lane_marker(self):
+        """True only on a positive look: the markers directory is gone or holds
+        no marker. A marker is what says a lane finished; an evidence file can
+        be an unfinished attempt, and an unreadable directory says nothing."""
+        try:
+            return not any(n.endswith(".json") for n in os.listdir(self.path("markers")))
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+
     def required_lanes(self):
         c = self.contract or {}
         return [m for m in c.get("requiredLaneMarkers") or [] if isinstance(m, str)]
@@ -3251,8 +3289,8 @@ class Controller:
             return route
         if not self.live or self.owner_cutover is None:
             return "legacy"
-        already_owned = any(o["runId"] == run_id and o["kind"] == "owner" for o in self.obligations().values())
-        route = "legacy" if run_id in self.owner_cutover["legacyRuns"] or already_owned else "phase-dispatch"
+        route = owner_route_for(self.obligations(), run_id,
+                                self.owner_cutover)
         self.record(run_id, "run", "claim", claim["state"], detail={"ownerRoute": route})
         return route
 
@@ -3302,9 +3340,11 @@ class Controller:
                     self.ensure_alarm(run_id, "controller_owner_checkpoint_missing", "owner-checkpoint:{}".format(step),
                                       {"step": step, "rowId": receipt["row_id"]})
                 started = parse_iso(ob["history"][0].get("at"))
-                if started and (self.now - started).total_seconds() > OWNER_STEP_SLA_SECONDS:
+                overdue = started and self._dispatched_owner_overdue(run_id, step, (self.now - started).total_seconds())
+                if overdue:
                     self.ensure_alarm(run_id, "controller_obligation_overdue", "owner-dispatch:{}".format(step),
-                                      {"step": step, "rowId": receipt["row_id"], "status": status.get("status") if status else "unknown"})
+                                      {"step": step, "rowId": receipt["row_id"], "status": status.get("status") if status else "unknown",
+                                       "reason": overdue})
                 self.decide(run_id, phase, "wait", "wait", "phase owner in flight or requires disposition", step=step)
                 return "intent"
         if not ob:
@@ -3331,6 +3371,17 @@ class Controller:
                                   "owner-dispatch-unconfirmed:{}:{}".format(step, event[:40]),
                                   {"step": step, "eventKey": event, "since": iso(since), "error": error})
         return "enqueued" if result.get("outcome") == "admitted" else "intent"
+
+    def _dispatched_owner_overdue(self, run_id, step, age):
+        """Past twice the SLA the step is overdue however busy its owner
+        looks, so an owner looping on live writes still surfaces."""
+        if age <= owner_step_sla(step):
+            return None
+        if age > 2 * owner_step_sla(step):
+            return "past-ceiling"
+        if smoke_owner_activity.owner_writing(os.path.join(self.args.run_root, run_id), self.now.timestamp()):
+            return None
+        return "owner-quiet"
 
     def owner_step(self, run_id, phase, step, done):
         """Judgment step for the retained owner. The wake is an effect: live
@@ -3384,7 +3435,7 @@ class Controller:
                                          "since": ob["history"][0].get("at")})
         started = parse_iso(ob["history"][0].get("at"))
         if ob["state"] in ("intent", "enqueued") and started and \
-                (self.now - started).total_seconds() > OWNER_STEP_SLA_SECONDS:
+                (self.now - started).total_seconds() > owner_step_sla(step):
             raised = self.ensure_alarm(run_id, "controller_obligation_overdue", "overdue:{}".format(key[:12]),
                                        {"obligation": "owner:{}".format(step)})
             if not ob["detail"].get("overdue"):
@@ -4090,6 +4141,9 @@ class Controller:
             return timed
         lanes = run.barrier("lanes")
         if not lanes.get("ready"):
+            stopped = self._maybe_no_lane_work(run_id, claim, run)
+            if stopped:
+                return stopped
             # PUBLISHED BEFORE THE WAKE, not after: the brief is written by
             # owner_step's effect, and _brief_notes can only cite a file that
             # already exists.
@@ -4298,7 +4352,10 @@ class Controller:
             early, early_err = run.synthesis()
             if not early_err and isinstance(early, dict) and early.get("verdict") in ("BLOCKED", "HUMAN_DECISION"):
                 return None
-        return self._maybe_challenger_timeout(run_id, claim, run)
+        timed = self._maybe_challenger_timeout(run_id, claim, run)
+        if timed or not run.contract_error:
+            return timed
+        return self._maybe_no_lane_work(run_id, claim, run)
 
     def _root_attempt_due(self, run_id, root_ob):
         """Will send() put an attempt of the root post out this fire? A first
@@ -4366,6 +4423,36 @@ class Controller:
         # the controller must not call `finish` after it.
         return self.pre_finish(run_id, claim.get("pr"), "BLOCKED", ["challenger-timeout: no disposition by {}".format(
             claim.get("deadline"))], {}, terminal_verb="challenger-timeout")
+
+    def _nothing_running(self, run_id, run):
+        """Positive evidence only, because "no lane finished yet" is also what a
+        slow first lane looks like, and a `progress` stamp cannot tell them
+        apart: the controller's own keepalive stamps on every fire. A challenger
+        that filed BLOCKED has closed the campaign, and the host can say a
+        dispatched owner's turn ended. Anything else, a status it cannot read
+        and a brief-route owner it cannot see included, counts as still running."""
+        challenge = run.challenge_complete()
+        if isinstance(challenge, dict) and challenge.get("disposition") == "BLOCKED":
+            return True
+        detail = (self.obligations().get(obligation_key(run_id, "owner", "lanes")) or {}).get("detail") or {}
+        if not detail.get("dispatch") or detail.get("dispatchIntent"):
+            return False
+        status = self.effects.owner_status(detail["dispatch"])
+        return bool(status) and (status.get("settlement") or {}).get("state") == "settled"
+
+    def _maybe_no_lane_work(self, run_id, claim, run):
+        """The challenger filed, so `challenger-timeout` is moot, no lane has
+        finished by the deadline, and nothing is working on one. Nothing else
+        can end this run: the synthesis safety net sits behind the lanes
+        barrier, and the owner step is only ever re-offered. Goes out through
+        `finish`, which the gate does not refuse on a disposition, and only as
+        BLOCKED, so it can neither carry evidence forward nor clear a PR."""
+        deadline = parse_iso(claim.get("deadline"))
+        if not deadline or self.now < deadline or not run.has("challenger/disposition.md") or \
+                not run.no_lane_marker() or not self._nothing_running(run_id, run):
+            return None
+        return self.pre_finish(run_id, claim.get("pr"), "BLOCKED", [
+            "no-lane-work: no lane finished by {} and nothing is running".format(claim.get("deadline"))], {})
 
     def pre_finish(self, run_id, pr, verdict, failed, synthesis_doc, terminal_verb="finish"):
         phase = "verdict"
@@ -5048,6 +5135,18 @@ def live_config(args):
         "oneshot_model": args.oneshot_model, "oneshot_effort": args.oneshot_effort,
         "deadline": args.deadline_epoch,
     }
+
+
+def owner_route_for(obligations, run_id, cutover):
+    """The owner route a live controller with an enabled owner-dispatch cutover
+    gives run_id: the one persisted on its claim, else legacy for a listed or
+    already-owned run, else phase-dispatch."""
+    claim = obligations.get(obligation_key(run_id, "run", "claim")) or {}
+    route = (claim.get("detail") or {}).get("ownerRoute")
+    if route:
+        return route
+    already_owned = any(o.get("runId") == run_id and o.get("kind") == "owner" for o in obligations.values())
+    return "legacy" if run_id in cutover["legacyRuns"] or already_owned else "phase-dispatch"
 
 
 def main(argv=None):

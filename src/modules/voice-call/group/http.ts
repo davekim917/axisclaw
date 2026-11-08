@@ -3,10 +3,12 @@ import type { Socket } from 'net';
 import { timingSafeEqual } from 'crypto';
 
 import { log } from '../../../log.js';
-import { json, send, streamEvents } from '../http.js';
+import { json, readBody, send, streamEvents } from '../http.js';
+import { logMicReport, MIC_REPORT_MAX_BYTES } from '../mic-report.js';
 import { livekitClientScript } from './bridge-page.js';
 import { joinPageHtml } from './join-page.js';
 import { claimLink, gate, groupCallUrl, leave, linkFor, listen, type GroupPageEvent } from './service.js';
+import { platformName } from '../prompts.js';
 
 function pageTokenMatches(expected: string | null, url: URL): boolean {
   const given = Buffer.from(url.searchParams.get('t') ?? '');
@@ -38,7 +40,7 @@ export function handleGroupCallRequest(linkId: string, req: IncomingMessage, res
         'content-security-policy',
         `default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self' ${groupCallUrl(linkId).replace('https://', 'wss://')}; media-src blob: mediastream:; frame-ancestors 'none'; base-uri 'none'`,
       );
-      send(res, 200, joinPageHtml(call.agentName, person.name), 'text/html');
+      send(res, 200, joinPageHtml(call.agentName, person.name, platformName(call.route.channelType)), 'text/html');
     }
     return true;
   }
@@ -51,7 +53,7 @@ export function handleGroupCallRequest(linkId: string, req: IncomingMessage, res
     else streamEvents<GroupPageEvent>(req, res, (write) => listen(person, write));
     return true;
   }
-  if (method !== 'POST' || !['/claim', '/leave'].includes(url.pathname)) {
+  if (method !== 'POST' || !['/claim', '/leave', '/mic'].includes(url.pathname)) {
     json(res, 404, { error: 'Not found.' });
     return true;
   }
@@ -69,7 +71,10 @@ export function handleGroupCallRequest(linkId: string, req: IncomingMessage, res
         return;
       }
       if (!pageTokenMatches(person.pageToken, url)) json(res, 403, { error: 'Not this call.' });
-      else {
+      else if (url.pathname === '/mic') {
+        logMicReport(call.id, await readBody(req, MIC_REPORT_MAX_BYTES));
+        json(res, 200, { ok: true });
+      } else {
         await leave(linkId);
         json(res, 200, { ok: true });
       }

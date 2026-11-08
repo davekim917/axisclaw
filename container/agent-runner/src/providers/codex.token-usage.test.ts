@@ -24,8 +24,12 @@ import { formatStatusSubtext, resetTurnStatus, setTurnSettings } from '../turn-s
  *    subtracted it (turn-usage.ts's module-global memo) died with the old
  *    process while the codex thread did not. The second test is that case.
  */
+/** The image's guard chain, read from its source in the repo. */
+const SYSTEM_HOOKS = new URL('../../../codex-system/hooks.json', import.meta.url).pathname;
+
 const ORIGINAL_ENV = {
   PATH: process.env.PATH,
+  FAKE_CODEX_SYSTEM_HOOKS: process.env.FAKE_CODEX_SYSTEM_HOOKS,
   CODEX_HOME: process.env.CODEX_HOME,
   CODEX_HEALTH_STILL_WORKING_NOTICE_MS: process.env.CODEX_HEALTH_STILL_WORKING_NOTICE_MS,
 };
@@ -82,24 +86,24 @@ lines.on('line', (line) => {
     return;
   }
   // verifyCodexHookTrust (codex-companion-setup.ts) refuses the spawn unless
-  // every generated guard handler reads back dispatchable. The provider writes
-  // hooks.json AND its trust entries immediately before each spawn, so a
-  // faithful fake reports exactly those two handlers trusted and enabled —
-  // which is what a real codex 0.154.0 does against the same home (measured).
+  // every handler of the image's system guard chain reads back dispatchable.
+  // Codex lists a system-layer handler as managed under every CODEX_HOME, so a
+  // faithful fake reports the chain's two handlers that way — as a real codex
+  // 0.163.0 does for /etc/codex/hooks.json (measured).
   if (request.method === 'hooks/list') {
     const home = process.env.CODEX_HOME || (process.env.HOME || '/home/node') + '/.codex';
-    const hooksPath = home + '/hooks.json';
+    const hooksPath = process.env.FAKE_CODEX_SYSTEM_HOOKS;
     const rows = ['pre_tool_use', 'post_tool_use'].map((event, index) => ({
       key: hooksPath + ':' + event + ':0:0',
       eventName: event,
       handlerType: 'command',
       sourcePath: hooksPath,
-      source: 'user',
+      source: 'system',
       pluginId: null,
       displayOrder: index,
       enabled: true,
-      isManaged: false,
-      trustStatus: 'trusted',
+      isManaged: true,
+      trustStatus: 'managed',
     }));
     send({ id: request.id, result: { data: [{ cwd: process.cwd(), hooks: rows, warnings: [], errors: [] }] } });
     return;
@@ -175,10 +179,11 @@ async function runTurnUsage(steps: UsageStep[]): Promise<unknown> {
   fs.mkdirSync(codexHome, { recursive: true });
 
   process.env.PATH = `${binDir}:${process.env.PATH ?? ''}`;
+  process.env.FAKE_CODEX_SYSTEM_HOOKS = SYSTEM_HOOKS;
   process.env.CODEX_HOME = codexHome;
   process.env.CODEX_HEALTH_STILL_WORKING_NOTICE_MS = '10000';
 
-  const provider = new CodexProvider({ providerConfig: {} });
+  const provider = new CodexProvider({ providerConfig: {} }, { systemHooksPath: SYSTEM_HOOKS });
   provider.registerMemorySessionHook(MEMORY_SESSION_HOOK);
   const query = provider.query({ prompt: 'run a multi-request turn', cwd: tmpDir });
 

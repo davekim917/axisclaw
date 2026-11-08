@@ -26,8 +26,9 @@
 #      alarm queue is empty -- runs the gate's `poll` with
 #      SMOKE_GATE_CLAIMANT=controller, so a new claim is recorded as the
 #      controller's (smoke-pr-gate.sh claimant_guard) and its wake -- with the
-#      owner token -- reaches only the controller. An alarm wake is queued
-#      before its latch is acknowledged;
+#      owner token -- reaches only the controller. With the claim renewer
+#      unhealthy it polls `--recovery-only` instead, whatever the queue holds.
+#      An alarm wake is queued before its latch is acknowledged;
 #   6. reads PR heads (gh), delivery receipts (this session's inbound.db) and,
 #      only when a dispatch intent needs reconciling, `ncl tasks list`;
 #   7. runs one controller `step` in live mode, which journals every queued

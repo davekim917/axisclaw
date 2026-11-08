@@ -9,6 +9,7 @@ import { closeDb, createAgentGroup, createSession, runMigrations } from '../db/i
 import { initDb } from '../db/connection.js';
 
 import { createDiscordAdapter, DiscordFormatConverter } from '@chat-adapter/discord';
+import { createChatSdkBridge } from './chat-sdk-bridge.js';
 
 import {
   installThreadParentResolve,
@@ -919,6 +920,192 @@ describe('installMessageThreadAutoCreate', () => {
     } finally {
       fetchSpy.mockRestore();
     }
+  });
+
+  it.each([
+    ['a threaded post', anchor, { kind: 'chat', content: { text: 'part 2' } }],
+    [
+      'a files-only post',
+      anchor,
+      { kind: 'chat', content: {}, files: [{ filename: 'chart.png', data: Buffer.from('x') }] },
+    ],
+    [
+      'the continuation chunk of an oversize root post',
+      null,
+      { kind: 'chat', content: { text: 'A'.repeat(30) + '\n' + 'B'.repeat(30) } },
+    ],
+  ])(
+    'through the bridge, %s opens a week-long workstream thread and a day-long report thread',
+    async (_, threadId, m) => {
+      for (const [workstreamThread, minutes] of [
+        [true, 10080],
+        [undefined, 1440],
+      ] as const) {
+        let opened = false;
+        const postMessage = vi.fn(async (tid: string) => {
+          if (tid === anchor && !opened) throw unknownChannel();
+          return { id: 'msg1', threadId: tid, raw: {} };
+        });
+        const rest = {
+          get: vi.fn().mockResolvedValue({ content: 'Why did saves drop?' }),
+          post: vi.fn(async () => {
+            opened = true;
+            return { id: 'msg1' };
+          }),
+        };
+        const adapter = setup(postMessage, rest);
+        const bridge = createChatSdkBridge({
+          adapter: adapter as never,
+          supportsThreads: true,
+          maxTextLength: 30,
+          threadContinuationChunks: true,
+          channelType: 'discord',
+        });
+
+        await bridge.deliver('discord:guild1:chan1', threadId, { ...m, workstreamThread });
+
+        expect(rest.post).toHaveBeenCalledWith('/channels/chan1/messages/msg1/threads', {
+          body: { name: 'Why did saves drop?', auto_archive_duration: minutes },
+        });
+      }
+    },
+  );
+
+  describe('a workstream root post', () => {
+    const root = 'discord:guild1:chan1';
+    const body = { markdown: 'Why did saves drop?', workstreamThread: true };
+    const posted = () => vi.fn(async () => ({ id: 'msg1', threadId: root, raw: {} }));
+
+    it('still opens a week-long thread on the next chunk when the root open failed', async () => {
+      let opened = false;
+      const postMessage = vi.fn(async (tid: string) => {
+        if (tid !== root && !opened) throw unknownChannel();
+        return { id: 'msg1', threadId: tid, raw: {} };
+      });
+      const rest = {
+        get: vi.fn().mockResolvedValue({ content: 'Why did saves drop?' }),
+        post: vi
+          .fn()
+          .mockRejectedValueOnce(new Error('Missing Permissions'))
+          .mockImplementation(async () => {
+            opened = true;
+            return { id: 'msg1' };
+          }),
+      };
+      const bridge = createChatSdkBridge({
+        adapter: setup(postMessage, rest) as never,
+        supportsThreads: true,
+        maxTextLength: 30,
+        threadContinuationChunks: true,
+        channelType: 'discord',
+      });
+
+      await bridge.deliver(root, null, {
+        kind: 'chat',
+        content: { text: ['A', 'B'].map((letter) => letter.repeat(30)).join('\n') },
+        workstreamThread: true,
+      });
+
+      expect(rest.post).toHaveBeenLastCalledWith('/channels/chan1/messages/msg1/threads', {
+        body: { name: 'Why did saves drop?', auto_archive_duration: 10080 },
+      });
+    });
+
+    it('keeps a week-long open on a later chunk of a threaded post', async () => {
+      const thread = 'discord:guild1:chan1:msg0';
+      let sent = 0;
+      const postMessage = vi.fn(async (tid: string) => {
+        sent += 1;
+        if (sent === 2) throw unknownChannel();
+        return { id: `msg${sent}`, threadId: tid, raw: {} };
+      });
+      const rest = {
+        get: vi.fn().mockResolvedValue({ content: 'Why did saves drop?' }),
+        post: vi.fn().mockResolvedValue({ id: 'msg0' }),
+      };
+      const bridge = createChatSdkBridge({
+        adapter: setup(postMessage, rest) as never,
+        supportsThreads: true,
+        maxTextLength: 30,
+        threadContinuationChunks: true,
+        channelType: 'discord',
+      });
+
+      await bridge.deliver('discord:guild1:chan1', thread, {
+        kind: 'chat',
+        content: { text: ['A', 'B'].map((letter) => letter.repeat(30)).join('\n') },
+        workstreamThread: true,
+      });
+
+      expect(rest.post).toHaveBeenCalledWith('/channels/chan1/messages/msg0/threads', {
+        body: { name: 'Why did saves drop?', auto_archive_duration: 10080 },
+      });
+    });
+
+    it('opens one thread when a later chunk falls back to the channel', async () => {
+      let sent = 0;
+      const postMessage = vi.fn(async (tid: string) => {
+        if (tid !== root) throw new Error('Internal Server Error');
+        sent += 1;
+        return { id: `msg${sent}`, threadId: tid, raw: {} };
+      });
+      const rest = {
+        get: vi.fn().mockResolvedValue({ content: 'Why did saves drop?' }),
+        post: vi.fn().mockResolvedValue({ id: 'msg1' }),
+      };
+      const bridge = createChatSdkBridge({
+        adapter: setup(postMessage, rest) as never,
+        supportsThreads: true,
+        maxTextLength: 30,
+        threadContinuationChunks: true,
+        channelType: 'discord',
+      });
+
+      await bridge.deliver(root, null, {
+        kind: 'chat',
+        content: { text: ['A', 'B', 'C'].map((letter) => letter.repeat(30)).join('\n') },
+        workstreamThread: true,
+      });
+
+      expect(sent).toBe(3);
+      expect(rest.post).toHaveBeenCalledTimes(1);
+      expect(rest.post).toHaveBeenCalledWith('/channels/chan1/messages/msg1/threads', expect.anything());
+    });
+
+    it('opens its thread on the post itself, named for it and kept a week', async () => {
+      const rest = {
+        get: vi.fn().mockResolvedValue({ content: 'Why did saves drop?' }),
+        post: vi.fn().mockResolvedValue({ id: 'msg1' }),
+      };
+      const adapter = setup(posted(), rest);
+
+      await expect(adapter.postMessage(root, body)).resolves.toMatchObject({ id: 'msg1' });
+
+      expect(rest.post).toHaveBeenCalledTimes(1);
+      expect(rest.post).toHaveBeenCalledWith('/channels/chan1/messages/msg1/threads', {
+        body: { name: 'Why did saves drop?', auto_archive_duration: 10080 },
+      });
+    });
+
+    it('stays delivered when the thread cannot open', async () => {
+      const rest = { get: vi.fn().mockResolvedValue({}), post: vi.fn().mockRejectedValue(new Error('403')) };
+      const adapter = setup(posted(), rest);
+
+      await expect(adapter.postMessage(root, body)).resolves.toMatchObject({ id: 'msg1' });
+    });
+
+    it.each([
+      ['a report root post', root, { markdown: 'x' }],
+      ['a DM', 'discord:@me:dm1', body],
+      ['a post already in a thread', anchor, body],
+    ])('%s opens nothing', async (_, target, message) => {
+      const rest = { get: vi.fn(), post: vi.fn() };
+      const adapter = setup(posted(), rest);
+
+      await adapter.postMessage(target, message);
+
+      expect(rest.post).not.toHaveBeenCalled();
+    });
   });
 
   it('leaves channel-root posts, DMs and unrelated errors untouched', async () => {

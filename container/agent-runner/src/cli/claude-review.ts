@@ -1,6 +1,7 @@
 /** Client half of the constrained Claude review launcher. */
 import net from 'node:net';
 
+import { claudeCyclePlan, runClaudeCycle } from './claude-cycle.js';
 import {
   CLAUDE_REVIEW_SOCKET_ENV,
   isClaudeReviewResponse,
@@ -69,7 +70,7 @@ export async function requestClaudeReview(
 async function main(): Promise<void> {
   const [mode, ...argv] = process.argv.slice(2);
   if (mode === '--nanoclaw-review-eligible') {
-    process.exitCode = parseClaudeReviewArgs(argv) ? 0 : 64;
+    process.exitCode = parseClaudeReviewArgs(argv) || claudeCyclePlan(argv, process.env) ? 0 : 64;
     return;
   }
   if (mode !== '--nanoclaw-review') {
@@ -78,6 +79,18 @@ async function main(): Promise<void> {
     return;
   }
   const args = parseClaudeReviewArgs(argv);
+  const cycle = args ? null : claudeCyclePlan(argv, process.env);
+  if (cycle) {
+    try {
+      // Explicit: a stdin nothing closes would otherwise hold the process open after the run.
+      const code = await runClaudeCycle(cycle);
+      await new Promise((resolve) => process.stdout.write('', resolve));
+      process.exit(code);
+    } catch (err) {
+      process.stderr.write(`claude launcher: ${err instanceof Error ? err.message : 'request failed'}\n`);
+      process.exit(2);
+    }
+  }
   if (!args) {
     process.stderr.write('claude review launcher: unsafe review invocation\n');
     process.exitCode = 2;

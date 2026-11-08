@@ -1,5 +1,6 @@
 import { getDb, hasTable } from '../../db/connection.js';
 import { getSessionsByAgentGroup } from '../../db/sessions.js';
+import { yieldToEventLoop } from '../../event-loop-yield.js';
 import { log } from '../../log.js';
 import { registerResource } from '../crud.js';
 
@@ -21,6 +22,7 @@ export async function projectDestinationsToSessions(agentGroupId: string): Promi
   if (!(await hasTable(getDb(), 'agent_destinations'))) return;
   const { writeDestinations } = await import('../../modules/agent-to-agent/write-destinations.js');
   for (const session of await getSessionsByAgentGroup(agentGroupId)) {
+    await yieldToEventLoop();
     try {
       await writeDestinations(agentGroupId, session.id);
     } catch (err) {

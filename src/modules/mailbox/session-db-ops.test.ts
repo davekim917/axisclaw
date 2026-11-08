@@ -1134,6 +1134,33 @@ describe('expireStalePending', () => {
       db.close();
     }
   });
+
+  it('keeps a stale recall row while its target is live, and expires one whose target is gone or ended', () => {
+    const db = makeInboundDb();
+    try {
+      const oldTs = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
+      for (const [target, status] of [
+        ['t-pending', 'pending'],
+        ['t-paused', 'paused'],
+        ['t-done', 'completed'],
+      ] as const) {
+        insertRow(db, { id: `recall-${target}`, timestamp: oldTs, processAfter: oldTs, kind: 'system' });
+        insertRow(db, { id: target, timestamp: oldTs, status, kind: 'task' });
+        db.prepare("UPDATE messages_in SET recurrence = '0 * * * *' WHERE id = ?").run(target);
+      }
+      insertRow(db, { id: 'recall-t-missing', timestamp: oldTs, processAfter: oldTs, kind: 'system' });
+
+      expect(expireStalePending(db, 24 * 60 * 60 * 1000)).toBe(2);
+      expect(db.prepare("SELECT id, status FROM messages_in WHERE kind = 'system' ORDER BY id").all()).toEqual([
+        { id: 'recall-t-done', status: 'expired' },
+        { id: 'recall-t-missing', status: 'expired' },
+        { id: 'recall-t-paused', status: 'pending' },
+        { id: 'recall-t-pending', status: 'pending' },
+      ]);
+    } finally {
+      db.close();
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1310,6 +1337,25 @@ describe('syncProcessingAcks — script-skip counter', () => {
 
   const status = (inDb: InstanceType<typeof Database>, id: string) =>
     (inDb.prepare('SELECT status FROM messages_in WHERE id = ?').get(id) as { status: string }).status;
+
+  it.each([
+    ['pending', 'completed'],
+    ['processing', 'completed'],
+    ['expired', 'completed'],
+    ['cancelled', 'completed'],
+    ['paused', 'completed'],
+    ['completed', 'completed'],
+    ['failed', 'failed'],
+  ])('a completed ack leaves a %s one-shot row %s', (before, after) => {
+    const { inDb, outDb } = freshPair();
+    seedTask(inDb, 't1', { prompt: 'p' });
+    inDb.prepare('UPDATE messages_in SET status = ? WHERE id = ?').run(before, 't1');
+    ack(outDb, 't1', 'completed');
+
+    syncProcessingAcks(inDb, outDb);
+
+    expect(status(inDb, 't1')).toBe(after);
+  });
 
   it('script-skip:error ack lands the row as a FAILED run (streak-derivable history)', () => {
     const { inDb, outDb } = freshPair();

@@ -24,7 +24,9 @@ export interface ChannelSetup {
   /**
    * A card button click. `messageId` is the clicked message's platform id, null when the platform gave none; an
    * approval resolves only from a click on its own card. `replyToClicker`, when the platform can, answers the
-   * clicker alone (Slack ephemeral, Discord flags 64); a refused click uses it to say who can answer.
+   * clicker alone (Slack ephemeral, Discord flags 64); a refused click uses it to say who can answer. `channelId` is
+   * the clicked message's conversation as `messaging_groups.platform_id` names it; a copy of a card counts only when
+   * the click carries it.
    */
   onAction(
     questionId: string,
@@ -32,6 +34,7 @@ export interface ChannelSetup {
     userId: string,
     messageId: string | null,
     replyToClicker?: (text: string) => Promise<void>,
+    channelId?: string | null,
   ): void;
 
   secretIntake?: SecretIntakeHooks;
@@ -176,6 +179,11 @@ export interface OutboundMessage {
   kind: string;
   content: unknown; // parsed JSON from messages_out
   files?: OutboundFile[]; // file attachments from the session outbox
+  /**
+   * Set by the host, never read from `content`: this post is a workstream someone comes back to, not a report, so a
+   * thread opened for it outlasts a report thread, and a root post opens that thread at once.
+   */
+  workstreamThread?: boolean;
 }
 
 /** Discovered conversation info (from syncConversations). */
@@ -212,6 +220,16 @@ export function conversationDisplayName(conversation: ChannelConversation): stri
   if (conversation.type !== 'group_dm') return conversation.name;
   const names = conversation.participantNames;
   return names && names.length > 0 ? `Group DM: ${formatParticipantList(names)}` : null;
+}
+
+/** Discord's limit, the one platform here whose threads have names. */
+export const MAX_THREAD_NAME_CHARS = 100;
+
+export class ChannelRateLimitedError extends Error {
+  constructor(readonly retryAfterMs: number) {
+    super(`Rate limited for ${retryAfterMs} ms`);
+    this.name = 'ChannelRateLimitedError';
+  }
 }
 
 /** Wiring/mg defaults for one conversation context (DM vs group/channel). */
@@ -394,6 +412,19 @@ export interface ChannelAdapter {
     title: string,
     firstMessage: string,
   ): Promise<{ threadId: string; messageId: string }>;
+
+  /**
+   * The thread's name now, for a platform whose threads have names. Throws when it cannot be read, so a failed read
+   * never passes for a changed name. Fails fast, with {@link ChannelRateLimitedError} on a rate limit.
+   */
+  threadName?(threadId: string): Promise<string>;
+
+  /**
+   * Renames a thread and returns the name the platform stored, which is what later reads compare against. Fails fast
+   * like `threadName`: a caller never waits out a rate limit here. A platform without names omits both, and a title
+   * then lives only in `thread_titles`.
+   */
+  renameThread?(threadId: string, name: string): Promise<string>;
 
   /**
    * Declared wiring-time defaults for this channel. Optional for backward

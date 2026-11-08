@@ -12,7 +12,8 @@ Create `groups/<source>-codex/` from `groups/<source>/`. The codex sibling share
   host and `/workspace/workgroup/memory` in every sibling container.
   `/workspace/agent/memory` is only the compatibility link.
 - **standing-instructions.md** — symlinked to the source file when present, so
-  every sibling reads one persona. It is not a memory root and never becomes
+  every sibling reads one persona. The link is read-only in the sibling's
+  container: only the source group edits it. It is not a memory root and never becomes
   part of the workgroup memory canon.
 - **Repos** — symlinked top-level dirs that contain `.git/`.
 - **sources/** — ordinary knowledge files, shared across the workgroup.

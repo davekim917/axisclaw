@@ -3,6 +3,7 @@ import base64
 import datetime
 import errno
 import fcntl
+import importlib.util
 import json
 import os
 import re
@@ -27,6 +28,8 @@ SCOPE_LISTS = ("tenants", "authPaths", "readOnlyPosts", "denyPaths", "denyPrefix
 REQUIRED_LISTS = ("tenants", "denyPaths", "denyPrefixes")
 PINNED_KEYS = {"mode", "schemaVersion", "runId"}
 GUARD_KEY = "approvalModeGuards"
+OWNED_KEY = "ownedDeletes"
+OWNED_FIELDS = {"path", "read", "items", "require"}
 SEATS_KEY = "seats"
 SEAT_EMAIL = re.compile(r"[a-z0-9][a-z0-9._+-]*@[a-z0-9.-]+")
 GUARD_FIELDS = {"methods", "path", "read", "field", "allow"}
@@ -55,6 +58,11 @@ PASSWORD_HELPER = "/workspace/extra/qa-seat-password.sh"
 LEASE_TOOL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "smoke-seat-lease.py")
 LEASE_REFUSED = 69
 SECRET_KEY = re.compile(r"password|secret|token", re.I)
+_spec = importlib.util.spec_from_file_location("ab_net_redact", os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "..", "agent-browser", "scripts", "ab-net-redact.py"))
+_ab_net_redact = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_ab_net_redact)
+scrub_str = _ab_net_redact.scrub_str
 
 
 class WriteScopeRefused(Exception):
@@ -67,6 +75,12 @@ class ApprovalModeUnread(WriteScopeRefused):
     def __init__(self, message, read_path, field, allow):
         super().__init__(message)
         self.read_path, self.field, self.allow = read_path, field, allow
+
+
+class OwnedDeleteUnread(WriteScopeRefused):
+    def __init__(self, message, read_path, items, item_id, require):
+        super().__init__(message)
+        self.read_path, self.items, self.item_id, self.require = read_path, items, item_id, require
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -96,7 +110,7 @@ def validated_scope(raw):
         return legacy_validated_scope(raw)
     if raw.get("mode") != SCOPE_MODE:
         raise ValueError("mode must be {!r} (an allowlist scope file is no longer accepted)".format(SCOPE_MODE))
-    unknown = sorted(set(raw) - set(SCOPE_LISTS) - PINNED_KEYS - {GUARD_KEY, SEATS_KEY})
+    unknown = sorted(set(raw) - set(SCOPE_LISTS) - PINNED_KEYS - {GUARD_KEY, OWNED_KEY, SEATS_KEY})
     if unknown:
         raise ValueError("unknown keys {}".format(unknown))
     for key in SCOPE_LISTS:
@@ -121,6 +135,9 @@ def validated_scope(raw):
     guards = validated_guards(raw.get(GUARD_KEY, []))
     if guards:
         scope[GUARD_KEY] = guards
+    owned = validated_owned_deletes(raw.get(OWNED_KEY, []))
+    if owned:
+        scope[OWNED_KEY] = owned
     seats = raw.get(SEATS_KEY, [])
     if not isinstance(seats, list) or not all(isinstance(v, str) and SEAT_EMAIL.fullmatch(v) for v in seats):
         raise ValueError("{} must be a list of lowercase seat emails".format(SEATS_KEY))
@@ -165,8 +182,41 @@ def validated_guards(raw):
     return guards
 
 
+def validated_owned_deletes(raw):
+    if not isinstance(raw, list):
+        raise ValueError("{} must be a list of objects".format(OWNED_KEY))
+    entries = []
+    for i, entry in enumerate(raw):
+        where = "{}[{}]".format(OWNED_KEY, i)
+        if not isinstance(entry, dict) or set(entry) != OWNED_FIELDS:
+            raise ValueError("{} must have exactly the keys {}".format(where, sorted(OWNED_FIELDS)))
+        path, read, items, require = (entry[k] for k in ("path", "read", "items", "require"))
+        if not isinstance(path, str) or not path.startswith("/") or path.endswith("/") or "//" in path or "%" in path:
+            raise ValueError("{}.path {!r} is not a canonical path pattern".format(where, path))
+        groups = set(re.compile(path).groupindex)
+        if "item" not in groups:
+            raise ValueError("{}.path must name the deleted item's id as the group (?P<item>...)".format(where))
+        if not isinstance(read, str) or not read.startswith("/"):
+            raise ValueError("{}.read must be a path starting with /".format(where))
+        if not all(name in groups for name in PLACEHOLDER.findall(read)) or "{" in PLACEHOLDER.sub("", read):
+            raise ValueError("{}.read may name only groups of path".format(where))
+        if not isinstance(items, str) or not items:
+            raise ValueError("{}.items must name the list holding the item, or the item itself".format(where))
+        if (not isinstance(require, dict) or not require or not all(
+                isinstance(v, list) and v and all(x is None or isinstance(x, (str, bool)) for x in v)
+                for v in require.values())):
+            raise ValueError("{}.require must map each field to a non-empty list of strings, booleans or null"
+                             .format(where))
+        entries.append({"path": path, "read": read, "items": items, "require": dict(require)})
+    return entries
+
+
+def run_id_of(run_dir):
+    return os.path.basename(os.path.abspath(run_dir))
+
+
 def init_scope(run_dir, source):
-    run_id = os.path.basename(os.path.normpath(run_dir))
+    run_id = run_id_of(run_dir)
     with open(source) as f:
         scope = validated_scope(json.load(f))
     if scope["mode"] == LEGACY_MODE:
@@ -179,7 +229,7 @@ def init_scope(run_dir, source):
 
 
 def fixture_prefix(run_dir):
-    return "QA-{}-".format(os.path.basename(os.path.normpath(run_dir)))
+    return "QA-{}-".format(run_id_of(run_dir))
 
 
 def load_scope(run_dir):
@@ -192,13 +242,13 @@ def load_scope(run_dir):
         scope = validated_scope(raw)
     except (OSError, ValueError, re.error) as e:
         raise WriteScopeRefused("unreadable-scope path={} error={}".format(path, e))
-    run_id = os.path.basename(os.path.normpath(run_dir))
+    run_id = run_id_of(run_dir)
     if raw.get("runId") != run_id:
         raise WriteScopeRefused("scope-run-mismatch scope={} run={}".format(raw.get("runId"), run_id))
     return scope
 
 
-def ledger_ids(run_dir):
+def ledger_ids(run_dir, owned_deletes=False):
     path = os.path.join(run_dir, LEDGER_FILE)
     if not os.path.lexists(path):
         return set()
@@ -207,15 +257,19 @@ def ledger_ids(run_dir):
     try:
         with open(path) as f:
             rows = [json.loads(line) for line in f if line.strip()]
-        return {"{}/{}".format(r["path"].rstrip("/"), r["id"]) for r in rows}
-    except (OSError, ValueError, KeyError) as e:
+        return {"{}/{}".format(r["path"].rstrip("/"), r["id"]) for r in rows
+                if not owned_deletes or r.get("ownedDelete") is True}
+    except (OSError, ValueError, KeyError, AttributeError) as e:
         raise WriteScopeRefused("unreadable-ledger error={}".format(e))
 
 
-def record_fixture(run_dir, create_path, fixture_id, name):
+def record_fixture(run_dir, create_path, fixture_id, name, owned_delete=False):
+    row = {"id": str(fixture_id), "path": create_path, "name": name, "at": now()}
+    if owned_delete:
+        row["ownedDelete"] = True
     with open(os.path.join(run_dir, LEDGER_FILE), "a") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
-        f.write(json.dumps({"id": str(fixture_id), "path": create_path, "name": name, "at": now()}) + "\n")
+        f.write(json.dumps(row) + "\n")
 
 
 def scalars(value):
@@ -312,7 +366,8 @@ def judge(run_dir, method, path, body=None, token_tenants=(), base_path="", seat
     if scope["mode"] == LEGACY_MODE:
         return legacy_judge(run_dir, method, path, body, scope)
     rule = denied(scope, route)
-    if rule:
+    owned = owned_delete(scope, method, path, base_path) if rule else None
+    if rule and not owned:
         raise WriteScopeRefused("denied-path rule={}".format(rule))
     if method == "POST" and any(re.fullmatch(p, route, re.I) for p in scope["authPaths"]):
         return "auth"
@@ -339,8 +394,54 @@ def judge(run_dir, method, path, body=None, token_tenants=(), base_path="", seat
             raise WriteScopeRefused("foreign-seat seat={}".format(seat.lower()))
     elif not token_tenants:
         raise WriteScopeRefused("no-tenant (a write needs a seat token naming a scoped tenant)")
+    if owned:
+        entry, match = owned
+        if match.group(0) not in ledger_ids(run_dir, owned_deletes=True):
+            raise WriteScopeRefused("owned-delete not-ledgered path={} (only an item this run ledgered with own_item)"
+                                    .format(match.group(0)))
+        read_path = owned_read_path(entry, match)
+        raise OwnedDeleteUnread("owned-delete-unread read={} (the client reads it on the deleting seat; check "
+                                "cannot)".format(read_path), read_path, entry["items"], match.group("item"),
+                                entry["require"])
     need_approval_mode(scope, method, path, body, base_path)
     return "write"
+
+
+def owned_delete(scope, method, path, base_path):
+    # Ids are exact and plain: an encoded or query-bearing spelling would be judged as one item and sent as another.
+    if method != "DELETE" or any(c in path for c in "%?#"):
+        return None
+    route = cased_route_of(path)
+    if base_path:
+        route = cased_route_of(base_path.rstrip("/") + route)
+    for entry in scope.get(OWNED_KEY, []):
+        match = re.fullmatch(entry["path"], route, re.I)
+        if match:
+            return entry, match
+    return None
+
+
+def owned_read_path(entry, match):
+    return PLACEHOLDER.sub(lambda m: urllib.parse.quote(match.group(m.group(1)), safe=""), entry["read"])
+
+
+def _has_id(x):
+    return isinstance(x, dict) and isinstance(x.get("id"), (str, int)) and not isinstance(x.get("id"), bool)
+
+
+def unused_problem(response, items, item_id, require):
+    listed = field_value(response, items)
+    if _has_id(listed):
+        listed = [listed]
+    if not isinstance(listed, list):
+        return "unreadable"
+    found = [x for x in listed if _has_id(x) and str(x["id"]) == str(item_id)]
+    if len(found) != 1:
+        return "item-not-found id={}".format(item_id)
+    for field, allowed in require.items():
+        if field not in found[0] or not mode_allowed(found[0][field], allowed):
+            return "in-use field={}".format(field)
+    return None
 
 
 def need_approval_mode(scope, method, path, body, base_path):
@@ -416,9 +517,11 @@ def names_itself(response, fixture_id, name):
 
 def redacted(body):
     if isinstance(body, dict):
-        return {k: "<redacted>" if SECRET_KEY.search(k) else redacted(v) for k, v in body.items()}
-    if isinstance(body, list):
+        return {scrub_str(k): "<redacted>" if SECRET_KEY.search(k) else redacted(v) for k, v in body.items()}
+    if isinstance(body, (list, tuple)):
         return [redacted(v) for v in body]
+    if isinstance(body, str):
+        return scrub_str(body)
     return body
 
 
@@ -426,7 +529,7 @@ def sanitized(path):
     parts = urllib.parse.urlsplit(path)
     if not parts.query:
         return path
-    query = [(k, "<redacted>" if SECRET_KEY.search(k) else v)
+    query = [(k, "<redacted>" if SECRET_KEY.search(k) else scrub_str(v))
              for k, v in urllib.parse.parse_qsl(parts.query, keep_blank_values=True)]
     return urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(query)))
 
@@ -451,17 +554,18 @@ class H:
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
 
     def emit(self, line):
+        line = scrub_str(line)
         print(line, flush=True)
         with open(os.path.join(self.out, "00-timeline.txt"), "a") as f:
             f.write(line + "\n")
 
     def save(self, tag, record):
         with open(os.path.join(self.out, "{}.json".format(tag)), "w") as f:
-            json.dump(record, f, indent=1, default=str)
+            json.dump(redacted(record), f, indent=1, default=str)
 
     def refuse(self, tag, seat, method, path, body, error):
         self.save(tag, {"harnessBlocked": True, "refusal": "WRITE_SCOPE_REFUSED", "reason": str(error),
-                        "seat": seat, "method": method, "path": sanitized(path), "body": redacted(body), "at": now()})
+                        "seat": seat, "method": method, "path": sanitized(path), "body": body, "at": now()})
         self.emit("{} [{}] {} {} {} -> HARNESS_BLOCKED WRITE_SCOPE_REFUSED reason={} (no request sent)".format(
             now(), tag, seat, method, sanitized(path), error))
         raise error
@@ -475,18 +579,47 @@ class H:
             except ApprovalModeUnread as need:
                 self.approval_mode(tag, seat, need, base_path, tok)
                 verdict = "write"
+            except OwnedDeleteUnread as need:
+                self.owned_unused(tag, seat, need, base_path, tok)
+                verdict = "write"
         except WriteScopeRefused as e:
             self.refuse(tag, seat, method, path, body, e)
         return verdict
 
-    def approval_mode(self, tag, seat, need, base_path, tok):
-        read = need.read_path
+    def client_read(self, read, base_path, reason):
         prefix = base_path.rstrip("/")
         if prefix:
             if not read.lower().startswith(prefix.lower() + "/"):
-                raise WriteScopeRefused("{} approval-mode-unreadable read={} is outside the client base {}".format(
-                    GUARD_REASON, read, prefix))
+                raise WriteScopeRefused("{} read={} is outside the client base {}".format(reason, read, prefix))
             read = read[len(prefix):]
+        return read
+
+    def owned_unused(self, tag, seat, need, base_path, tok):
+        read = self.client_read(need.read_path, base_path, "owned-delete-unreadable")
+        code, js = self.exchange(tag + "-owned-read", seat, "GET", read, None, tok)
+        problem = (unused_problem(js, need.items, need.item_id, need.require) if 200 <= code < 300
+                   else "unreadable status={}".format(code))
+        if problem:
+            raise WriteScopeRefused("owned-delete {} read={}".format(problem, need.read_path))
+
+    def own_item(self, tag, seat, path):
+        base_path = urllib.parse.urlsplit(self.base).path
+        try:
+            owned = owned_delete(load_scope(self.run_dir), "DELETE", path, base_path)
+            if not owned:
+                raise WriteScopeRefused("no-owned-delete path={} (no ownedDeletes entry covers it)".format(path))
+            entry, match = owned
+            self.owned_unused(tag, seat, OwnedDeleteUnread("", owned_read_path(entry, match), entry["items"],
+                                                           match.group("item"), entry["require"]), base_path,
+                              self.tok.get(seat))
+        except WriteScopeRefused as e:
+            self.refuse(tag, seat, "OWN", path, None, e)
+        parent, item = match.group(0).rsplit("/", 1)
+        record_fixture(self.run_dir, parent, item, None, owned_delete=True)
+        self.emit("{} [{}] {} OWN {} -> ledgered for an owned delete".format(now(), tag, seat, path))
+
+    def approval_mode(self, tag, seat, need, base_path, tok):
+        read = self.client_read(need.read_path, base_path, "{} approval-mode-unreadable".format(GUARD_REASON))
         code, js = self.exchange(tag + "-approval-mode", seat, "GET", read, None, tok)
         value = field_value(js, need.field) if 200 <= code < 300 else None
         if mode_allowed(value, need.allow):
@@ -606,7 +739,7 @@ class H:
         code, js, dt = self.req(method, path, tok, body, tag, seat)
         if save:
             self.save(tag, {"status": code, "seat": seat, "method": method, "path": sanitized(path),
-                            "body": redacted(body), "at": now(), "response": redacted(js)})
+                            "body": body, "at": now(), "response": js})
         d = js.get("data", js) if isinstance(js, dict) else js
         shape = "list[{}]".format(len(d)) if isinstance(d, list) else (
             "keys={}".format(list(d.keys())[:12]) if isinstance(d, dict) else type(d).__name__)

@@ -33,7 +33,7 @@ describe('curlConfigEscape', () => {
 });
 
 describe('sanitizeCurlFailure', () => {
-  const label = 'PATCH /api/secrets/abc';
+  const label = 'PATCH /v1/secrets/abc';
 
   it('reports the exit code and its meaning, never the error text', () => {
     const raw: NodeJS.ErrnoException = new Error('Command failed: curl -H "Authorization: Bearer SECRET" …');

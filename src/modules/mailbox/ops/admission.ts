@@ -50,7 +50,12 @@ export function deferForFreshContextRetry(db: Database.Database, messageId: stri
   }).immediate();
 }
 
-/** Only UNPAIRED legacy `trigger = 1` task rows are demoted; an admitted pair stays wakeable. */
+/**
+ * Demotes a `trigger = 1` task row with no PENDING recall partner, so admission
+ * re-pairs it: a legacy row never had one, and a partner that ended while its
+ * task stayed pending makes a workgroup runner skip the task on every poll. An
+ * admitted pair stays wakeable.
+ */
 export function demoteUnpairedLegacyTasks(db: Database.Database): void {
   db.prepare(
     `UPDATE messages_in
@@ -62,6 +67,7 @@ export function demoteUnpairedLegacyTasks(db: Database.Database): void {
           SELECT 1
             FROM messages_in AS recall
            WHERE recall.id = 'recall-' || messages_in.id
+             AND recall.status = 'pending'
         )`,
   ).run();
 }

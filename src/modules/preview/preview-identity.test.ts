@@ -46,6 +46,19 @@ describe('previewProxyEnv', () => {
     expect(getContainerConfig).toHaveBeenCalledWith({ agent: 'example-group-preview' });
   });
 
+  test('a -preview identity in the lane family gets no proxy and no grant', async () => {
+    expect(
+      await previewProxyEnv({
+        agentIdentifier: 'approved-run-acme',
+        groupName: 'Lane',
+        declarations: ['Places-Example'],
+        getContainerConfig,
+      }),
+    ).toEqual([]);
+    expect(onecli.ensure).not.toHaveBeenCalled();
+    expect(getContainerConfig).not.toHaveBeenCalled();
+  });
+
   test('nothing declared: no identity, no env', async () => {
     expect(await run(undefined)).toEqual([]);
     expect(await run([])).toEqual([]);

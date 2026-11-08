@@ -47,8 +47,8 @@ export function buildContainerCodexConfig(): string {
     'sandbox_mode = "workspace-write"',
     'approval_policy = "on-request"',
     'approvals_reviewer = "auto_review"',
-    'model_context_window = 400000',
-    'model_auto_compact_token_limit = 360000',
+    'model_context_window = 800000',
+    'model_auto_compact_token_limit = 720000',
     'model_reasoning_effort = "high"',
     '',
     '[features]',
@@ -79,6 +79,8 @@ registerProviderContainerConfig('codex', (ctx) => {
   // The top-level `.tmp`, not `.tmp/marketplaces`: `.tmp` was container-writable and could redirect host cleanup
   // through a planted intermediate symlink.
   removeUntrustedPathEntry(codexDir, '.tmp');
+  // The guard chain is the image's /etc/codex layer, so the home carries no hooks.json of its own.
+  removeUntrustedPathEntry(codexDir, 'hooks.json');
   const mounts: VolumeMount[] = [{ hostPath: codexDir, containerPath: '/home/node/.codex', readonly: false }];
 
   const hostHome = ctx.hostEnv.HOME || os.homedir();

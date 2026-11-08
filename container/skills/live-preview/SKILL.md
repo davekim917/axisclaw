@@ -57,13 +57,17 @@ boot without one, stop and ask.
 identity holding only test-mode keys. Give the backend that proxy instead, in the clean
 environment: `HTTPS_PROXY="$PREVIEW_HTTPS_PROXY" HTTP_PROXY="$PREVIEW_HTTPS_PROXY"
 NODE_USE_ENV_PROXY=1 NODE_EXTRA_CA_CERTS=/tmp/onecli-combined-ca.pem
-SSL_CERT_FILE=/tmp/onecli-combined-ca.pem`, and no `NO_PROXY` for those services' hosts. The
+SSL_CERT_FILE=/tmp/onecli-combined-ca.pem PREVIEW_HTTPS_PROXY="$PREVIEW_HTTPS_PROXY"
+NODE_OPTIONS="--require /home/node/.claude/skills/live-preview/preview-egress.cjs"`, and no `NO_PROXY` for those
+services' hosts. The preload is for Node SDKs that ignore proxy variables (Stripe's builds its
+own agent); it routes their requests through the same proxy and leaves loopback alone. The
 proxy adds each key to requests for its host, so set the repo's key variables to placeholders
 in the format its code expects (e.g. `sk_test_placeholder`). The proxy address carries a token:
 never print, post or commit it.
 
-Then check each service really goes through it: make one call (a Stripe test-mode request, a
-Places lookup) and confirm a real test-mode response, since some SDKs ignore proxy variables.
+Then check each service really goes through it: make one call through the app's own client (a
+Stripe test-mode request, a Places lookup) and confirm a real test-mode response. A non-Node
+backend gets no preload: if its client ignores the proxy, set that client's proxy option.
 Email and push go only to the team: use the repo's allowlist or redirect mode. A service with no
 preview key stays in its stub or off mode; say that feature won't work in the preview. Inbound
 webhooks need their endpoint registered to this preview's URL, and tools that stream events
@@ -80,16 +84,19 @@ Then point the frontend's `/api` proxy at `http://127.0.0.1:<backend port>`, and
 preview origin if the backend checks CORS.
 
 **Local Postgres and Redis.** Data lives in `/tmp` and disappears with the container, so each
-session starts clean and migrates and seeds again.
+session starts clean and migrates and seeds again. Start Postgres with the scratch-postgres skill,
+the one way to run a local database here, and give the backend its URL:
 
 ```bash
-PG=/usr/lib/postgresql/15/bin
-$PG/initdb -D /tmp/pg -U postgres --auth=trust >/dev/null
-$PG/pg_ctl -D /tmp/pg -l /tmp/pg.log start \
-  -o "-k /tmp -c listen_addresses=127.0.0.1 -c dynamic_shared_memory_type=mmap"
-$PG/createdb -h 127.0.0.1 -U postgres <db name from the repo's env>
+SPG=/home/node/.claude/skills/scratch-postgres/scratch-pg
+$SPG start
+$SPG createdb <db name from the repo's env>
+$SPG url <db name>     # the backend's DATABASE_URL
 redis-server --bind 127.0.0.1 --port 6379 --save '' --daemonize yes
 ```
+
+Run psql, createdb and dropdb through `$SPG` too (see that skill); its drops and deletes need no
+approval card.
 
 Production may run Postgres 16; 15 is fine for app work unless a migration uses a 16-only
 feature. If one fails, say so.
@@ -103,5 +110,5 @@ file first next time. Never commit agent-specific files to the repo itself.
 
 Finishing a batch of changes is not ending the session; others may still be using the link.
 When someone says to close the preview, run `ncl preview close`, stop the backend and dev
-server, and stop Postgres (`$PG/pg_ctl -D /tmp/pg stop`) and Redis (`redis-cli shutdown`). If
+server, and stop Postgres (`$SPG stop`) and Redis (`redis-cli shutdown`). If
 "done" could mean either, ask once.

@@ -4,9 +4,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
+import { notifyOwner } from '../../src/notify-owner.js';
+import { alertOwner, type AlertDeps } from './alert.js';
 import {
   failedStatus,
   isAiHoldRecord,
+  redactText,
   runExport,
   type AiHoldRecord,
   type ExportDeps,
@@ -16,6 +19,7 @@ import {
 import {
   gateCommits,
   knownPrivateNames,
+  messageIsClean,
   loadAcceptedFindings,
   loadApprovedBinaries,
   loadPublicNames,
@@ -323,6 +327,64 @@ export function buildDeps(config: RunConfig): ExportDeps {
   };
 }
 
+function alertDeps(config: RunConfig): AlertDeps {
+  const origin = path.join(config.workDir, 'origin.git');
+  return {
+    recordFile: path.join(path.dirname(config.statusFile), 'public-export-alert.json'),
+    heldDetailLabel: path.relative(config.install.installRoot, config.heldDetailFile),
+    origin: (sha) => {
+      try {
+        const rev = stagingOriginRev(path.join(config.workDir, 'staging.git'), sha);
+        if (!rev) return null;
+        return { rev, subject: redactText(git(origin, ['log', '-1', '--format=%s', rev]), config.redact) };
+      } catch {
+        return null;
+      }
+    },
+    quotes: () => {
+      const texts = (findings: unknown): string[] =>
+        Array.isArray(findings)
+          ? findings.flatMap((finding: { text?: unknown } | null) =>
+              typeof finding?.text === 'string' ? [finding.text] : [],
+            )
+          : [];
+      const detail = readJson(config.heldDetailFile) as { aiFindings?: unknown } | undefined;
+      const records = loadAiHolds(path.join(path.dirname(config.heldDetailFile), 'ai-holds.json')) ?? [];
+      return [
+        ...texts(detail?.aiFindings),
+        ...records.flatMap((record) => [...(record.texts ?? []), ...texts(record.findings)]),
+      ];
+    },
+    isClean: (text) => {
+      const scanners = realScanners(config.install);
+      try {
+        return messageIsClean(scanners.scanMessage(text));
+      } finally {
+        scanners.dispose();
+      }
+    },
+    notify: (title, body) =>
+      notifyOwner({ title, body, dbPath: config.install.dbPath, rootDir: config.install.installRoot }),
+  };
+}
+
+async function alert(config: RunConfig): Promise<void> {
+  try {
+    let status: Status | null = null;
+    try {
+      status = (readJson(config.statusFile) as Status | undefined) ?? null;
+    } catch {
+      status = null;
+    }
+    const outcome = await alertOwner(status, config.publicRemote === undefined, alertDeps(config));
+    if (outcome === 'undelivered') process.stderr.write('public export: the owner alert was not delivered\n');
+  } catch (error) {
+    process.stderr.write(
+      `public export: owner alert failed: ${error instanceof Error ? error.message : String(error)}\n`,
+    );
+  }
+}
+
 async function main(): Promise<number> {
   const installRoot = path.resolve(process.env.NANOCLAW_DIR ?? path.join(HERE, '..', '..'));
   const logDir = path.resolve(process.env.PUBLIC_EXPORT_LOG_DIR ?? path.join(installRoot, 'logs'));
@@ -375,10 +437,13 @@ async function main(): Promise<number> {
     } catch {
       fs.rmSync(config.statusFile, { force: true });
     }
+    await alert(config);
     return 1;
   }
 
-  return runExport(buildDeps(config));
+  const code = await runExport(buildDeps(config));
+  await alert(config);
+  return code;
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {

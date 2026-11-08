@@ -174,23 +174,36 @@ function failure(message: string): GuardStepResult {
   return { ok: false, message };
 }
 
-function runLintGate(): GuardStepResult {
-  const eslintBin = path.join(REPO_ROOT, 'node_modules', '.bin', 'eslint');
-  const eslintArgs = ['src/', 'scripts/', 'setup/', '--quiet', '-f', 'json'];
+export const LINT_ROOTS = ['src/', 'scripts/', 'setup/'];
+
+export interface LintError {
+  filePath: string;
+  line: number;
+  ruleId: string | null;
+  message: string;
+}
+
+/** eslint's errors in `targets`, at idle priority; `failure` when eslint could not run or its report was unreadable. */
+export function findLintErrors(
+  targets: string[],
+  cwd: string = REPO_ROOT,
+): { errors: LintError[] } | { failure: string } {
+  const eslintBin = path.join(cwd, 'node_modules', '.bin', 'eslint');
+  const eslintArgs = ['--quiet', '-f', 'json', ...targets];
   let stdout: string;
   try {
-    stdout = execCaptureStdout('ionice', ['-c3', 'nice', '-n', '10', eslintBin, ...eslintArgs], { cwd: REPO_ROOT });
+    stdout = execCaptureStdout('ionice', ['-c3', 'nice', '-n', '10', eslintBin, ...eslintArgs], { cwd });
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
-      return failure(`BUILD REFUSED: lint gate could not run.\n${err instanceof Error ? err.message : String(err)}`);
+      return { failure: `could not run.\n${err instanceof Error ? err.message : String(err)}` };
     }
     // ionice missing: throttling is a courtesy, not a correctness requirement.
     try {
-      stdout = execCaptureStdout(eslintBin, eslintArgs, { cwd: REPO_ROOT });
+      stdout = execCaptureStdout(eslintBin, eslintArgs, { cwd });
     } catch (fallbackError) {
-      return failure(
-        `BUILD REFUSED: lint gate could not run.\n${fallbackError instanceof Error ? fallbackError.message : String(fallbackError)}`,
-      );
+      return {
+        failure: `could not run.\n${fallbackError instanceof Error ? fallbackError.message : String(fallbackError)}`,
+      };
     }
   }
 
@@ -198,27 +211,39 @@ function runLintGate(): GuardStepResult {
   try {
     results = JSON.parse(stdout) as EslintFileResult[];
   } catch (err) {
-    return failure(
-      `BUILD REFUSED: lint gate produced invalid JSON.\n${err instanceof Error ? err.message : String(err)}`,
-    );
+    return { failure: `produced invalid JSON.\n${err instanceof Error ? err.message : String(err)}` };
   }
-  const errors: Array<{ filePath: string; line: number; ruleId: string | null; message: string }> = [];
+  const errors: LintError[] = [];
   for (const result of results) {
     for (const m of result.messages) {
-      if (m.severity === 2) {
+      if (m.severity === 2)
         errors.push({ filePath: result.filePath, line: m.line, ruleId: m.ruleId, message: m.message });
-      }
     }
   }
-  if (errors.length === 0) return { ok: true };
+  return { errors };
+}
 
-  const lines = [`BUILD REFUSED: \`pnpm run lint\` found ${errors.length} error(s).`, ''];
-  for (const e of errors.slice(0, 20)) {
-    lines.push(`  ${e.filePath}:${e.line}  ${e.ruleId ?? '(parse error)'}  ${e.message}`);
-  }
+export function formatLintErrors(errors: LintError[]): string[] {
+  const lines = errors
+    .slice(0, 20)
+    .map((e) => `  ${e.filePath}:${e.line}  ${e.ruleId ?? '(parse error)'}  ${e.message}`);
   if (errors.length > 20) lines.push(`  ... and ${errors.length - 20} more`);
-  lines.push('', 'Run `pnpm run lint` to see the full list, fix, then rebuild.');
-  return failure(lines.join('\n'));
+  return lines;
+}
+
+function runLintGate(): GuardStepResult {
+  const found = findLintErrors(LINT_ROOTS);
+  if ('failure' in found) return failure(`BUILD REFUSED: lint gate ${found.failure}`);
+  if (found.errors.length === 0) return { ok: true };
+  return failure(
+    [
+      `BUILD REFUSED: \`pnpm run lint\` found ${found.errors.length} error(s).`,
+      '',
+      ...formatLintErrors(found.errors),
+      '',
+      'Run `pnpm run lint` to see the full list, fix, then rebuild.',
+    ].join('\n'),
+  );
 }
 
 function runTypecheckGate(): GuardStepResult {

@@ -16,7 +16,7 @@ const BASE_RE = /^[^\s\x00-\x1F\x7F]{1,255}$/;
 const HEAD_RE = /^[a-f0-9]{40}$/;
 const RELEASE_SCOPE_KEYS = ['purpose', 'repository', 'pullRequest', 'base', 'headSha'] as const;
 const HOLD_RE = /^hold:[A-Za-z0-9_.:/@+-]{1,160}$/;
-const MAX_SCOPE_HOLDS = 12;
+const MAX_SCOPE_HOLDS = 24;
 const DECISION_FIELDS: Record<'warning' | 'release', { required: string[]; optional: string[] }> = {
   warning: {
     required: ['headline', 'asked', 'does', 'risk', 'undo', 'holdingCosts', 'recommend', 'evidence', 'accept'],
@@ -152,7 +152,7 @@ export const requestChoice: McpToolDefinition = {
             headSha: { type: 'string', description: 'Exact lower-case 40-hex commit SHA' },
             holds: {
               type: 'array',
-              maxItems: 12,
+              maxItems: MAX_SCOPE_HOLDS,
               items: { type: 'string' },
               description:
                 'The exact `hold:` codes the release policy published for this head, unique. Required on a warning card; the card shows them and a Ship click accepts only these, at this head. Absent or empty, a Ship accepts no hold.',
@@ -163,7 +163,7 @@ export const requestChoice: McpToolDefinition = {
         },
         decision: {
           description:
-            'Required with approvalScope, refused without it. `kind: "warning"` is a HELD card: post one only when agents recommend NOT shipping; it renders "Silence = nothing ships", every field in order, and the buttons "Ship anyway — I accept <accept>" (value ship) and "Send back" (value send_back). `kind: "release"` is a scheduled production release: its warnings (or "No unresolved warnings"), what goes to production, undo, evidence, and the buttons "Ship release" (ship) and "Hold" (hold). Plain text only (ASCII, accented Latin letters and ‘ ’ “ ” – — • … → £ € °; no emoji). The host refuses a commit SHA, a markdown link or || anywhere in it, a field over its limit, or a card over 1800 characters; that refusal arrives later as a "request_choice failed" message.',
+            'Required with approvalScope, refused without it. `kind: "warning"` is a HELD card: post one only when agents recommend NOT shipping; it renders "Silence = nothing ships", every field in order, and the buttons "Ship anyway — I accept <accept>" (value ship) and "Send back" (value send_back). `kind: "release"` is a scheduled production release: its warnings (or "No unresolved warnings"), what goes to production, undo, evidence, and the buttons "Ship release" (ship) and "Hold" (hold). Plain text only (ASCII, accented Latin letters and ‘ ’ “ ” – — • … → £ € °; no emoji). The host refuses a commit SHA, a markdown link or || anywhere in it, a field over its limit, or a card longer than its platform shows whole: 1800 characters on Discord, 2642 on Slack, counted over the title and the whole card including the host-printed hold list and pin line, so many long hold codes leave less room for the decision (on Slack each #channel or @name counts 80 more, since Slack turns it into a link); that refusal arrives later as a "request_choice failed" message.',
           oneOf: [
             {
               type: 'object',

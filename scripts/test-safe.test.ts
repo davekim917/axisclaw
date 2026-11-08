@@ -113,7 +113,14 @@ describe('test-safe.sh', () => {
     const r = run(root, ['src/a.test.ts', '--reporter=dot']);
     expect(r.status, r.stderr).toBe(0);
     const [rec] = records(root, 'vitest');
-    expect(rec.args).toEqual(['run', '--maxWorkers=2', 'src/a.test.ts', '--reporter=dot']);
+    expect(rec.args).toEqual([
+      'run',
+      '--maxWorkers=2',
+      '--testTimeout=15000',
+      '--hookTimeout=30000',
+      'src/a.test.ts',
+      '--reporter=dot',
+    ]);
     expect(rec.nice).toBe(expectedNice);
     expect(rec.io).toBe('idle');
   });
@@ -143,6 +150,37 @@ describe('test-safe.sh', () => {
     const recs = records(root, 'vitest');
     if (status === 0) expect(recs[0].args.slice(0, 2)).toEqual(['run', '--maxWorkers=1']);
     else expect(recs).toEqual([]);
+  });
+
+  // vitest aborts on a repeated option, so each row asserts the wrapper's default is gone, not merely later.
+  it.each<{ name: string; args: string[]; timeouts: string[] }>([
+    {
+      name: "a caller's --testTimeout replaces the default and keeps the hook default",
+      args: ['--testTimeout=2000'],
+      timeouts: ['--hookTimeout=30000', '--testTimeout=2000'],
+    },
+    {
+      name: "a caller's split --hookTimeout replaces the default and keeps the test default",
+      args: ['--hookTimeout', '2000'],
+      timeouts: ['--testTimeout=15000', '--hookTimeout'],
+    },
+    {
+      name: 'the kebab spelling counts as the same option',
+      args: ['--test-timeout=2000', '--hook-timeout=2000'],
+      timeouts: ['--test-timeout=2000', '--hook-timeout=2000'],
+    },
+    { name: '--coverage keeps the longer limits vitest.config.ts sets', args: ['--coverage'], timeouts: [] },
+    {
+      name: 'a --coverage. option counts as coverage',
+      args: ['--coverage.include=src/a.ts'],
+      timeouts: [],
+    },
+  ])('$name', ({ args, timeouts }) => {
+    const root = sandbox();
+    const r = run(root, ['src/a.test.ts', ...args]);
+    expect(r.status, r.stderr).toBe(0);
+    const [rec] = records(root, 'vitest');
+    expect(rec.args.filter((a) => /^--(test|hook)-?[tT]imeout/.test(a))).toEqual(timeouts);
   });
 
   it('runs the typed lint under the same priority', () => {

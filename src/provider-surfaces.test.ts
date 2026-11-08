@@ -1,7 +1,9 @@
+import crypto from 'crypto';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { execFileSync } from 'child_process';
+import YAML from 'yaml';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const { TEST_ROOT } = vi.hoisted(() => ({ TEST_ROOT: uniqueTmpRoot('provider-surfaces-test') }));
@@ -40,6 +42,8 @@ vi.mock('./db/messaging-groups.js', async (importOriginal) => {
 });
 
 import { buildMounts } from './container-runner.js';
+import { assertMountSourcesPinned } from './mount-source-gate.js';
+import { workgroupSharedDir } from './modules/workgroup/shared-dirs.js';
 import { log } from './log.js';
 import { getAgentMailbox } from './mailbox/index.js';
 import { sessionContextPath, sessionDir, writeSessionContext } from './session-manager.js';
@@ -184,7 +188,7 @@ describe('host-enrolled wiki maintenance mounts', () => {
       buildMounts(ag, session('listed-policy-test', ag.id), containerConfig(), 'claude', {}, 'example'),
     ).rejects.toThrow('marker');
   });
-  it('uses private runtime surfaces and omits repository, shared-memory and application mounts', async () => {
+  async function enrolledWikiWriter(): Promise<AgentGroup> {
     const ag = group('wiki-writer', 'wiki-writer');
     await createAgentGroup(ag);
     assignWorkgroup(ag, 'example');
@@ -208,6 +212,11 @@ describe('host-enrolled wiki maintenance mounts', () => {
         notification: { channelType: 'test', instance: 'test', platformId: 'example', threadId: null },
       }),
     );
+    return ag;
+  }
+
+  it('uses private runtime surfaces and omits repository, shared-memory and application mounts', async () => {
+    const ag = await enrolledWikiWriter();
     const sess = session('wiki-maintenance-session', ag.id);
     const cfg = { ...containerConfig(), wikiMaintenance: true, provider: 'claude' };
     const mounts = await buildMounts(ag, sess, cfg, 'claude', {}, 'example');
@@ -232,6 +241,26 @@ describe('host-enrolled wiki maintenance mounts', () => {
     // A target workgroup's ordinary OneCLI roster must not make the actor
     // unusable or add a mount to that isolated surface.
     expect(withWorkgroupSecrets.map((m) => m.containerPath)).toEqual(mounts.map((m) => m.containerPath));
+  });
+
+  it("drops a source planted in a wiki actor's session folder", async () => {
+    const ag = await enrolledWikiWriter();
+    const sess = session('wiki-planted-session', ag.id);
+    const planted = path.join(sessionDir(ag.id, sess.id), 'codex');
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.symlinkSync(DATA_DIR, planted);
+    const cfg = { ...containerConfig(), wikiMaintenance: true, provider: 'codex' };
+
+    const mounts = await buildMounts(
+      ag,
+      sess,
+      cfg,
+      'codex',
+      { mounts: [{ hostPath: planted, containerPath: '/home/node/.codex', readonly: false }] },
+      'example',
+    );
+
+    expect(mounts.filter((m) => m.containerPath === '/home/node/.codex')).toEqual([]);
   });
 });
 
@@ -549,6 +578,31 @@ describe('buildMounts agent surfaces', async () => {
         },
       ]);
     }
+  });
+
+  it("mounts a group's private logins read-only, only with browserSso, and never into a sibling", async () => {
+    const owner = group('ag-sso-owner', 'sso-owner');
+    const sibling = group('ag-sso-sibling', 'sso-sibling');
+    for (const ag of [owner, sibling]) {
+      await createAgentGroup(ag);
+      assignWorkgroup(ag, 'sso-wg');
+      await ensureContainerConfig(ag.id);
+      initGroupFilesystem(ag, {});
+    }
+    const widened = { ...containerConfig(), browserSso: { example: ['login.idp.example'] } };
+    const privateMounts = async (ag: AgentGroup, config: ContainerConfig, id: string) =>
+      (await buildMounts(ag, session(id, ag.id), config, 'claude', {}, 'sso-wg')).filter(
+        (m) => m.containerPath === '/workspace/browser-state-private',
+      );
+
+    expect(await privateMounts(owner, widened, 's-sso-owner')).toEqual([
+      {
+        hostPath: path.join(DATA_DIR, 'browser-state-private', owner.folder),
+        containerPath: '/workspace/browser-state-private',
+        readonly: true,
+      },
+    ]);
+    expect(await privateMounts(sibling, containerConfig(), 's-sso-sibling')).toEqual([]);
   });
 
   it('applies one workgroup policy to every provider sibling through the real additional-mount allowlist', async () => {
@@ -1790,6 +1844,14 @@ describe('buildMounts agent surfaces', async () => {
     fs.mkdirSync(gwsDir, { recursive: true });
     for (const file of ['client-a.json', 'client-a.json.bak', 'shared.json'])
       fs.writeFileSync(path.join(gwsDir, file), '{}');
+    for (const file of ['client-a.signature.html', 'shared.signature.html'])
+      fs.writeFileSync(path.join(gwsDir, file), '<b>Sig</b>\n');
+    const credentialsSha256 = crypto.createHash('sha256').update('{}').digest('hex');
+    for (const account of ['client-a', 'shared'])
+      fs.writeFileSync(
+        path.join(gwsDir, `${account}.mailbox`),
+        JSON.stringify({ credentialsSha256, mailbox: `${account}@example.com` }),
+      );
     for (const dir of ['.gmail-mcp', '.gmail-mcp-client-a', '.gmail-mcp-shared'])
       fs.mkdirSync(path.join(home, dir), { recursive: true });
     fs.writeFileSync(path.join(home, '.gmail-mcp', 'gcp-oauth.keys.json'), '{}');
@@ -1868,10 +1930,51 @@ describe('buildMounts agent surfaces', async () => {
     const hubGws = hubMounts.find((mount) => mount.containerPath === '/home/node/.config/gws/accounts')!.hostPath;
     expect(hubGws).not.toBe(gwsDir);
     expect(fs.readdirSync(hubGws)).toEqual(['client-a.json']);
+    // The email gate reads signatures and senders only from the session's host-owned directory; only the group's
+    // accounts are there.
+    const signaturesDir = path.join(sessionDir(hub.id, 's-own-hub'), '.host', 'email-signatures');
+    expect(fs.readdirSync(signaturesDir).sort()).toEqual(['client-a.signature.html', 'identities.json']);
+    expect(Object.values(JSON.parse(fs.readFileSync(path.join(signaturesDir, 'identities.json'), 'utf8')))).toEqual([
+      { account: 'client-a', mailbox: 'client-a@example.com' },
+    ]);
     expect(gmailMounts(hubMounts).sort()).toEqual([
       ['.gmail-mcp', '/home/node/.gmail-mcp'],
       ['.gmail-mcp-client-a', '/home/node/.gmail-mcp-client-a'],
     ]);
+  });
+
+  it('tags the staged Snowflake connections and dbt profiles with the group folder and session', async () => {
+    const home = process.env.HOME!;
+    fs.mkdirSync(path.join(home, '.snowflake'), { recursive: true });
+    fs.writeFileSync(path.join(home, '.snowflake', 'connections.toml'), '[conn-a]\nuser = "u"\n');
+    fs.mkdirSync(path.join(home, '.dbt'), { recursive: true });
+    fs.writeFileSync(
+      path.join(home, '.dbt', 'profiles.yml'),
+      'proj:\n  target: dev\n  outputs:\n    dev:\n      type: snowflake\n      user: u\n',
+    );
+    const ag = group('ag-tag', 'tag-folder');
+    await createAgentGroup(ag);
+    assignWorkgroup(ag, 'tag-wg');
+    await ensureContainerConfig(ag.id);
+    initGroupFilesystem(ag, {});
+
+    const config = { ...containerConfig(), tools: ['snowflake', 'dbt'] };
+    const mounts = await buildMounts(ag, session('s-tag', ag.id), config, 'claude', {}, 'tag-wg');
+    const at = (containerPath: string) => mounts.find((mount) => mount.containerPath === containerPath)!.hostPath;
+    expect(fs.readFileSync(path.join(at('/home/node/.snowflake'), 'connections.toml'), 'utf8')).toBe(
+      '[conn-a]\nsession_parameters = { QUERY_TAG = "tag-folder:s-tag" }\nuser = "u"\n',
+    );
+    const profiles = YAML.parse(fs.readFileSync(path.join(at('/home/node/.dbt'), 'profiles.yml'), 'utf8'));
+    expect(profiles.proj.outputs.dev.query_tag).toBe('tag-folder:s-tag');
+    // The host's own files are never rewritten.
+    expect(fs.readFileSync(path.join(home, '.snowflake', 'connections.toml'), 'utf8')).toBe('[conn-a]\nuser = "u"\n');
+
+    // A file the tagger cannot parse exactly still stages, unchanged and untagged.
+    const unsupported = '["conn-a"]\nuser = "u"\n';
+    fs.writeFileSync(path.join(home, '.snowflake', 'connections.toml'), unsupported);
+    const again = await buildMounts(ag, session('s-tag-2', ag.id), config, 'claude', {}, 'tag-wg');
+    const staged = again.find((mount) => mount.containerPath === '/home/node/.snowflake')!.hostPath;
+    expect(fs.readFileSync(path.join(staged, 'connections.toml'), 'utf8')).toBe(unsupported);
   });
 
   it('mounts a workgroup-scoped plugin only for groups in its workgroups (src/plugin-scopes.ts)', async () => {
@@ -2213,6 +2316,324 @@ describe('symlink overlay workgroup allowlist', async () => {
   });
 });
 
+describe('buildMounts symlink overlay', () => {
+  const OWN = 'overlay-own';
+  const SIBLING = 'overlay-sibling';
+  const WORKGROUP = 'overlay-wg';
+  const ownDir = path.join(GROUPS_DIR, OWN);
+  const siblingDir = path.join(GROUPS_DIR, SIBLING);
+  const REFUSED = 'Refusing symlink-overlay mount of a group root or container.json';
+
+  beforeEach(() => vi.mocked(log.warn).mockClear());
+
+  async function mountsWith(plant: () => void, contribution: ProviderContainerContribution = {}) {
+    const own = group('ag-overlay-own', OWN);
+    const sibling = group('ag-overlay-sibling', SIBLING);
+    for (const ag of [own, sibling]) {
+      await createAgentGroup(ag);
+      assignWorkgroup(ag, WORKGROUP);
+      await ensureContainerConfig(ag.id);
+      initGroupFilesystem(ag, {});
+      fs.writeFileSync(path.join(GROUPS_DIR, ag.folder, 'container.json'), '{}\n');
+    }
+    fs.mkdirSync(path.join(siblingDir, 'notes'));
+    fs.writeFileSync(path.join(siblingDir, 'notes', 'shared.md'), 'shared\n');
+    plant();
+    return buildMounts(own, session('s-overlay', own.id), containerConfig(), 'claude', contribution, WORKGROUP);
+  }
+
+  function linkThroughHop(target: string): void {
+    fs.mkdirSync(path.join(ownDir, '.hop'));
+    fs.symlinkSync(target, path.join(ownDir, '.hop', 'next'));
+    fs.symlinkSync('.hop/next', path.join(ownDir, 'planted'));
+  }
+
+  // A member whose real directory sits inside the workgroup shared tree, the one allowed root that can contain a group.
+  function nestSiblingInSharedTree(): string {
+    const nest = path.join(workgroupSharedDir(WORKGROUP), 'nest');
+    fs.mkdirSync(nest, { recursive: true });
+    fs.renameSync(siblingDir, path.join(nest, SIBLING));
+    fs.symlinkSync(path.join(nest, SIBLING), siblingDir);
+    return nest;
+  }
+
+  it.each<[string, () => void]>([
+    ["the agent's own folder", () => fs.symlinkSync(`../${OWN}`, path.join(ownDir, 'planted'))],
+    ["a sibling's folder", () => fs.symlinkSync(`../${SIBLING}`, path.join(ownDir, 'planted'))],
+    [
+      "the agent's own config by host path",
+      () => fs.symlinkSync(path.join(ownDir, 'container.json'), path.join(ownDir, 'planted')),
+    ],
+    ["the agent's own config by name", () => fs.symlinkSync('container.json', path.join(ownDir, 'planted'))],
+    ["a sibling's config", () => fs.symlinkSync(`../${SIBLING}/container.json`, path.join(ownDir, 'planted'))],
+    ["a sibling's folder through a chain", () => linkThroughHop(`../../${SIBLING}`)],
+    ["a sibling's config through a chain", () => linkThroughHop(`../../${SIBLING}/container.json`)],
+    ['a directory holding a group', () => fs.symlinkSync(nestSiblingInSharedTree(), path.join(ownDir, 'planted'))],
+  ])('refuses a link to %s, and still spawns', async (_label, plant) => {
+    const mounts = await mountsWith(plant);
+
+    const realSibling = fs.realpathSync(siblingDir);
+    const exposed = mounts.filter(
+      (m) =>
+        m.containerPath !== '/workspace/agent' &&
+        !m.readonly &&
+        (path.basename(m.hostPath) === 'container.json' ||
+          [ownDir, realSibling].some((root) => m.hostPath === root || root.startsWith(m.hostPath + path.sep))),
+    );
+    expect(exposed).toEqual([]);
+    expect(mounts.filter((m) => m.containerPath === '/workspace/agent/container.json')).toEqual([
+      {
+        hostPath: path.join(ownDir, 'container.json'),
+        containerPath: '/workspace/agent/container.json',
+        readonly: true,
+      },
+    ]);
+    expect(log.warn).toHaveBeenCalledWith(
+      REFUSED,
+      expect.objectContaining({ agentGroupId: 'ag-overlay-own', link: path.join(ownDir, 'planted') }),
+    );
+  });
+
+  it('keeps a per-file link and a sub-directory link into a sibling, read-only', async () => {
+    const mounts = await mountsWith(() => {
+      fs.symlinkSync(`../${SIBLING}/notes/shared.md`, path.join(ownDir, 'shared.md'));
+      fs.symlinkSync(`../${SIBLING}/notes`, path.join(ownDir, 'notes'));
+    });
+
+    expect(vi.mocked(log.warn).mock.calls.filter(([message]) => message === REFUSED)).toEqual([]);
+    expect(mounts).toContainEqual(
+      expect.objectContaining({
+        hostPath: path.join(siblingDir, 'notes', 'shared.md'),
+        containerPath: `/workspace/${SIBLING}/notes/shared.md`,
+        readonly: true,
+      }),
+    );
+    expect(mounts).toContainEqual(
+      expect.objectContaining({
+        hostPath: path.join(siblingDir, 'notes'),
+        containerPath: `/workspace/${SIBLING}/notes`,
+        readonly: true,
+      }),
+    );
+  });
+
+  it("keeps a link inside the agent's own folder writable", async () => {
+    const mounts = await mountsWith(() => {
+      fs.mkdirSync(path.join(ownDir, 'work', 'area'), { recursive: true });
+      fs.symlinkSync('work/area', path.join(ownDir, 'area'));
+    });
+
+    expect(mounts).toContainEqual(
+      expect.objectContaining({
+        hostPath: path.join(ownDir, 'work', 'area'),
+        containerPath: '/workspace/agent/work/area',
+        readonly: false,
+      }),
+    );
+  });
+
+  it("re-protects a member's config from a writable mount that reaches it by another route", async () => {
+    const mounts = await mountsWith(() => {}, {
+      mounts: [{ hostPath: siblingDir, containerPath: '/workspace/extra/from-provider', readonly: false }],
+    });
+
+    expect(mounts).toContainEqual(
+      expect.objectContaining({
+        hostPath: path.join(siblingDir, 'container.json'),
+        containerPath: '/workspace/extra/from-provider/container.json',
+        readonly: true,
+      }),
+    );
+    // A second bind at this path is a Docker error, and every spawn would die on it.
+    expect(mounts.filter((m) => m.containerPath === '/workspace/agent/container.json')).toHaveLength(1);
+  });
+
+  describe('bind sources', () => {
+    const LEFT = 'Refusing bind source that leaves the agent-writable trees';
+    const OVER = 'Refusing writable bind over a read-only path';
+    const TONES = '/workspace/tone-profiles-group';
+    const tones = path.join(ownDir, 'tone-profiles');
+    const toneMount = (mounts: Awaited<ReturnType<typeof mountsWith>>) =>
+      mounts.filter((m) => m.containerPath === TONES);
+
+    it('drops a bind whose source is a link to data/, and still spawns', async () => {
+      const mounts = await mountsWith(() => {
+        fs.mkdirSync(DATA_DIR, { recursive: true });
+        fs.symlinkSync(DATA_DIR, tones);
+      });
+
+      expect(toneMount(mounts)).toEqual([]);
+      expect(log.warn).toHaveBeenCalledWith(
+        LEFT,
+        expect.objectContaining({ agentGroupId: 'ag-overlay-own', source: tones, target: fs.realpathSync(DATA_DIR) }),
+      );
+    });
+
+    it('holds for a bind it has never heard of, from a session folder or a writable source', async () => {
+      const sessionLink = path.join(sessionDir('ag-overlay-own', 's-overlay'), 'planted');
+      const ownLink = path.join(ownDir, 'planted-rw');
+      const mounts = await mountsWith(
+        () => {
+          fs.mkdirSync(path.dirname(sessionLink), { recursive: true });
+          fs.mkdirSync(DATA_DIR, { recursive: true });
+          fs.symlinkSync(DATA_DIR, sessionLink);
+          fs.symlinkSync(DATA_DIR, ownLink);
+        },
+        {
+          mounts: [
+            { hostPath: sessionLink, containerPath: '/workspace/extra/from-session', readonly: true },
+            { hostPath: ownLink, containerPath: '/workspace/extra/from-group', readonly: false },
+          ],
+        },
+      );
+
+      expect(mounts.filter((m) => m.containerPath.startsWith('/workspace/extra/'))).toEqual([]);
+    });
+
+    it('drops a source whose link leads nowhere', async () => {
+      const dangling = path.join(ownDir, 'planted-dangling');
+      const mounts = await mountsWith(() => fs.symlinkSync(path.join(ownDir, 'gone'), dangling), {
+        mounts: [{ hostPath: dangling, containerPath: '/workspace/extra/dangling', readonly: true }],
+      });
+
+      expect(mounts.filter((m) => m.containerPath === '/workspace/extra/dangling')).toEqual([]);
+      expect(log.warn).toHaveBeenCalledWith(LEFT, expect.objectContaining({ source: dangling, target: null }));
+    });
+
+    it('keeps a source that does not exist yet, which Docker creates', async () => {
+      const later = path.join(ownDir, 'not-yet');
+      const mounts = await mountsWith(() => {}, {
+        mounts: [{ hostPath: later, containerPath: '/workspace/extra/later', readonly: true }],
+      });
+
+      expect(mounts).toContainEqual({ hostPath: later, containerPath: '/workspace/extra/later', readonly: true });
+    });
+
+    it('drops a missing source behind a dangling link, which Docker would create at the far end', async () => {
+      const under = path.join(ownDir, 'planted-dangling', 'inner');
+      const mounts = await mountsWith(
+        () => fs.symlinkSync(path.join(TEST_ROOT, 'outside-group'), path.join(ownDir, 'planted-dangling')),
+        { mounts: [{ hostPath: under, containerPath: '/workspace/extra/under', readonly: true }] },
+      );
+
+      expect(mounts.filter((m) => m.containerPath === '/workspace/extra/under')).toEqual([]);
+    });
+
+    it("leaves a source outside the agent's trees alone", async () => {
+      const outside = path.join(TEST_ROOT, 'host-owned');
+      const target = path.join(TEST_ROOT, 'host-owned-target');
+      const mounts = await mountsWith(
+        () => {
+          fs.mkdirSync(target);
+          fs.symlinkSync(target, outside);
+        },
+        { mounts: [{ hostPath: outside, containerPath: '/workspace/extra/host', readonly: true }] },
+      );
+
+      expect(mounts).toContainEqual({ hostPath: outside, containerPath: '/workspace/extra/host', readonly: true });
+    });
+
+    it.each<[string, () => void, string]>([
+      ['a real folder', () => fs.mkdirSync(tones), tones],
+      [
+        "a link inside the agent's own folder",
+        () => {
+          fs.mkdirSync(path.join(ownDir, 'voices'));
+          fs.symlinkSync('voices', tones);
+        },
+        path.join(ownDir, 'voices'),
+      ],
+      ['a link into a sibling', () => fs.symlinkSync(`../${SIBLING}/notes`, tones), path.join(siblingDir, 'notes')],
+    ])('binds %s by its resolved path', async (_label, plant, resolved) => {
+      const mounts = await mountsWith(plant);
+
+      expect(toneMount(mounts)).toMatchObject([{ hostPath: resolved, containerPath: TONES, readonly: true }]);
+    });
+
+    it('a link swapped after the check moves nothing: the bind already names the real folder', async () => {
+      const mounts = await mountsWith(() => {
+        fs.mkdirSync(path.join(ownDir, 'voices'));
+        fs.symlinkSync('voices', tones);
+      });
+
+      fs.unlinkSync(tones);
+      fs.symlinkSync(DATA_DIR, tones);
+
+      expect(toneMount(mounts)).toEqual([
+        { hostPath: path.join(ownDir, 'voices'), containerPath: TONES, readonly: true },
+      ]);
+      expect(() => assertMountSourcesPinned(mounts)).not.toThrow();
+    });
+
+    it('a real folder swapped for a link after the check aborts the spawn', async () => {
+      const mounts = await mountsWith(() => fs.mkdirSync(tones));
+
+      fs.renameSync(tones, `${tones}-moved`);
+      fs.symlinkSync(DATA_DIR, tones);
+
+      expect(() => assertMountSourcesPinned(mounts)).toThrow(/Bind source changed before spawn/);
+    });
+
+    it.each<[string, () => void, ProviderContainerContribution]>([
+      ['an overlay', () => fs.symlinkSync(`../${SIBLING}/notes`, path.join(ownDir, 'notes')), {}],
+      [
+        'a bind no overlay recorded',
+        () => {},
+        {
+          mounts: [
+            { hostPath: path.join(siblingDir, 'notes'), containerPath: '/workspace/extra/sibling', readonly: true },
+          ],
+        },
+      ],
+    ])(
+      "a sibling's folder swapped for a link after the check aborts the spawn: %s",
+      async (_label, plant, contribution) => {
+        const mounts = await mountsWith(plant, contribution);
+        const notes = path.join(siblingDir, 'notes');
+
+        expect(() => assertMountSourcesPinned(mounts)).not.toThrow();
+        fs.renameSync(notes, `${notes}-moved`);
+        fs.symlinkSync(DATA_DIR, notes);
+
+        expect(() => assertMountSourcesPinned(mounts)).toThrow(/Bind source changed before spawn/);
+      },
+    );
+
+    it("keeps the agent's own plugins read-only through an absolute link", async () => {
+      const plugins = path.join(ownDir, 'plugins');
+      const mounts = await mountsWith(() => fs.symlinkSync(plugins, path.join(ownDir, 'planted')));
+
+      expect(mounts).toContainEqual(
+        expect.objectContaining({ hostPath: plugins, containerPath: '/workspace/agent/planted', readonly: true }),
+      );
+    });
+
+    it("keeps a sub-folder of the agent's own plugins read-only through a link", async () => {
+      const inner = path.join(ownDir, 'plugins', 'inner');
+      const mounts = await mountsWith(() => {
+        fs.mkdirSync(inner);
+        fs.symlinkSync(inner, path.join(ownDir, 'planted'));
+      });
+
+      expect(mounts).toContainEqual(
+        expect.objectContaining({ hostPath: inner, containerPath: '/workspace/agent/planted', readonly: true }),
+      );
+    });
+
+    it("refuses a link by name onto the agent's own plugins: a second bind there would kill the spawn", async () => {
+      const mounts = await mountsWith(() => fs.symlinkSync('plugins', path.join(ownDir, 'planted')));
+
+      expect(mounts.filter((m) => m.containerPath === '/workspace/agent/plugins')).toEqual([
+        { hostPath: path.join(ownDir, 'plugins'), containerPath: '/workspace/agent/plugins', readonly: true },
+      ]);
+      expect(log.warn).toHaveBeenCalledWith(
+        OVER,
+        expect.objectContaining({ agentGroupId: 'ag-overlay-own', containerPath: '/workspace/agent/plugins' }),
+      );
+    });
+  });
+});
+
 describe('workgroup read-only paths', async () => {
   function writeReadonlyPolicy(workgroups: Record<string, string[]>): void {
     fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -2304,6 +2725,20 @@ describe('workgroup read-only paths', async () => {
 
     expect(mounts).toContain('/workspace/agent/rel:rw');
     expect(mounts).toContain('/workspace/agent/rel/ops:ro');
+  });
+
+  it('makes a link into the workgroup tree read-only in memory-only mode, which withholds that tree', async () => {
+    const ag = await workgroupMember('ag-ro-memory-only', 'wg-memory-only', false);
+    const groupDir = path.join(GROUPS_DIR, ag.folder);
+    fs.mkdirSync(groupDir, { recursive: true });
+    fs.symlinkSync(path.join(DATA_DIR, 'workgroups', 'wg-memory-only', 'releases'), path.join(groupDir, 'rel'));
+
+    const mounts = shape(
+      await buildMounts(ag, session('s-ro-memory-only', ag.id), containerConfig(), 'claude', {}, 'wg-memory-only'),
+    );
+
+    expect(mounts).toContain('/workspace/agent/rel:ro');
+    expect(mounts).not.toContain('/workspace/agent/rel:rw');
   });
 });
 

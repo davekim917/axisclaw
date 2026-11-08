@@ -58,7 +58,7 @@ export function failedStreakBreach(failedStreakMax: number): boolean {
 }
 
 export function isDuplicateBreach(openTitles: string[], metric: string): boolean {
-  const prefix = `fleet-drift: ${metric}`;
+  const prefix = `fleet-drift: ${metric} `;
   return openTitles.some((t) => t.startsWith(prefix));
 }
 
@@ -320,7 +320,7 @@ function detectBreaches(metrics: StoredMetrics, priorMetrics: StoredMetrics[]): 
 }
 
 // The scan lives in ./instruction-surface.ts so it imports without loading better-sqlite3.
-import { scanBannedPatterns } from './instruction-surface.js';
+import { findAtImports, MISSING_PATH_CODES, scanBannedPatterns } from './instruction-surface.js';
 
 export { scanBannedPatterns };
 
@@ -703,6 +703,58 @@ function detectInstructionStackBreaches(
   }));
 }
 
+function realPathOrNull(p: string): string | null {
+  try {
+    return fs.realpathSync(p);
+  } catch (err) {
+    if (MISSING_PATH_CODES.has((err as NodeJS.ErrnoException).code ?? '')) return null;
+    throw err;
+  }
+}
+
+/**
+ * Host Claude reads `~/.claude/CLAUDE.md`; host Codex reads its home's `AGENTS.md`, a link to that same file. A home
+ * whose `AGENTS.md` resolves anywhere else, or an `@`-import (expanded by Claude, literal to Codex), means the two
+ * load different rules.
+ */
+export function checkHostGlobalInstructions(home: string): Breach[] {
+  const claudeMd = path.join(home, '.claude', 'CLAUDE.md');
+  const claudeReal = realPathOrNull(claudeMd);
+  const breaches: Breach[] = [];
+
+  const codexHomes = fs
+    .readdirSync(home, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && (entry.name === '.codex' || entry.name.startsWith('.codex-')))
+    .map((entry) => entry.name)
+    .sort();
+  for (const name of codexHomes) {
+    const agentsMd = path.join(home, name, 'AGENTS.md');
+    const present = fs.lstatSync(agentsMd, { throwIfNoEntry: false }) !== undefined;
+    if (!present && !(name === '.codex' && claudeReal)) continue;
+    const resolved = present ? realPathOrNull(agentsMd) : null;
+    if (resolved !== null && resolved === claudeReal) continue;
+    breaches.push({
+      metric: `hostGlobalInstructions:codexLink:${name}`,
+      ruleDescription:
+        `${agentsMd} ${present ? `resolves to ${resolved ?? 'nothing (dangling)'}` : 'is missing'}, ` +
+        `not ${claudeMd}: Codex and Claude load different global rules. Fix: ln -sfn ${claudeMd} ${agentsMd}`,
+    });
+  }
+
+  if (claudeReal === null) return breaches;
+  const content = fs.readFileSync(claudeReal, 'utf-8');
+  const imports = findAtImports(content, path.dirname(claudeMd));
+  if (imports.length > 0) {
+    breaches.push({
+      metric: 'hostGlobalInstructions:atImport',
+      ruleDescription:
+        `${claudeMd} imports ${imports.map(({ line, target }) => `@${target} (line ${line})`).join(', ')}: ` +
+        'Claude expands it, Codex reads it as literal text. Inline the content or link the doc in prose',
+    });
+  }
+  return breaches;
+}
+
 function fetchOpenFleetDriftTitles(): string[] {
   const out = execFileSync(
     'gh',
@@ -805,11 +857,14 @@ function main(): number {
     }
 
     // A static tree check with no history: runs (and can file) even during warm-up.
-    const instructionStackBreaches = detectInstructionStackBreaches(
-      path.join(REPO_ROOT, 'container', 'CLAUDE.md'),
-      path.join(REPO_ROOT, 'groups'),
-      path.join(REPO_ROOT, 'CLAUDE.md'),
-    );
+    const instructionStackBreaches = [
+      ...detectInstructionStackBreaches(
+        path.join(REPO_ROOT, 'container', 'CLAUDE.md'),
+        path.join(REPO_ROOT, 'groups'),
+        path.join(REPO_ROOT, 'CLAUDE.md'),
+      ),
+      ...checkHostGlobalInstructions(os.homedir()),
+    ];
 
     if (isWarmingUp(priorMetrics.length)) {
       console.log(`fleet-drift: warming up (${priorMetrics.length}/7 runs of history)`);
