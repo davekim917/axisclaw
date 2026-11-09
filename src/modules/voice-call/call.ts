@@ -1,6 +1,9 @@
 import { log } from '../../log.js';
+import { checkInWish } from './check-in-wish.js';
 import type { ContextUse, LiveCall, LiveEvent } from './live.js';
 import {
+  CHECK_INS_OFF_NOTE,
+  CHECK_INS_ON_NOTE,
   checkInText,
   greeting,
   groupCallEndedText,
@@ -19,6 +22,7 @@ import { startupContext, type FeedEvent, type SessionFeed } from './session-feed
 
 const OUTPUT_LIMIT_BYTES = 4000;
 const SPOKEN_TRANSCRIPT_LIMIT = 8 * 1024;
+const CALLER_TURN_LIMIT = 4 * 1024;
 /** A running request is spoken about at most this often, counted from its start or its last spoken reply. */
 export const CHECK_IN_INTERVAL_MS = 120_000;
 
@@ -106,6 +110,11 @@ export class VoiceCallBridge {
   private done = new Set<string>();
   /** When each running request was last spoken about. */
   private lastSpoken = new Map<string, number>();
+  /** Someone on the call asked to stop the check-ins; the whole call hears them, so one person's word holds for all. */
+  private checkInsOff = false;
+  /** What the voice was last told about the check-ins. */
+  private toldOff = false;
+  private callerTurn = '';
   private beforeLive: Array<[string, ContextUse, string | undefined]> = [];
   private sentAny = false;
   private connected = false;
@@ -177,6 +186,7 @@ export class VoiceCallBridge {
   }
 
   private checkIn(delegation: string, note: string): boolean {
+    if (this.checkInsOff) return false;
     const now = Date.now();
     const since = this.lastSpoken.get(delegation);
     if (since === undefined || now - since < CHECK_IN_INTERVAL_MS) return false;
@@ -202,6 +212,37 @@ export class VoiceCallBridge {
     if (event.type === 'transcript') this.ports.caption(event.role, event.text, false);
     else this.ports.caption(event.role, '', true);
     this.spoken.add(event);
+    if (event.role === 'caller') this.heardCaller(event);
+    else if (event.type === 'turn-done') this.tellCheckIns();
+  }
+
+  /**
+   * Acts on a wish about check-ins as soon as its words arrive, so a check-in due meanwhile stays unsaid. The service
+   * ends a caller's turn late, after the next one may have begun, so the words past the ended turn are kept.
+   */
+  private heardCaller(event: LiveEvent & { type: 'transcript' | 'turn-done' }): void {
+    let said: string;
+    if (event.type === 'transcript') {
+      said = this.callerTurn = (this.callerTurn + event.text).slice(-CALLER_TURN_LIMIT);
+    } else {
+      const ended = event.transcript.trim();
+      const heard = this.callerTurn.trimStart();
+      const runsOn = ended !== '' && heard.startsWith(ended);
+      said = runsOn ? heard : ended || heard;
+      this.callerTurn = runsOn ? heard.slice(ended.length) : '';
+    }
+    const wish = checkInWish(said);
+    if (wish) this.checkInsOff = wish === 'off';
+  }
+
+  /**
+   * Tells the voice once it has answered and the caller is not still talking over it: a note appended while the caller
+   * is speaking can leave their turn open, and the request in that turn then never reaches the agent.
+   */
+  private tellCheckIns(): void {
+    if (this.toldOff === this.checkInsOff || this.callerTurn.trim() !== '') return;
+    this.toldOff = this.checkInsOff;
+    this.context(this.checkInsOff ? CHECK_INS_OFF_NOTE : CHECK_INS_ON_NOTE, 'know');
   }
 
   private delegate(id: string, request: string): void {

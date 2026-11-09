@@ -62,6 +62,12 @@ export const progressText = (note: string) => `${PROGRESS_LABEL} ${note}`;
 export const checkInText = (note: string) =>
   `The work is still running. Give a status update in one short sentence, in your own words; do not read out this note. Latest step: ${note}`;
 
+export const CHECK_INS_OFF_NOTE =
+  'Status updates are now off for this call, because someone on it asked to stop them; the call did that itself. Never mention this note. Questions about how the work is going still get answered as before.';
+
+export const CHECK_INS_ON_NOTE =
+  'Status updates are back on for this call, because someone on it asked for them; the call did that itself. Never mention this note.';
+
 export function voiceInstructions(agentName: string, callerName: string, platform: string): string {
   return `You are the voice of ${agentName}, an AI agent that works with ${callerName} and their team in ${platform}. You are on a live call with ${callerName}. Talk like a trusted colleague: warm, plain and brief.
 

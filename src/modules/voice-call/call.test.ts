@@ -448,6 +448,141 @@ describe('VoiceCallBridge', () => {
         ['check-in', expect.stringContaining('shard 3 is green')],
       ]);
     });
+
+    const runningRequest = async () => {
+      vi.useFakeTimers({ toFake: ['Date'] });
+      at(0);
+      const h = await connect();
+      h.live({ type: 'delegation', id: 'd1', text: 'Check the nightly.' });
+      return h;
+    };
+    const checkIns = (h: Harness) => h.appended.filter((a) => a.use === 'check-in').map((a) => a.text);
+    const notes = (h: Harness) => h.appended.filter((a) => a.text.startsWith('Status updates')).map((a) => a.text);
+    const pieces = (h: Harness, words: string) => {
+      for (const word of words.split(' ')) h.live({ type: 'transcript', role: 'caller', text: ` ${word}` });
+    };
+    const sayWordByWord = (h: Harness, words: string) => {
+      pieces(h, words);
+      h.live({ type: 'turn-done', role: 'caller', transcript: ` ${words}` });
+    };
+    const answered = (h: Harness) => h.live({ type: 'turn-done', role: 'voice', transcript: 'Got it.' });
+
+    it.each([
+      'stop updating me',
+      'Atlas, can you stop updating us?',
+      'Stop giving me updates.',
+      'No more updates for me, thanks',
+      "I don't care about the logs, stop checking in with me.",
+    ])('mutes the check-ins for the call when the caller says "%s"', async (words) => {
+      const h = await runningRequest();
+      at(10_000);
+      sayWordByWord(h, words);
+      answered(h);
+      at(CHECK_IN_INTERVAL_MS + 1);
+      h.agent({ type: 'progress', text: 'shard 3 of 8', inReplyTo: 'm1' });
+      at(3 * CHECK_IN_INTERVAL_MS);
+      h.agent({ type: 'progress', text: 'shard 7 of 8', inReplyTo: 'm1' });
+      h.agent({ type: 'reply', text: 'The nightly passed.', inReplyTo: 'm1' });
+      expect(checkIns(h)).toEqual([]);
+      expect(h.appended.filter((a) => a.use === 'know').map((a) => a.text)).toEqual([
+        expect.stringMatching(/^Status updates are now off for this call/),
+        expect.stringContaining('shard 3 of 8'),
+        expect.stringContaining('shard 7 of 8'),
+      ]);
+      expect(h.appended.filter((a) => a.use === 'say').map((a) => a.text)).toEqual(['The nightly passed.']);
+    });
+
+    it.each([
+      'stop',
+      'be quiet',
+      "don't stop the update job",
+      'the update failed, stop it',
+      'Don’t stop updating me.',
+      'stop checking in the code until review',
+      'there are no more updates to the schema',
+      'stop the updates to the dashboard',
+      'no more updates are needed on the PR',
+      'we should pause the updates to prod',
+      'turn off the updates on the Windows box',
+      'mute the updates channel in Slack',
+      "we've had enough updates to the schema this week",
+      "I don't want you to stop updating me",
+      "you shouldn't stop updating me",
+      'there is no need to stop updating me',
+    ])('keeps the check-ins, and tells the voice nothing, when the caller says "%s" word by word', async (words) => {
+      const h = await runningRequest();
+      at(10_000);
+      sayWordByWord(h, words);
+      answered(h);
+      at(CHECK_IN_INTERVAL_MS + 1);
+      h.agent({ type: 'progress', text: 'shard 3 of 8', inReplyTo: 'm1' });
+      expect(checkIns(h)).toEqual([expect.stringContaining('shard 3 of 8')]);
+      expect(notes(h)).toEqual([]);
+    });
+
+    it.each(['keep me posted', 'Keep us updated.', 'Actually, start updating me'])(
+      'brings the check-ins back when the caller says "%s"',
+      async (words) => {
+        const h = await runningRequest();
+        sayWordByWord(h, 'stop updating me');
+        answered(h);
+        at(CHECK_IN_INTERVAL_MS + 1);
+        h.agent({ type: 'progress', text: 'shard 3 of 8', inReplyTo: 'm1' });
+        sayWordByWord(h, words);
+        answered(h);
+        sayWordByWord(h, words);
+        answered(h);
+        h.agent({ type: 'progress', text: 'shard 4 of 8', inReplyTo: 'm1' });
+        expect(checkIns(h)).toEqual([expect.stringContaining('shard 4 of 8')]);
+        expect(notes(h)).toEqual([
+          expect.stringMatching(/^Status updates are now off/),
+          expect.stringMatching(/^Status updates are back on/),
+        ]);
+      },
+    );
+
+    it('mutes as the words arrive, and tells the voice only once it has answered', async () => {
+      const h = await runningRequest();
+      pieces(h, 'Stop updating me');
+      at(CHECK_IN_INTERVAL_MS + 1);
+      h.agent({ type: 'progress', text: 'shard 3 of 8', inReplyTo: 'm1' });
+      h.live({ type: 'turn-done', role: 'caller', transcript: ' Stop updating me' });
+      expect([checkIns(h), notes(h)]).toEqual([[], []]);
+      answered(h);
+      answered(h);
+      expect(notes(h)).toEqual([expect.stringMatching(/^Status updates are now off/)]);
+    });
+
+    it('holds the note while the caller talks over the voice, and sends it once they have finished', async () => {
+      const h = await runningRequest();
+      pieces(h, 'Stop updating me, and');
+      answered(h);
+      expect(notes(h)).toEqual([]);
+      pieces(h, 'rerun the shard');
+      h.live({ type: 'turn-done', role: 'caller', transcript: ' Stop updating me, and rerun the shard' });
+      answered(h);
+      expect(notes(h)).toEqual([expect.stringMatching(/^Status updates are now off/)]);
+    });
+
+    it('tells the voice nothing when a wish is taken back before it answers', async () => {
+      const h = await runningRequest();
+      sayWordByWord(h, 'stop updating me');
+      sayWordByWord(h, 'actually no, keep me posted');
+      answered(h);
+      expect(notes(h)).toEqual([]);
+    });
+
+    it('keeps the opening words of a turn that began before the service ended the one before it', async () => {
+      const h = await runningRequest();
+      sayWordByWord(h, 'stop updating me');
+      pieces(h, 'Thanks.');
+      pieces(h, 'Actually keep me');
+      h.live({ type: 'turn-done', role: 'caller', transcript: 'Thanks.' });
+      pieces(h, 'posted');
+      at(CHECK_IN_INTERVAL_MS + 1);
+      h.agent({ type: 'progress', text: 'shard 3 of 8', inReplyTo: 'm1' });
+      expect(checkIns(h)).toEqual([expect.stringContaining('shard 3 of 8')]);
+    });
   });
 
   it('ends when the voice service closes the call', async () => {
