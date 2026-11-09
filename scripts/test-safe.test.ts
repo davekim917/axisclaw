@@ -20,15 +20,38 @@ enforceHermeticity();
 const SCRIPT = path.resolve('scripts/test-safe.sh');
 const roots: string[] = [];
 
+// `vitest list --filesOnly` prints the FAKE_TESTS paths that contain a filter (all of them with none), or
+// FAKE_CHANGED under --changed: vitest's own answers, so the wrapper's handling of them is what a test sees.
 const FAKE = `#!/usr/bin/env bash
-rec="$RECORD_DIR/$(basename "$0")-$$"
+if [ "$1" = list ]; then rec="$RECORD_DIR/list-$$"; else rec="$RECORD_DIR/$(basename "$0")-$$"; fi
 {
   echo "start $(date +%s%N)"
   echo "nice $(nice)"
   echo "io $(ionice -p $$)"
   printf 'arg %s\\n' "$@"
 } >"$rec"
-sleep "\${FAKE_SLEEP:-0}"
+if [ "$1" = list ]; then
+  filters=()
+  changed=
+  for a in "\${@:2}"; do
+    case "$a" in
+      --changed*) changed=1 ;;
+      -*) ;;
+      *) filters+=("$a") ;;
+    esac
+  done
+  if [ -n "$changed" ]; then
+    printf '%b' "\${FAKE_CHANGED:-}"
+  else
+    printf '%b\\n' "\${FAKE_TESTS:-src/a.test.ts}" | while IFS= read -r t; do
+      [ -n "$t" ] || continue
+      if [ "\${#filters[@]}" -eq 0 ]; then echo "$t"; continue; fi
+      for f in "\${filters[@]}"; do [[ "$t" == *"$f"* ]] && { echo "$t"; break; }; done
+    done
+  fi
+else
+  sleep "\${FAKE_SLEEP:-0}"
+fi
 echo "end $(date +%s%N)" >>"$rec"
 `;
 
@@ -65,7 +88,7 @@ interface Run {
   args: string[];
 }
 
-function records(root: string, tool: 'vitest' | 'pnpm'): Run[] {
+function records(root: string, tool: 'vitest' | 'pnpm' | 'list'): Run[] {
   const dir = path.join(root, 'records');
   return fs
     .readdirSync(dir)
@@ -123,6 +146,82 @@ describe('test-safe.sh', () => {
     ]);
     expect(rec.nice).toBe(expectedNice);
     expect(rec.io).toBe('idle');
+  });
+
+  it('refuses a named test file that matches no test file, and never starts the run', () => {
+    const root = sandbox();
+    const r = run(root, ['src/a.test.ts', 'src/missing.test.ts']);
+    expect(r.status).toBe(2);
+    expect(r.stderr).toContain('match no test file: src/missing.test.ts');
+    expect(records(root, 'vitest')).toEqual([]);
+  });
+
+  it('asks vitest which files each name matches under the same priority as the run', () => {
+    const root = sandbox();
+    const r = run(root, ['src/a.test.ts', 'ratchet'], { FAKE_TESTS: 'src/a.test.ts\\nsrc/x-ratchet.test.ts' });
+    expect(r.status, r.stderr).toBe(0);
+    const lists = records(root, 'list');
+    expect(lists.map((l) => l.args).sort()).toEqual([
+      ['list', '--filesOnly', 'ratchet'],
+      ['list', '--filesOnly', 'src/a.test.ts'],
+    ]);
+    for (const l of lists) expect([l.nice, l.io]).toEqual([expectedNice, 'idle']);
+    expect(records(root, 'vitest')[0].args.slice(-2)).toEqual(['src/a.test.ts', 'ratchet']);
+  });
+
+  describe('changed', () => {
+    const tests = 'src/a.test.ts\\nsrc/b.test.ts\\nsrc/c.test.ts';
+
+    function withOriginMain(root: string): void {
+      const git = (...args: string[]) =>
+        spawnSync('git', ['-C', root, ...args], { env: { PATH: process.env.PATH ?? '', HOME: root } });
+      git('-c', 'user.name=t', '-c', 'user.email=t@example.invalid', 'commit', '-q', '--allow-empty', '-m', 'base');
+      git('update-ref', 'refs/remotes/origin/main', 'HEAD');
+    }
+
+    it('runs the test files vitest selects for the changes since origin/main', () => {
+      const root = sandbox();
+      withOriginMain(root);
+      const r = run(root, ['changed', '--reporter=dot'], { FAKE_TESTS: tests, FAKE_CHANGED: 'src/b.test.ts\\nsrc/c.test.ts' });
+      expect(r.status, r.stderr).toBe(0);
+      expect(records(root, 'list').map((l) => l.args)).toContainEqual(['list', '--filesOnly', '--changed=origin/main']);
+      const [rec] = records(root, 'vitest');
+      expect(rec.args).toEqual([
+        'run',
+        '--maxWorkers=2',
+        '--testTimeout=15000',
+        '--hookTimeout=30000',
+        'src/b.test.ts',
+        'src/c.test.ts',
+        '--reporter=dot',
+      ]);
+      expect([rec.nice, rec.io]).toEqual([expectedNice, 'idle']);
+    });
+
+    it.each([
+      { name: 'no test imports a changed file: nothing runs', changed: '', status: 0, stderr: 'no host test imports' },
+      {
+        name: 'the change reaches every test file: refused as the full suite',
+        changed: tests,
+        status: 2,
+        stderr: 'reach every host test',
+      },
+    ])('$name', ({ changed, status, stderr }) => {
+      const root = sandbox();
+      withOriginMain(root);
+      const r = run(root, ['changed'], { FAKE_TESTS: tests, FAKE_CHANGED: changed });
+      expect(r.status, r.stderr).toBe(status);
+      expect(r.stderr).toContain(stderr);
+      expect(records(root, 'vitest')).toEqual([]);
+    });
+
+    it('is refused without origin/main to compare with', () => {
+      const root = sandbox();
+      const r = run(root, ['changed'], { FAKE_TESTS: tests, FAKE_CHANGED: 'src/b.test.ts' });
+      expect(r.status).toBe(2);
+      expect(r.stderr).toContain('git fetch origin main');
+      expect(records(root, 'vitest')).toEqual([]);
+    });
   });
 
   it.each<Row>([
