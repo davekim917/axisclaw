@@ -11,6 +11,7 @@ import { transformOutsideProtectedRegions } from '../../text-styles.js';
 import { withoutReplayedThread } from '../../thread-context.js';
 import { rawUserId, userPlatform } from '../voice-call/group/place.js';
 import { mirroredSpeech, relayedWords } from '../voice-call/prompts.js';
+import { botPictures, peoplePictures, personAvatars, personOf, type AvatarCache, type Person } from './avatars.js';
 import { opaqueId, type ThreadToRead } from './threads.js';
 
 export const MESSAGES_SHOWN = 100;
@@ -36,7 +37,11 @@ export interface ShownMessage {
   spoken: boolean;
   text: string;
   sentAt: string;
+  /** The key of its speaker's picture in the answer's `avatars`, when the host holds one. */
+  avatar?: string;
 }
+
+export type Speaker = { bot: string } | { sender: string } | null;
 
 export interface AgentRead {
   name: string;
@@ -82,7 +87,7 @@ export function shownMessages(
   reads: AgentRead[],
   ourBots: ReadonlySet<string>,
   names: ReadonlyMap<string, string>,
-): ShownMessage[] {
+): Array<ShownMessage & { who: Speaker }> {
   const ownRecords = new Map<string, OwnRecord[]>();
   for (const { botId, rows } of reads) {
     if (!botId) continue;
@@ -99,7 +104,7 @@ export function shownMessages(
         record.atMs >= atMs && record.atMs - atMs <= OWN_RECORD_LAG_MS && (!mirrorShaped || record.mirrorShaped),
     );
   };
-  const shown = new Map<string, ShownMessage>();
+  const shown = new Map<string, ShownMessage & { who: Speaker }>();
   const rows = reads
     .flatMap((read) => read.rows.map((row) => ({ read, row })))
     .sort((a, b) => a.row.sentAt.localeCompare(b.row.sentAt) || a.row.id.localeCompare(b.row.id));
@@ -116,6 +121,14 @@ export function shownMessages(
     if (shown.has(key)) continue;
     const text = scrubSecrets(withNames(mirror ? mirror.words : saidText(row), names)).trim();
     if (!text) continue;
+    const posterBot = row.role === 'assistant' ? read.botId : fromOurBot ? sender : null;
+    const who: Speaker = mirror
+      ? null
+      : posterBot
+        ? { bot: posterBot }
+        : row.role === 'user' && row.senderId
+          ? { sender: row.senderId }
+          : null;
     shown.set(key, {
       id: opaqueId(key),
       speaker: mirror?.speaker ?? (row.role === 'assistant' ? read.name : row.senderName || 'Someone'),
@@ -123,9 +136,39 @@ export function shownMessages(
       spoken: mirror !== null,
       text,
       sentAt: row.sentAt,
+      who,
     });
   }
   return [...shown.values()].slice(-MESSAGES_SHOWN);
+}
+
+export async function withAvatars(
+  shown: Array<ShownMessage & { who: Speaker }>,
+  people: AvatarCache,
+): Promise<{ messages: ShownMessage[]; avatars?: Record<string, string> }> {
+  const bots = await botPictures();
+  const persons = new Map<string, Person>();
+  for (let at = shown.length - 1; at >= 0; at--) {
+    const who = shown[at]!.who;
+    if (who && 'sender' in who && !persons.has(who.sender)) {
+      const person = personOf(who.sender);
+      if (person) persons.set(who.sender, person);
+    }
+  }
+  const held = peoplePictures(
+    [...new Map([...persons.values()].map((person) => [person.key, person])).values()],
+    people,
+  );
+  const keys = new Map<string, string>();
+  const messages = shown.map(({ who, ...message }) => {
+    const url = !who ? undefined : 'bot' in who ? bots.get(who.bot) : held.get(persons.get(who.sender)?.key ?? '');
+    if (!url) return message;
+    const key = keys.get(url) ?? String(keys.size);
+    keys.set(url, key);
+    return { ...message, avatar: key };
+  });
+  if (keys.size === 0) return { messages };
+  return { messages, avatars: Object.fromEntries([...keys].map(([url, key]) => [key, url])) };
 }
 
 /** The platform id each channel type's bot posts as, from the registries the adapters fill as they connect. */
@@ -170,7 +213,10 @@ async function mentionNames(thread: ThreadToRead, rows: ThreadMessage[]): Promis
   return names;
 }
 
-export async function readThreadMessages(thread: ThreadToRead): Promise<{ messages: ShownMessage[] }> {
+export async function readThreadMessages(
+  thread: ThreadToRead,
+  people: AvatarCache = personAvatars,
+): Promise<{ messages: ShownMessage[]; avatars?: Record<string, string> }> {
   const { platformId, threadId } = thread;
   // A thread id that is the platform id names the top level, where delivery archives an agent's posts with no thread.
   const shapes = threadId === platformId ? [threadId, null] : [threadId];
@@ -192,5 +238,5 @@ export async function readThreadMessages(thread: ThreadToRead): Promise<{ messag
     thread,
     reads.flatMap((read) => read.rows),
   );
-  return { messages: shownMessages(platformId, threadId, reads, new Set(bots.values()), names) };
+  return withAvatars(shownMessages(platformId, threadId, reads, new Set(bots.values()), names), people);
 }

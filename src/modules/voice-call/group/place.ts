@@ -180,7 +180,10 @@ interface DiscordMember {
 }
 
 /** Reads through this bot's limiter, each path once across `reads`. A 404 reads as null. */
-function discordReader(channelType: string, reads: DiscordReads = new Map()): (path: string) => Promise<unknown> {
+export function discordReader(
+  channelType: string,
+  reads: DiscordReads = new Map(),
+): (path: string) => Promise<unknown> {
   const bot = discordBotToken(channelType);
   if (!bot) throw new VoiceCallRefused('Group calls cannot check who is in this channel.');
   const { key, token } = bot;

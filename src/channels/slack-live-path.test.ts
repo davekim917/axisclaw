@@ -43,7 +43,19 @@ const human = {
   name: 'example.user',
   real_name: 'Example User',
   is_bot: false,
-  profile: { display_name: 'Example User', real_name: 'Example User' },
+  profile: {
+    display_name: 'Example User',
+    real_name: 'Example User',
+    is_custom_image: true,
+    image_72: 'https://avatars.example/example-user-72.png',
+  },
+};
+const noPhoto = {
+  id: 'U0NOPHOTOUSER',
+  team_id: TEAM,
+  name: 'no.photo',
+  is_bot: false,
+  profile: { real_name: 'No Photo', is_custom_image: false, image_72: 'https://avatars.example/default-72.png' },
 };
 
 function webApi(method: string, body: Record<string, unknown>, port: number): Record<string, unknown> {
@@ -57,7 +69,7 @@ function webApi(method: string, body: Record<string, unknown>, port: number): Re
         ? { ok: true, user: { id: BOT_USER, team_id: TEAM, name: 'example-agent', is_bot: true, profile: {} } }
         : { ok: true, user: human };
     case 'users.list':
-      return { ok: true, members: [human], response_metadata: { next_cursor: '' } };
+      return { ok: true, members: [human, noPhoto], response_metadata: { next_cursor: '' } };
     case 'conversations.info':
       return {
         ok: true,
@@ -215,6 +227,19 @@ afterAll(async () => {
 });
 
 describe('Slack inbound through the real adapter and Socket Mode client', () => {
+  it('keeps each workspace member’s own picture from users.list, and none for one on Slack’s default', async () => {
+    const { getKnownSlackHumans } = await import('./slack-mentions.js');
+    await vi.waitFor(() => expect(getKnownSlackHumans().get(TEAM)).toHaveLength(2));
+    expect(
+      getKnownSlackHumans()
+        .get(TEAM)!
+        .map(({ userId, imageUrl }) => [userId, imageUrl]),
+    ).toEqual([
+      [HUMAN, 'https://avatars.example/example-user-72.png'],
+      ['U0NOPHOTOUSER', undefined],
+    ]);
+  });
+
   it('connects with the app token and calls the Web API with the bot token', () => {
     expect(apiCalls).toContainEqual({ method: 'apps.connections.open', auth: `Bearer ${APP_TOKEN}` });
     expect(apiCalls).toContainEqual({ method: 'auth.test', auth: `Bearer ${BOT_TOKEN}` });

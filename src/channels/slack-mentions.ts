@@ -22,13 +22,29 @@ export interface SlackBotIdentity {
   realName?: string;
   /** Scopes cross-bot resolution to siblings in the same workspace. */
   teamId: string;
-  /** Public slack-edge avatar URL (image_192 preferred); absent until upgradeSlackBotProfile runs. */
+  /**
+   * Public slack-edge avatar URL: a bot's image_192 (else image_72) once upgradeSlackBotProfile runs; a workspace
+   * human's own image_72 from `users.list`, absent when they show Slack's default.
+   */
   imageUrl?: string;
   /**
    * Workspace base URL from `auth.test`, the only piece of a permalink not in the thread id. Missing degrades to no
    * link, never a wrong one.
    */
   workspaceUrl?: string;
+}
+
+export interface SlackProfile {
+  is_custom_image?: boolean;
+  image_72?: unknown;
+  image_48?: unknown;
+}
+
+/** Slack fills `image_*` for everyone; only `is_custom_image` says the picture is the person's own. */
+export function ownSlackPicture(profile: SlackProfile): string | null {
+  if (profile.is_custom_image !== true) return null;
+  const url = profile.image_72 || profile.image_48;
+  return typeof url === 'string' && url.startsWith('https://') ? url : null;
 }
 
 const knownSlackBots = new Map<string, SlackBotIdentity>();

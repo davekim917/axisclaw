@@ -1,9 +1,11 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
+import { registerSlackBot, unregisterSlackBot } from '../../channels/slack-mentions.js';
 import type { ThreadMessage } from '../../message-archive.js';
 import { withThreadContext } from '../../thread-context.js';
 import { groupRequestText, voiceMirror, voiceRequestText } from '../voice-call/prompts.js';
-import { MESSAGES_SHOWN, shownMessages, type AgentRead } from './thread-messages.js';
+import type { AvatarCache } from './avatars.js';
+import { MESSAGES_SHOWN, shownMessages, withAvatars, type AgentRead } from './thread-messages.js';
 
 const PLATFORM = 'slack:C0TEST';
 const THREAD = 'slack:C0TEST:7.0';
@@ -150,5 +152,58 @@ describe('mentions', () => {
     ['an id in code', 'run `notify <@1234567890123456789>`', 'run `notify <@1234567890123456789>`'],
   ])('reads %s', (_name, text, expected) => {
     expect(shown(text)).toBe(expected);
+  });
+});
+
+describe('withAvatars', () => {
+  const bot = {
+    userId: OUR_BOT,
+    username: 'juniper-bot',
+    teamId: 'T0TEST',
+    imageUrl: 'https://avatars.example/bot.png',
+  };
+  beforeEach(() => registerSlackBot('slack', bot));
+  afterEach(() => unregisterSlackBot('slack', bot));
+  const holding = (urls: Record<string, string>): AvatarCache & { asked: string[] } => {
+    const asked: string[] = [];
+    return {
+      asked,
+      lookup: (people) => {
+        asked.push(...people.map(({ key }) => key));
+        return new Map(people.flatMap(({ key }) => (urls[key] ? [[key, urls[key]] as const] : [])));
+      },
+      settled: async () => {},
+    };
+  };
+
+  it('names each speaker’s picture by one key per answer, the agent by its bot and a person by the cache', async () => {
+    const cache = holding({ 'slack:T0TEST:U0PERSON': 'https://avatars.example/ana.png' });
+    const shown = show(
+      row('Is the nightly green?', { sentAt: at(0) }),
+      agentPost('It is.', 60_000),
+      row('Thanks', { sentAt: at(120_000) }),
+      row('And mine?', { senderId: 'slack:U0NOPIC', senderName: 'Mallory Example', sentAt: at(180_000) }),
+      botCopy(voiceMirror('Ana Example', 'Ship it'), 240_000),
+    );
+
+    const answer = await withAvatars(shown, cache);
+
+    expect(answer.messages.map(({ speaker, avatar }) => [speaker, avatar])).toEqual([
+      ['Ana Example', '0'],
+      ['Juniper', '1'],
+      ['Ana Example', '0'],
+      ['Mallory Example', undefined],
+      ['Ana Example', undefined],
+    ]);
+    expect(answer.avatars).toEqual({ '0': 'https://avatars.example/ana.png', '1': 'https://avatars.example/bot.png' });
+    expect(cache.asked).toEqual(['slack:T0TEST:U0NOPIC', 'slack:T0TEST:U0PERSON']);
+    expect(answer.messages.some((message) => 'who' in message)).toBe(false);
+  });
+
+  it('leaves the map out of an answer with no picture, as an older host answers', async () => {
+    unregisterSlackBot('slack', bot);
+    const answer = await withAvatars(show(row('Anyone?'), agentPost('Here.', 1_000)), holding({}));
+    expect(answer.messages.map(({ avatar }) => avatar)).toEqual([undefined, undefined]);
+    expect(Object.keys(answer)).toEqual(['messages']);
   });
 });

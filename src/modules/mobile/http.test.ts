@@ -19,6 +19,9 @@ const H = vi.hoisted(() => {
     dataDir: { path: uniqueTmpRoot('mobile-http-archive') },
     /** Where each agent group's `container.json` is read from. */
     groupsDir: uniqueTmpRoot('mobile-http-groups'),
+    /** Every person-avatar fetch the history read starts: none reaches a platform from this file. */
+    avatarFetch: (() => Promise.resolve(null)) as (person: { key: string }) => Promise<string | null>,
+    avatars: null as unknown as import('./avatars.js').AvatarCache,
     walks: 0,
     statements: 0,
     walkTerminated: 0,
@@ -207,6 +210,13 @@ vi.mock('../../env.js', async (orig) => {
     }),
   };
 });
+vi.mock('./avatars.js', async (orig) => {
+  const real = await orig<typeof import('./avatars.js')>();
+  return {
+    ...real,
+    personAvatars: { lookup: (people) => H.avatars.lookup(people), settled: () => H.avatars.settled() },
+  } satisfies typeof real;
+});
 vi.mock('../voice-call/group/place.js', async (orig) => {
   const real = await orig<typeof import('../voice-call/group/place.js')>();
   return {
@@ -319,7 +329,8 @@ const { insertAutoThreadTitle, recordThreadPinned, recordThreadRename, storeThre
 const { dispatch } = await import('../../cli/dispatch.js');
 const { requestWake } = await import('../../request-wake.js');
 const { writeSessionMessage } = await import('../../session-manager.js');
-const { registerSlackBot, unregisterSlackBot } = await import('../../channels/slack-mentions.js');
+const { registerSlackBot, registerSlackWorkspaceHumans, unregisterSlackBot } =
+  await import('../../channels/slack-mentions.js');
 const { addMember } = await import('../permissions/db/agent-group-members.js');
 const { upsertUserDm } = await import('../permissions/db/user-dms.js');
 const { initSessionFolder } = await import('../../session-manager.js');
@@ -335,6 +346,7 @@ const { __resetArchiveConnectionForTest, archiveMessage, ensureArchiveSchema, re
 const { buildThreadContextBlock } = await import('../../thread-context.js');
 const { claimLink, groupCallLive, groupCallPeople, linkFor } = await import('../voice-call/group/service.js');
 const { handleMobileRequest } = await import('./http.js');
+const { avatarCache } = await import('./avatars.js');
 const { startChannelVisibilityRefresh } = await import('./threads.js');
 const { archiveTenancyOf } = await import('../../archive-tenancy.js');
 const { pairFromThread } = await import('./pairing.js');
@@ -678,6 +690,8 @@ afterAll(async () => {
 
 beforeEach(async () => {
   vi.clearAllMocks();
+  H.avatarFetch = () => Promise.resolve(null);
+  H.avatars = avatarCache((asked) => H.avatarFetch(asked));
   H.dataDir.path = fs.mkdtempSync(path.join(os.tmpdir(), 'mobile-http-'));
   fs.mkdirSync(ARCHIVE_DIR, { recursive: true });
   ensureArchiveSchema();
@@ -4117,6 +4131,59 @@ describe('GET /v1/threads/:threadKey/messages', () => {
     expect([renewing.status, renewed.status, checks, H.seeCalls]).toEqual([200, 200, 2, 2]);
   });
 
+  it('names each speaker’s picture once in `avatars`: the bot’s and a rostered member’s at once, a guest’s never waited for', async () => {
+    const bot = {
+      userId: 'U0BOTPIC',
+      username: 'pic-bot',
+      teamId: 'T-PIC-TEST',
+      imageUrl: 'https://avatars.example/bot.png',
+    };
+    const member = {
+      userId: 'U0ROSTERUSER1',
+      username: 'rae',
+      teamId: 'T-PIC-TEST',
+      imageUrl: 'https://avatars.example/rae.png',
+    };
+    registerSlackBot('slack', bot);
+    registerSlackWorkspaceHumans('T-PIC-TEST', [member]);
+    const asked: string[] = [];
+    H.avatarFetch = (guest) => {
+      asked.push(guest.key);
+      return new Promise(() => {});
+    };
+    try {
+      const key = await pairedKey(person);
+      await newSession({ thread_id: THREAD });
+      await said('Is the nightly green?', { sentAt: '2026-11-01T10:00:00.000Z' });
+      await said('It is.', { role: 'assistant', sentAt: '2026-11-01T10:01:00.000Z' });
+      await said('Thanks', {
+        senderId: 'slack:U0ROSTERUSER1',
+        senderName: 'Rae Example',
+        sentAt: '2026-11-01T10:02:00.000Z',
+      });
+      const [{ threadKey }] = await listThreads(key);
+
+      const res = await read(key, threadKey);
+      await new Promise((resolve) => setImmediate(resolve));
+
+      const answer = parsed<{ messages: Array<{ speaker: string; avatar?: string }>; avatars?: unknown }>(res);
+      expect(res.status).toBe(200);
+      expect(answer.messages.map(({ speaker, avatar }) => [speaker, avatar])).toEqual([
+        ['Ana Example', undefined],
+        ['Juniper', '0'],
+        ['Rae Example', '1'],
+      ]);
+      expect(answer.avatars).toEqual({
+        '0': 'https://avatars.example/bot.png',
+        '1': 'https://avatars.example/rae.png',
+      });
+      expect(asked).toEqual(['slack:T-PIC-TEST:U0EXAMPLE']);
+    } finally {
+      registerSlackWorkspaceHumans('T-PIC-TEST', []);
+      unregisterSlackBot('slack', bot);
+    }
+  });
+
   describe('mentions', () => {
     const own = { userId: 'U0BOTEXAMPLE', username: 'quill-bot', displayName: 'Quill', teamId: 'T-NAMES-TEST' };
     const far = { userId: 'U0BOTOTHER1', username: 'far-bot', displayName: 'Faraway', teamId: 'T-OTHER-TEST' };
@@ -4269,10 +4336,11 @@ describe('GET /v1/threads/:threadKey/messages', () => {
       expect(parsed(res)).toEqual({
         messages: [
           shown('Ana Example', false, 'Is the nightly green?', '2026-10-31T11:00:00.000Z'),
-          shown('Juniper', true, 'It is **green**.', '2026-10-31T11:01:00.150Z'),
+          { ...shown('Juniper', true, 'It is **green**.', '2026-10-31T11:01:00.150Z'), avatar: '0' },
           shown('Aster', true, 'Two flaky tests were retried.', '2026-10-31T11:02:00.200Z'),
           shown('Quill', true, 'I re-ran the deploy.', '2026-10-31T11:03:00.000Z'),
         ],
+        avatars: { '0': PICTURE },
       });
     });
   });

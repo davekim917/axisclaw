@@ -24,6 +24,7 @@ import {
   getSlackBotSenderName,
   getKnownSlackBots,
   getKnownSlackHumans,
+  ownSlackPicture,
   registerSlackBot,
   registerSlackWorkspaceHumans,
   slackMentionOutsideCode,
@@ -140,12 +141,14 @@ async function syncSlackWorkspaceHumans(client: WebClient, teamId: string, chann
       const res = await client.users.list({ limit: 200, cursor });
       for (const m of res.members ?? []) {
         if (!m.id || !isSlackHumanMember(m.id, m)) continue;
+        const imageUrl = m.profile ? ownSlackPicture(m.profile) : null;
         humans.push({
           userId: m.id,
           username: m.name ?? '',
           displayName: m.profile?.display_name || undefined,
           realName: m.profile?.real_name || undefined,
           teamId,
+          ...(imageUrl ? { imageUrl } : {}),
         });
       }
       cursor = res.response_metadata?.next_cursor || undefined;

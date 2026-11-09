@@ -396,7 +396,7 @@ to `last_active`: without that, a call started on a thread found by search would
 
 ### Thread history
 
-`GET /v1/threads/:threadKey/messages` answers `{ messages }`, oldest first, from the archive:
+`GET /v1/threads/:threadKey/messages` answers `{ messages, avatars? }`, oldest first, from the archive:
 
 ```ts
 interface Message {
@@ -406,7 +406,9 @@ interface Message {
   spoken: boolean; // said on a call: the words a speech model heard, posted by the agent's bot
   text: string;
   sentAt: string;
+  avatar?: string; // the key of its speaker's picture in `avatars`; absent when the host holds none
 }
+// avatars: { [key: string]: string }, present only when a message names one, so each URL travels once per answer
 ```
 
 A thread can be read only when a call in it would be accepted right now, or it is the person's own DM. The host finds
@@ -468,6 +470,36 @@ Relay wrappers (`[Voice call]`, `[Group voice call]` with `<request>`) and a rep
 are how an agent was told; only the words inside show, and only in what people post. The archive held none of them on
 2026-11-02, but nothing stops a writer from archiving one.
 
+**Pictures.** An agent's post, and a copy one of our bots archived of it, names that bot's own picture, from the
+registry its adapter fills at start (`botPictures`, `src/modules/mobile/avatars.ts`; the picture the call screen shows). A
+Slack member's picture comes from the member roster each Slack adapter already lists with `users.list` at start and
+hourly for mention resolution (`syncSlackWorkspaceHumans`, `src/channels/slack.ts`), which keeps `image_72` only when
+`is_custom_image` says the photo is the person's own: Slack fills `image_*` for everyone, so a member on Slack's default
+picture shows the initial, as a Discord person with no avatar does. That answer is there from the first read, and adds
+no call.
+
+Anyone the roster cannot answer for, a Discord person, a Slack Connect guest or another app's bot, goes to a cache in host
+memory keyed by their platform account: a Slack id within the workspace of the bot that archived the message, a Discord
+id everywhere. A read never waits for one: a miss answers no `avatar` and queues a fetch, which starts on a later turn of
+the event loop, never inside the read, and the app's next read, ten seconds later, shows it. Each read queues at most 10,
+newest speakers first; two fetches run at once across the host, and a queue past 200 takes no more. A fetch goes through
+the token of the bot that archived the message, read from `.env` once per fetch: Slack's `users.info` (`image_72`, else
+`image_48`, under the same `is_custom_image` rule), or Discord's `GET /users/{id}` through the same per-bot limiter, 20 a
+second, and the same 429 cooldown as every other Discord read and post on that bot, giving
+`https://cdn.discordapp.com/avatars/<id>/<hash>.png?size=128`. Someone with no picture of their own, a Slack
+`user_not_found`, or a bot lacking `users:read` caches as none, and the bot's lack is logged once,
+`Mobile: a Slack bot cannot read people's pictures`. A failure waits one minute before it is tried again, doubling to a
+day. An answer, picture or none, is kept 7 days; after that the old picture still shows while a fresh one is fetched.
+The cache holds at most 5,000 people, dropping the one fetched longest ago, and is lost on a restart, so after one a
+Discord person or Slack guest shows initials for one read. It is memory rather than a table because every entry is a
+public URL the platform can give again and a read must never write. A call's mirrored words carry a name, not an id, so
+they show initials. On 2026-11-09 every Slack bot on this install that listed its roster logged
+`Slack workspace humans registered`, the largest workspace with 529 people, and no `users.list` or `users.info` failure
+appears in the 30 days of host logs, so those bots hold `users:read`.
+
+The app shows the picture beside the speaker's name at the start of each run, or the initial on the red accent, as the
+call screen does. Pictures load after the text, as the image arrives.
+
 `sentAt` is UTC, and the app shows it in the phone's own zone, which is where its reader is, rather than the install's.
 
 The answer also carries `reply` when the app can reply in this thread: `ready` once this device holds a send key, and
@@ -511,6 +543,13 @@ holds archive writes, and at these sizes it holds them for milliseconds. The per
 `OR` of its two shapes, which walked the agent's whole archive (315 ms p50, 510 ms at most); it now picks one statement per
 shape, so each walks `idx_archive_thread`, which also speeds the archive context a call opens with. A response was about 1.4 KB
 at p50, 39 to 44 KB at p90 and 201 KB at most. Re-measure if a read's p90 passes 50 ms.
+
+Pictures added nothing measurable. On a private copy of this install's archive (885 MB) on 2026-11-09, through the real
+read, the 417 threads with rows in the last 7 days, three runs each at a load average near 8 to 10, with each Slack bot
+type registered under an invented workspace and picture: before, 0.82 to 0.99 ms at p50 and 4.8 to 5.9 ms at p90; with an
+empty cache, 0.70 to 0.83 ms at p50 and 4.0 to 5.4 ms at p90; with every speaker's picture held, 0.79 ms at p50 and 4.1 to
+4.6 ms at p90. A response grew from 2,172 to 2,339 bytes at p50 and from 71,818 to 73,399 at p90, the `avatar` key on
+each message and one URL per speaker.
 
 ### Calling
 
