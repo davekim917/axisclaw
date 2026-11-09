@@ -104,9 +104,15 @@ interface Thread {
 interface Channel {
   id: string; // the `channelKey` of `GET /v1/places`: opaque, shared by sibling bots, one per workgroup
   workgroupId: string;
+  platform: 'slack' | 'discord';
   name: string | null; // as shown, `#general`, or `DM with Juniper` for the person's own DM
 }
 ```
+
+The app shows a Slack or Discord mark beside every channel it names, from `platform` on a thread, a channel and a
+place. A pairing is one platform, so every row of one answer carries the same value; it is sent rather than inferred so
+the app never has to know that. An app older than `platform` on a channel or place ignores it, and the app reads its
+absence, from an older host, as no mark.
 
 A row is one thread in one workgroup. A thread is its `thread_id`, or the `platform_id` for a session with no thread,
 because sibling bots share both; two workgroups in one channel stay two rows. An agent group with no workgroup counts as
@@ -611,6 +617,7 @@ interface Place {
   agentGroupId: string;
   agentName: string;
   messagingGroupId: string;
+  platform: 'slack' | 'discord';
   channelName: string | null;
   workgroupName: string;
   lastActiveAt: string | null; // newest last_active of that agent's sessions there, closed ones included

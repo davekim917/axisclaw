@@ -955,7 +955,9 @@ describe('GET /v1/threads', () => {
         },
       ],
       workgroups: [{ id: 'acme', name: 'Acme' }],
-      channels: [{ id: expect.stringMatching(/^[\w-]{22}$/), workgroupId: 'acme', name: '#general' }],
+      channels: [
+        { id: expect.stringMatching(/^[\w-]{22}$/), workgroupId: 'acme', platform: 'slack', name: '#general' },
+      ],
     });
   });
 
@@ -1546,7 +1548,7 @@ describe('GET /v1/threads', () => {
     expect(H.checkBatches.size).toBe(2);
   });
 
-  it('lists a Discord thread for a Discord identity', async () => {
+  it('lists a Discord thread, its channel and its place as Discord for a Discord identity', async () => {
     const id = 'discord:1234567890';
     await createUser({ id, kind: 'discord', display_name: 'Someone Else', created_at: NOW });
     await addMember({ user_id: id, agent_group_id: 'ag-voice', added_by: null, added_at: NOW });
@@ -1561,11 +1563,17 @@ describe('GET /v1/threads', () => {
       created_at: NOW,
     });
     const sessionId = await newSession({ messaging_group_id: 'mg-discord', thread_id: 'discord:111:222:333' });
-    expect(await listThreads(await pairedKey(id))).toEqual([
+    const key = await pairedKey(id);
+    const list = await listing(key);
+    expect(list.threads).toEqual([
       expect.objectContaining({
         platform: 'discord',
         agents: [expect.objectContaining({ sessionId })],
       }),
+    ]);
+    expect(list.channels).toEqual([expect.objectContaining({ name: '#general', platform: 'discord' })]);
+    expect(parsed<{ places: unknown[] }>(await listPlacesFor(key)).places).toEqual([
+      expect.objectContaining({ messagingGroupId: 'mg-discord', platform: 'discord' }),
     ]);
   });
 
@@ -2091,8 +2099,8 @@ describe('GET /v1/threads', () => {
       await newSession({ agent_group_id: 'ag-sibling' });
 
       expect((await listing(key)).channels).toEqual([
-        { id: expect.any(String), workgroupId: 'acme', name: '#general' },
-        { id: expect.any(String), workgroupId: 'acme', name: '#second' },
+        { id: expect.any(String), workgroupId: 'acme', platform: 'slack', name: '#general' },
+        { id: expect.any(String), workgroupId: 'acme', platform: 'slack', name: '#second' },
       ]);
     });
 
@@ -3836,6 +3844,7 @@ describe('GET /v1/places', () => {
         agentName: 'Juniper',
         avatarUrl: null,
         messagingGroupId: CHANNEL,
+        platform: 'slack',
         channelName: '#general',
         workgroupName: 'Acme',
         lastActiveAt: null,
@@ -4338,7 +4347,14 @@ describe('the person’s own DMs', () => {
         },
       ],
       workgroups: [{ id: '_agent-group:ag-voice', name: 'juniper' }],
-      channels: [{ id: list.threads[0].channelKey, workgroupId: '_agent-group:ag-voice', name: 'DM with Juniper' }],
+      channels: [
+        {
+          id: list.threads[0].channelKey,
+          workgroupId: '_agent-group:ag-voice',
+          platform: 'slack',
+          name: 'DM with Juniper',
+        },
+      ],
     });
     expect(H.seeCalls).toBe(0);
   });

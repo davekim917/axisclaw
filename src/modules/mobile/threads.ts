@@ -120,6 +120,7 @@ interface ThreadAgent {
 interface Channel {
   id: string;
   workgroupId: string;
+  platform: CallPlace['platform'];
   name: string | null;
 }
 
@@ -146,6 +147,7 @@ interface Place {
   agentName: string;
   avatarUrl: string | null;
   messagingGroupId: string;
+  platform: CallPlace['platform'];
   channelName: string | null;
   workgroupName: string;
   lastActiveAt: string | null;
@@ -911,7 +913,7 @@ async function channelsOf(callable: Wiring[], dms: Wiring[], userId: string, nam
   for (const { workgroup_id, platform_id, channel_name } of callable) {
     const id = opaqueKey(workgroup_id, platform_id);
     if (hasSeenChannel(userId, platform_id) && !channels.get(id)?.name)
-      channels.set(id, { id, workgroupId: workgroup_id, name: shownChannel(channel_name) });
+      channels.set(id, { id, workgroupId: workgroup_id, platform, name: shownChannel(channel_name) });
   }
   const dmAgents = new Map<string, { workgroupId: string; names: string[] }>();
   for (const wiring of dms) {
@@ -921,7 +923,7 @@ async function channelsOf(callable: Wiring[], dms: Wiring[], userId: string, nam
     dm.names.push(await nameOf(wiring));
   }
   for (const [id, { workgroupId, names }] of dmAgents)
-    channels.set(id, { id, workgroupId, name: `DM with ${dmWithOf(names)}` });
+    channels.set(id, { id, workgroupId, platform, name: `DM with ${dmWithOf(names)}` });
   return [...channels.values()].sort((a, b) => (a.name ?? '').localeCompare(b.name ?? '') || a.id.localeCompare(b.id));
 }
 
@@ -1247,12 +1249,13 @@ export async function listPlaces(userId: string): Promise<{ places: Place[] }> {
   const nameOf = agentNames();
   return {
     places: await Promise.all(
-      visible.map(async ({ sessions: [{ row }] }) => ({
+      visible.map(async ({ sessions: [{ row, place }] }) => ({
         channelKey: opaqueKey(row.workgroup_id, row.platform_id),
         agentGroupId: row.agent_group_id,
         agentName: await nameOf(row),
         avatarUrl: await botAvatar(row.channel_type),
         messagingGroupId: row.messaging_group_id,
+        platform: place.platform,
         channelName: shownChannel(row.channel_name),
         workgroupName: row.workgroup_name || row.workgroup_id,
         lastActiveAt: lastActive.get(agentKey(row)) ?? null,
