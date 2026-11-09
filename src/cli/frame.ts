@@ -15,6 +15,11 @@ export type RequestFrame = {
   command: string;
   /** Command-specific. Each command's parseArgs validates. */
   args: Record<string, unknown>;
+  /**
+   * Host client only: the command lines of the client's parent processes, nearest first. Self-reported by whatever
+   * wrote the frame, so it names the tool for the owner's notice and is never an authority for anything.
+   */
+  origin?: string[];
 };
 
 export type ResponseFrame =
@@ -44,7 +49,7 @@ export type ErrorCode =
  * caller identity from here, never from the frame.
  */
 export type CallerContext =
-  | { caller: 'host' }
+  | { caller: 'host'; origin?: string[] }
   | {
       caller: 'agent';
       sessionId: string;

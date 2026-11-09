@@ -27,7 +27,13 @@ import {
 import { log } from '../../log.js';
 import { displayNameAcrossBots, equivalentSlackUserIds } from '../../slack-user-identity.js';
 import type { PendingApproval, Session } from '../../types.js';
-import { editApprovalCard, fitResolutionLine, headUnits, notifyApprovalResolved } from './primitive.js';
+import {
+  APPROVAL_RESOLUTION_MAX_UNITS,
+  editApprovalCard,
+  fitResolutionLine,
+  headUnits,
+  notifyApprovalResolved,
+} from './primitive.js';
 import { cardReleaseScopeJson, unscopedReleaseCard } from './release-ship-scope.js';
 
 export interface ChoiceHandlerContext {
@@ -39,6 +45,8 @@ export interface ChoiceHandlerContext {
   label: string;
   /** Namespaced user ID (`<channel>:<handle>`) of the authorized clicker. */
   userId: string;
+  /** Set when the owner answered from the host (`ncl approvals choose`) rather than on the card. */
+  answeredFrom?: 'host';
 }
 
 /**
@@ -77,17 +85,21 @@ export function choiceClickAllowed(approval: PendingApproval, userId: string): b
   return approvers.some((approver) => clicker.has(approver));
 }
 
+/** How a resolveChoice call ended; `uncounted` is a Ship relayed on an out-of-date release card. */
+export type ChoiceOutcome = 'resolved' | 'uncounted' | 'unknown_option' | 'already_answered' | 'undelivered';
+
 /** First click wins: the pending→approved compare-and-swap lets exactly one racing click through. */
 export async function resolveChoice(
   approval: PendingApproval,
   selectedOption: string,
   userId: string,
   tellClicker?: (text: string) => Promise<void>,
-): Promise<void> {
+  answeredFrom?: 'host',
+): Promise<ChoiceOutcome> {
   const handler = getChoiceHandler(approval.action);
-  if (!handler) return;
+  if (!handler) return 'unknown_option';
 
-  const option = storedOptions(approval).find((o) => o.value === selectedOption);
+  const option = choiceOptions(approval).find((o) => o.value === selectedOption);
   if (!option) {
     // Untrusted transport input, not a decision. The card was not touched.
     log.warn('Ignoring choice response with an unknown option', {
@@ -96,13 +108,13 @@ export async function resolveChoice(
       selectedOption,
       userId,
     });
-    return;
+    return 'unknown_option';
   }
 
   if (!(await transitionPendingApprovalStatus(approval.approval_id, 'pending', 'approved'))) {
     // The winner delivers and edits the card.
     log.info('Ignoring click on an already-resolved choice', { approvalId: approval.approval_id, userId });
-    return;
+    return 'already_answered';
   }
   // The decision time is the CAS, captured before any await for the immutable receipt.
   const resolvedAt = new Date().toISOString();
@@ -115,6 +127,7 @@ export async function resolveChoice(
       value: option.value,
       label: option.label,
       userId,
+      ...(answeredFrom ? { answeredFrom } : {}),
     });
     // eslint-disable-next-line no-catch-all/no-catch-all -- the answer was not recorded (ChoiceHandler); keep the click unconsumed
   } catch (err) {
@@ -125,7 +138,7 @@ export async function resolveChoice(
       err,
     });
     await updatePendingApprovalStatus(approval.approval_id, 'pending');
-    return;
+    return 'undelivered';
   }
 
   if (!deliveredTo) {
@@ -136,7 +149,7 @@ export async function resolveChoice(
       userId,
     });
     await updatePendingApprovalStatus(approval.approval_id, 'pending');
-    return;
+    return 'undelivered';
   }
 
   log.info('Choice resolved', {
@@ -144,8 +157,9 @@ export async function resolveChoice(
     action: approval.action,
     userId,
     sessionId: deliveredTo.id,
+    ...(answeredFrom ? { answeredFrom } : {}),
   });
-  await writeChoiceReceipt(approval, deliveredTo, option, userId, resolvedAt);
+  await writeChoiceReceipt(approval, deliveredTo, option, userId, resolvedAt, answeredFrom);
   await deletePendingApproval(approval.approval_id);
   const name = (await displayNameAcrossBots(userId)) || userId;
   const uncounted = option.value === 'ship' && unscopedReleaseCard(approval);
@@ -154,13 +168,36 @@ export async function resolveChoice(
     cardText(
       approval,
       uncounted
-        ? `⚠️ Ship did not count (out-of-date card) — ${headUnits(name, UNCOUNTED_NAME_UNITS)}`
-        : `✅ ${option.label} — ${name}`,
+        ? `⚠️ Ship did not count (out-of-date card) — ${
+            answeredFrom ? deciderName(name, answeredFrom, UNCOUNTED_NAME_UNITS) : headUnits(name, UNCOUNTED_NAME_UNITS)
+          }`
+        : answeredLine(option.label, name, answeredFrom),
     ),
   );
   if (uncounted) await tellClicker?.(UNCOUNTED_SHIP);
   // A choice resolves as approval of the chosen option.
   await notifyApprovalResolved({ approval, session: deliveredTo, outcome: 'approve', userId });
+  return uncounted ? 'uncounted' : 'resolved';
+}
+
+const FROM_HOST = ' (from the host)';
+const HOST_DECIDER_UNITS = 48;
+
+/** A host answer cuts the label, then the name, so its marker always fits the resolution line. */
+function answeredLine(label: string, name: string, answeredFrom: 'host' | undefined): string {
+  if (answeredFrom !== 'host') return `✅ ${label} — ${name}`;
+  const by = ` — ${deciderName(name, answeredFrom, HOST_DECIDER_UNITS)}`;
+  const room = APPROVAL_RESOLUTION_MAX_UNITS - '✅ '.length - by.length;
+  return `✅ ${label.length <= room ? label : `${headUnits(label, room - 1).trimEnd()}…`}${by}`;
+}
+
+/**
+ * The name a card, report or note shows for who decided, so a host answer is never mistaken for a click. A host
+ * answer's name is cut to fit `units` before the marker, never the marker itself.
+ */
+export function deciderName(name: string, answeredFrom?: 'host', units = Infinity): string {
+  if (answeredFrom !== 'host') return name;
+  return `${headUnits(name, Math.max(0, units - FROM_HOST.length))}${FROM_HOST}`;
 }
 
 /**
@@ -193,6 +230,7 @@ async function writeChoiceReceipt(
   option: NormalizedOption,
   userId: string,
   resolvedAt: string,
+  answeredFrom: 'host' | undefined,
 ): Promise<void> {
   try {
     await recordChoiceReceipt({
@@ -209,6 +247,7 @@ async function writeChoiceReceipt(
       clickerUserId: userId,
       releaseScopeJson: cardReleaseScopeJson(approval) ?? null,
       resolvedAt,
+      answeredFrom: answeredFrom ?? null,
     });
     // eslint-disable-next-line no-catch-all/no-catch-all -- the answer is already delivered; a receipt-write failure must not reopen the card
   } catch (err) {
@@ -230,7 +269,7 @@ export function choiceApprovers(approval: PendingApproval): string[] | undefined
   }
 }
 
-function storedOptions(approval: PendingApproval): NormalizedOption[] {
+export function choiceOptions(approval: PendingApproval): NormalizedOption[] {
   try {
     const parsed: unknown = JSON.parse(approval.options_json);
     return Array.isArray(parsed) ? (parsed as NormalizedOption[]) : [];

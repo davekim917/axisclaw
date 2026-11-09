@@ -24,13 +24,20 @@ import { closeDb, getDb, initMigratedTestDb } from '../../db/index.js';
 import { createAgentGroup } from '../../db/agent-groups.js';
 import { createMessagingGroup, createMessagingGroupAgent } from '../../db/messaging-groups.js';
 import {
+  createPendingApproval,
   createSession,
   findSessionForAgent,
   getPendingApproval,
   getPendingApprovalsByAction,
 } from '../../db/sessions.js';
 import { getDeliveryAction, setDeliveryAdapter } from '../../delivery.js';
+import { getChoiceReceipt } from '../../db/choice-receipts.js';
+import type { CallerContext } from '../../cli/frame.js';
+import { dispatch } from '../../cli/dispatch.js';
+// Side-effect import: registers the `approvals-*` commands.
+import '../../cli/resources/approvals.js';
 import { log } from '../../log.js';
+import { notifyOwner } from '../../notify-owner.js';
 import { sessionMessageExists, writeSessionMessage } from '../../session-manager.js';
 import type { PendingApproval, Session } from '../../types.js';
 import { createDestination } from '../agent-to-agent/db/agent-destinations.js';
@@ -43,6 +50,10 @@ import { formatChoiceResponse, REQUEST_CHOICE_ACTION, retireUnscopedReleaseCards
 vi.mock('../../container-runner.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../container-runner.js')>()),
   wakeContainer: vi.fn().mockResolvedValue(true),
+}));
+
+vi.mock('../../notify-owner.js', () => ({
+  notifyOwner: vi.fn().mockResolvedValue({ code: 0, message: 'delivered' }),
 }));
 
 vi.mock('../../config.js', async () => {
@@ -1291,6 +1302,209 @@ describe('request_choice approvers', () => {
     expect(notes().map((n) => n.text)).toEqual([
       `request_choice failed: approver "${MEMBER}" is not an owner or admin of this agent group.`,
     ]);
+  });
+});
+
+describe('ncl approvals choose: the owner answers from the host', () => {
+  const OWNER = `${CHANNEL}:owner-1`;
+  const RELEASE_CARD = { approvalScope: RELEASE_SCOPE, decision: RELEASE_DECISION };
+
+  beforeEach(async () => {
+    await upsertUser({ id: OWNER, kind: CHANNEL, display_name: 'Owner One', created_at: now() });
+    await grantRole({ user_id: OWNER, role: 'owner', agent_group_id: null, granted_by: null, granted_at: now() });
+  });
+
+  const ORIGIN = ['300: bash -c ncl approvals choose', '200: fixture-agent exec'];
+
+  async function choose(id: string, option: string, ctx: CallerContext = { caller: 'host', origin: ORIGIN }) {
+    return dispatch({ id: 'req-choose', command: 'approvals-choose', args: { id, option } }, ctx);
+  }
+
+  function refusal(resp: Awaited<ReturnType<typeof choose>>): string {
+    if (resp.ok) throw new Error(`expected a refusal, got ${JSON.stringify(resp.data)}`);
+    return resp.error.message;
+  }
+
+  it('resolves a release card as the owner, with the same answer and receipt as the owner’s click, marked from the host', async () => {
+    const clicked = (await ask(session, { ...RELEASE_CARD, approvers: [OWNER, ADMIN] }, 'choice-click'))!;
+    await click(clicked.approval_id, 'ship', OWNER);
+    const chosen = (await ask(session, { ...RELEASE_CARD, approvers: [OWNER, ADMIN] }, 'choice-host'))!;
+    const posted = delivered.length;
+
+    const resp = await choose(chosen.approval_id, 'ship');
+
+    if (!resp.ok) throw new Error(resp.error.message);
+    expect(resp.data).toEqual({ answered: chosen.approval_id, option: 'ship', label: 'Ship release', by: OWNER });
+    expect(await getPendingApproval(chosen.approval_id)).toBeUndefined();
+
+    const [clickLine, hostLine] = notes();
+    const same = (text: string, row: PendingApproval) =>
+      text.replace(row.approval_id, '<approval>').replace(row.request_id, '<choice>');
+    expect(hostLine!.sessionId).toBe(clickLine!.sessionId);
+    expect(same(hostLine!.text, chosen)).toBe(same(clickLine!.text, clicked));
+
+    const {
+      approval_id: _a,
+      request_id: _r,
+      platform_message_id: _m,
+      resolved_at: _t,
+      ...clickReceipt
+    } = (await getChoiceReceipt(clicked.approval_id))!;
+    const {
+      approval_id: _b,
+      request_id: _s,
+      platform_message_id: _n,
+      resolved_at: _u,
+      ...hostReceipt
+    } = (await getChoiceReceipt(chosen.approval_id))!;
+    expect(clickReceipt).toMatchObject({ clicker_user_id: OWNER, value: 'ship', answered_from: null });
+    expect(hostReceipt).toEqual({ ...clickReceipt, answered_from: 'host' });
+
+    const edit = after(posted).filter((d) => d.content.operation === 'edit');
+    expect(edit).toHaveLength(1);
+    expect(String(edit[0]!.content.text).split('\n\n').at(-1)).toBe('✅ Ship release — Owner One (from the host)');
+
+    expect(vi.mocked(notifyOwner).mock.calls).toEqual([
+      [
+        {
+          title: 'A card was answered as you from the host',
+          body: [
+            `"${chosen.title}" (${chosen.approval_id}) was answered as you (${OWNER}) from the host: Ship release.`,
+            'It counted.',
+            'Run by (nearest process first, as the caller reported it):',
+            '• 300: bash -c ncl approvals choose',
+            '• 200: fixture-agent exec',
+          ].join('\n'),
+        },
+      ],
+    ]);
+  });
+
+  it('tells the owner of an answer that claimed the card but could not be delivered, and leaves the card open', async () => {
+    const row = (await ask(session, { approvers: [OWNER] }))!;
+    await getDb().run('UPDATE sessions SET status = ? WHERE id = ?', 'closed', 'sess-1');
+
+    expect(refusal(await choose(row.approval_id, 'hold'))).toBe(
+      'No live session could take the answer, so the card stays open. Nothing was decided.',
+    );
+    expect((await getPendingApproval(row.approval_id))?.status).toBe('pending');
+    expect(vi.mocked(notifyOwner)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(notifyOwner).mock.calls[0]![0].body.split('\n')[1]).toBe(
+      'It did not count: no live session could take it, so the card is still open.',
+    );
+  });
+
+  it('tells the owner when an answer fails after it was delivered, and reports the failure', async () => {
+    const row = (await ask(session, { approvers: [OWNER] }))!;
+    await getDb().run(
+      "CREATE TRIGGER fixture_delete_fails BEFORE DELETE ON pending_approvals BEGIN SELECT RAISE(ABORT, 'fixture fault'); END",
+    );
+
+    const resp = await choose(row.approval_id, 'hold');
+
+    expect(resp.ok).toBe(false);
+    expect(notes()).toHaveLength(1);
+    expect(vi.mocked(notifyOwner)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(notifyOwner).mock.calls[0]![0].body.split('\n')[1]).toBe(
+      'It failed partway, so whether it was recorded is unknown: check the card and the session.',
+    );
+  });
+
+  it('keeps the host marker on the card when a long option label fills the resolution line', async () => {
+    const label = `Ship ${'x'.repeat(170)}`;
+    const row = (await ask(session, { approvers: [OWNER], options: [{ label, value: 'long' }, OPTIONS[2]] }))!;
+
+    await choose(row.approval_id, 'long');
+
+    const line = String(after(1)[0]!.content.text).split('\n\n').at(-1)!;
+    expect(line).toMatch(/^✅ Ship x+… — Owner One \(from the host\)$/);
+    expect(line.length).toBeLessThanOrEqual(160);
+  });
+
+  it('keeps the answer when the owner cannot be told, and logs that at warn', async () => {
+    const row = (await ask(session, { approvers: [OWNER] }))!;
+    vi.mocked(notifyOwner).mockResolvedValueOnce({ code: 2, message: 'no owner DM resolved' });
+    const warn = vi.spyOn(log, 'warn');
+    try {
+      const resp = await choose(row.approval_id, 'hold');
+
+      expect(resp.ok).toBe(true);
+      expect(await getPendingApproval(row.approval_id)).toBeUndefined();
+      expect(warn).toHaveBeenCalledWith('Owner was not told of a host answer', {
+        approvalId: row.approval_id,
+        reason: 'no owner DM resolved',
+      });
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('refuses an agent caller and leaves the card open', async () => {
+    const row = (await ask(session, { approvers: [OWNER] }))!;
+
+    const message = refusal(
+      await choose(row.approval_id, 'hold', {
+        caller: 'agent',
+        sessionId: 'sess-1',
+        agentGroupId: 'ag-1',
+        messagingGroupId: 'mg-1',
+      }),
+    );
+
+    expect(message).toContain('operator-only');
+    expect((await getPendingApproval(row.approval_id))?.status).toBe('pending');
+    expect(notes()).toEqual([]);
+  });
+
+  it('refuses a card whose approvers do not include the owner, naming them, and leaves it open', async () => {
+    const row = (await ask(session, { approvers: [ADMIN] }))!;
+
+    expect(refusal(await choose(row.approval_id, 'hold'))).toBe(
+      "The owner is not among this card's approvers. Only Admin One can answer this card.",
+    );
+    expect((await getPendingApproval(row.approval_id))?.status).toBe('pending');
+    expect(notes()).toEqual([]);
+    expect(after(1)).toEqual([]);
+    expect(vi.mocked(notifyOwner)).not.toHaveBeenCalled();
+  });
+
+  it('refuses an option the card does not offer and leaves it open', async () => {
+    const row = (await ask(session, { approvers: [OWNER] }))!;
+
+    expect(refusal(await choose(row.approval_id, 'ship-everything'))).toBe(
+      '"ship-everything" is not an option on this card. Its options are: ship-a, ship-all, hold.',
+    );
+    expect((await getPendingApproval(row.approval_id))?.status).toBe('pending');
+    expect(notes()).toEqual([]);
+    expect(after(1)).toEqual([]);
+  });
+
+  it('refuses a card someone already answered', async () => {
+    const row = (await ask(session))!;
+    await click(row.approval_id, 'hold', ADMIN);
+
+    expect(refusal(await choose(row.approval_id, 'ship-a'))).toBe(
+      `No open card ${row.approval_id}: it was already answered, expired, or never existed.`,
+    );
+    expect(notes()).toHaveLength(1);
+    expect(notes()[0]!.text).toContain('value=hold');
+  });
+
+  it('still refuses a OneCLI credential approval', async () => {
+    await createPendingApproval({
+      approval_id: 'appr-cred',
+      request_id: 'req-cred',
+      action: 'onecli_credential',
+      payload: '{}',
+      created_at: now(),
+      title: 'Credential',
+      options_json: '[]',
+    });
+
+    expect(refusal(await choose('appr-cred', 'approve'))).toBe(
+      'OneCLI credential approvals resolve through the gateway flow, not the CLI.',
+    );
+    expect((await getPendingApproval('appr-cred'))?.status).toBe('pending');
   });
 });
 

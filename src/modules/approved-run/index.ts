@@ -5,7 +5,7 @@ import { onHostStart } from '../../host-lifecycle.js';
 import { log } from '../../log.js';
 import { agentsHoldingSecret } from '../../onecli-secrets.js';
 import type { Session } from '../../types.js';
-import { registerChoiceHandler } from '../approvals/choices.js';
+import { deciderName, registerChoiceHandler } from '../approvals/choices.js';
 import { notifyAgent, requestApprovalOutcome } from '../approvals/primitive.js';
 import { getUser } from '../permissions/db/users.js';
 import { resolveUserChannelType } from '../permissions/user-dm.js';
@@ -524,10 +524,10 @@ registerDeliveryAction(REQUEST_ACTION, execute, {
     ),
 });
 
-registerChoiceHandler(APPROVED_RUN_ACTION, async ({ approval, requester, value, userId }) => {
+registerChoiceHandler(APPROVED_RUN_ACTION, async ({ approval, requester, value, userId, answeredFrom }) => {
   const session = requester ?? (approval.session_id ? await getSession(approval.session_id) : undefined);
   if (!session) throw new Error('the requesting session no longer exists');
-  const name = (await getUser(userId))?.display_name || userId;
+  const name = deciderName((await getUser(userId))?.display_name || userId, answeredFrom);
   if (value !== RUN_VALUE) {
     await notifyAgent(session, `${name} chose not to run "${approval.title}". Nothing ran.`);
     return session;

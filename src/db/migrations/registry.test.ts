@@ -150,6 +150,7 @@ describe('central migration registry', () => {
       'mobile-send-keys',
       'discord-relay-posts',
       'workgroup-approvals-channel',
+      'choice-receipt-answered-from',
     ]);
     const liveSchema = schemaObjects(live);
     // Canary: two empty snapshots compare equal, so assert the query actually

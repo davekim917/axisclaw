@@ -22,6 +22,7 @@ import { fileURLToPath } from 'node:url';
 import { formatResponse } from './format.js';
 import type { RequestFrame } from './frame.js';
 import { parseArgv } from './parse-argv.js';
+import { processAncestry } from './process-ancestry.js';
 import { SocketTransport } from './socket-client.js';
 import { readStdinJsonArgs, StdinJsonInputError, type StdinJsonStream } from './stdin-json.js';
 import type { Transport } from './transport.js';
@@ -65,7 +66,7 @@ export async function main(
   }
   // Stdin is only a client-side encoding for args. The daemon receives the
   // same stable request frame it would receive if every value came from argv.
-  const req: RequestFrame = { id: randomUUID(), command, args: requestArgs };
+  const req: RequestFrame = { id: randomUUID(), command, args: requestArgs, origin: processAncestry(process.ppid) };
   const transport: Transport = pickTransport();
 
   let res;

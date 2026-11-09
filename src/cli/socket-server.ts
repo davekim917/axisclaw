@@ -284,7 +284,8 @@ async function handleFrame(conn: net.Socket, line: string): Promise<void> {
   // Host caller — connecting to data/ncl.sock requires file-system access
   // to a 0600 socket owned by the host user, so we treat the socket path
   // itself as the auth boundary.
-  const ctx: CallerContext = { caller: 'host' };
+  const origin = frameOrigin(req.origin);
+  const ctx: CallerContext = origin ? { caller: 'host', origin } : { caller: 'host' };
   const res = await dispatch(req, ctx);
   write(conn, res);
 }
@@ -296,6 +297,18 @@ function write(conn: net.Socket, frame: ResponseFrame): void {
   } catch (err) {
     log.warn('Failed to write ncl CLI response', { err });
   }
+}
+
+const ORIGIN_MAX_ENTRIES = 8;
+const ORIGIN_MAX_UNITS = 300;
+
+function frameOrigin(origin: unknown): string[] | undefined {
+  if (!Array.isArray(origin)) return undefined;
+  const lines = origin
+    .filter((line): line is string => typeof line === 'string')
+    .slice(0, ORIGIN_MAX_ENTRIES)
+    .map((line) => line.slice(0, ORIGIN_MAX_UNITS));
+  return lines.length > 0 ? lines : undefined;
 }
 
 function isRequestFrame(x: unknown): x is RequestFrame {

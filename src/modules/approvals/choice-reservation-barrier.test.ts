@@ -176,7 +176,7 @@ describe('the reservation spans the delivery window', () => {
     gate.reject(new Error('platform down'));
 
     // The restore is the part that used to throw SQLITE_CONSTRAINT_UNIQUE.
-    await expect(click).resolves.toBeUndefined();
+    await expect(click).resolves.toBe('undelivered');
 
     // Card left open, exactly one row, answerable again by a later click.
     expect((await getPendingApproval(row.approval_id))!.status).toBe('pending');
@@ -200,7 +200,7 @@ describe('the reservation spans the delivery window', () => {
     // No live session could take the answer (choices.ts:142-151).
     gate.resolve(null);
 
-    await expect(click).resolves.toBeUndefined();
+    await expect(click).resolves.toBe('undelivered');
 
     expect((await getPendingApproval(row.approval_id))!.status).toBe('pending');
     expect(await getPendingApprovalsByAction(ACTION)).toHaveLength(1);

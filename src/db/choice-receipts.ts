@@ -28,6 +28,8 @@ export interface ChoiceReceipt {
   /** NULL for every generic choice. */
   releaseScopeJson: string | null;
   resolvedAt: string;
+  /** `host` when the owner answered with `ncl approvals choose`; NULL for a click on the card. */
+  answeredFrom: 'host' | null;
 }
 
 /**
@@ -38,8 +40,9 @@ export async function recordChoiceReceipt(receipt: ChoiceReceipt): Promise<void>
   await getDb().run(
     `INSERT INTO choice_receipts
        (approval_id, request_id, action, agent_group_id, session_id,
-        platform_id, thread_id, platform_message_id, value, label, clicker_user_id, release_scope_json, resolved_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        platform_id, thread_id, platform_message_id, value, label, clicker_user_id, release_scope_json, resolved_at,
+        answered_from)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     receipt.approvalId,
     receipt.requestId,
     receipt.action,
@@ -53,6 +56,7 @@ export async function recordChoiceReceipt(receipt: ChoiceReceipt): Promise<void>
     receipt.clickerUserId,
     receipt.releaseScopeJson,
     receipt.resolvedAt,
+    receipt.answeredFrom,
   );
 }
 
@@ -70,6 +74,7 @@ export interface ChoiceReceiptRow {
   clicker_user_id: string;
   release_scope_json: string | null;
   resolved_at: string;
+  answered_from: 'host' | null;
 }
 
 export async function getChoiceReceipt(approvalId: string): Promise<ChoiceReceiptRow | undefined> {

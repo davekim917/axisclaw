@@ -1,5 +1,6 @@
 import { PENDING_APPROVAL_STATUSES } from '../../types.js';
 import { registerResource } from '../crud.js';
+import { chooseFromHost } from '../../modules/approvals/host-choose.js';
 import { resolveApprovalFromHost } from '../../modules/approvals/response-handler.js';
 
 registerResource({
@@ -68,6 +69,34 @@ registerResource({
         if (!result.resolved) throw new Error(result.error ?? 'approval not resolved');
         if (result.declined) return { declined: id, reason: result.declined };
         return { approved: id };
+      },
+    },
+    choose: {
+      access: 'open',
+      description:
+        'Answer a choice card (a release, migration or approved-run card) as the owner, from the host — the same as the owner clicking that option on the card. ' +
+        'Use --id <approval-id> --option <value>; --option must be one of the card’s own option values. ' +
+        'Recorded under the owner’s own id for that card, marked "(from the host)" on the card and in the receipt. ' +
+        'It never answers as anyone else: a card whose approvers do not include the owner is refused. ' +
+        "Host only. The host's Claude Code ask rule on this command is what makes each use the owner's own yes. " +
+        'Every use also notifies the owner, naming the processes that ran it. ' +
+        'OneCLI credential approvals are out of scope.',
+      hostOnly: true,
+      args: [
+        { name: 'id', type: 'string', required: true, description: 'The choice card’s approval id (appr-…).' },
+        { name: 'option', type: 'string', required: true, description: 'One of the card’s option values, e.g. ship.' },
+      ],
+      examples: ['ncl approvals choose --id appr-123 --option ship'],
+      handler: async (args, ctx) => {
+        if (ctx.caller === 'agent') throw new Error('Agents cannot resolve approvals.');
+        const id = args.id as string;
+        const option = args.option as string;
+        const result = await chooseFromHost(id, option, ctx.caller === 'host' ? ctx.origin : undefined);
+        if (!result.resolved) throw new Error(result.error);
+        if (result.uncounted) {
+          return { answered: id, option, by: result.userId, counted: false, reason: 'out-of-date release card' };
+        }
+        return { answered: id, option, label: result.label, by: result.userId };
       },
     },
     reject: {

@@ -95,8 +95,8 @@ export async function handleApprovalsResponse(payload: ResponsePayload): Promise
     tellClicker(
       payload,
       approvers.length === 0
-        ? 'No one can approve this credential request any more, so it will expire. Your click did not count.'
-        : await onlyNamed(approvers),
+        ? `No one can approve this credential request any more, so it will expire.${NOT_COUNTED}`
+        : `${await onlyNamed(approvers)}${NOT_COUNTED}`,
     );
   if (
     await resolveOneCLIApproval(payload.questionId, payload.value, namespacedUserId(payload) ?? '', refusedCredential)
@@ -299,14 +299,22 @@ async function clickRefusal(
 ): Promise<string | null> {
   const userId = namespacedUserId(payload);
   if (!userId) return 'Your click could not be matched to a user, so it did not count.';
-  return answerRefusal(approval, userId, !inApprovalsChannel);
+  const refusal = await answerRefusal(approval, userId, !inApprovalsChannel);
+  return refusal && `${refusal}${NOT_COUNTED}`;
 }
+
+const NOT_COUNTED = ' Your click did not count.';
 
 export async function canAnswerApproval(approval: PendingApproval, userId: string): Promise<boolean> {
   return (await answerRefusal(approval, userId)) === null;
 }
 
-async function answerRefusal(approval: PendingApproval, userId: string, threadShortcut = true): Promise<string | null> {
+/** Why `userId` may not answer this approval, or null when they may. */
+export async function answerRefusal(
+  approval: PendingApproval,
+  userId: string,
+  threadShortcut = true,
+): Promise<string | null> {
   // An approval may name a specific approver; only that user may resolve it, from any of their same-workspace bots.
   if (approval.approver_user_id) {
     return equivalentSlackUserIds(userId).includes(approval.approver_user_id)
@@ -336,25 +344,25 @@ async function answerRefusal(approval: PendingApproval, userId: string, threadSh
 
   if (!agentGroupId) {
     const allowed = await withCentralSync(() => isOwner(userId) || isGlobalAdmin(userId), 'approval click authority');
-    return allowed ? null : 'Only the owner or a global admin can answer this card. Your click did not count.';
+    return allowed ? null : 'Only the owner or a global admin can answer this card.';
   }
 
   const allowed = await withCentralSync(() => hasAdminPrivilege(userId, agentGroupId), 'approval click authority');
-  return allowed ? null : 'Only an admin of this agent can answer this card. Your click did not count.';
+  return allowed ? null : 'Only an admin of this agent can answer this card.';
 }
 
-async function onlyNamed(approvers: readonly string[]): Promise<string> {
+export async function onlyNamed(approvers: readonly string[]): Promise<string> {
   const names: string[] = [];
   for (const id of approvers) {
     const name = (await getUser(id))?.display_name;
-    if (!name) return 'Only the people this card names can answer it. Your click did not count.';
+    if (!name) return 'Only the people this card names can answer it.';
     if (!names.includes(name)) names.push(name);
   }
   if (names.length === 0) {
-    return 'Only the people this card names can answer it. Your click did not count.';
+    return 'Only the people this card names can answer it.';
   }
   const all = names.length === 1 ? names[0] : `${names.slice(0, -1).join(', ')} or ${names[names.length - 1]}`;
-  return `Only ${fitResolutionLine(all)} can answer this card. Your click did not count.`;
+  return `Only ${fitResolutionLine(all)} can answer this card.`;
 }
 
 async function tellClicker(payload: ResponsePayload, text: string): Promise<void> {

@@ -428,7 +428,7 @@ describe('choice receipts', () => {
       now(),
     );
 
-    await expect(resolveChoice(approval, 'ship-a', USER)).resolves.toBeUndefined();
+    await expect(resolveChoice(approval, 'ship-a', USER)).resolves.toBe('resolved');
 
     // Delivered anyway, and the click consumed: the row is gone, not left open.
     expect(handler).toHaveBeenCalledTimes(1);
