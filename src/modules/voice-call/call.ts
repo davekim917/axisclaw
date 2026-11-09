@@ -1,6 +1,7 @@
 import { log } from '../../log.js';
-import type { ContextChannel, LiveCall, LiveEvent } from './live.js';
+import type { ContextUse, LiveCall, LiveEvent } from './live.js';
 import {
+  checkInText,
   greeting,
   groupCallEndedText,
   groupGreeting,
@@ -11,12 +12,15 @@ import {
   voiceRequestText,
   headcountChangeText,
   onCallText,
+  progressText,
   voiceMirror,
 } from './prompts.js';
 import { startupContext, type FeedEvent, type SessionFeed } from './session-feed.js';
 
 const OUTPUT_LIMIT_BYTES = 4000;
 const SPOKEN_TRANSCRIPT_LIMIT = 8 * 1024;
+/** A running request is spoken about at most this often, counted from its start or its last spoken reply. */
+export const CHECK_IN_INTERVAL_MS = 120_000;
 
 export interface CallParty {
   agentName: string;
@@ -100,7 +104,9 @@ export class VoiceCallBridge {
    */
   private inTurn = new Set<string>();
   private done = new Set<string>();
-  private beforeLive: Array<[string, ContextChannel, string | undefined]> = [];
+  /** When each running request was last spoken about. */
+  private lastSpoken = new Map<string, number>();
+  private beforeLive: Array<[string, ContextUse, string | undefined]> = [];
   private sentAny = false;
   private connected = false;
   private greeted = false;
@@ -132,7 +138,7 @@ export class VoiceCallBridge {
       this.live.close();
       throw new Error('The call ended while it was connecting.');
     }
-    for (const [text, channel, delegationId] of this.beforeLive.splice(0)) this.context(text, channel, delegationId);
+    for (const [text, use, delegationId] of this.beforeLive.splice(0)) this.context(text, use, delegationId);
     if (!this.party.group)
       this.ports.mirror(`📞 ${this.party.callerName} started a voice call with ${this.party.agentName}.`);
     return this.live.answer;
@@ -149,9 +155,9 @@ export class VoiceCallBridge {
     const before = this.onCall;
     if (before && before.length === sorted.length && before.every((name, i) => name === sorted[i])) return;
     this.onCall = sorted;
-    this.context(onCallText(sorted), 'commentary');
+    this.context(onCallText(sorted), 'know');
     const change = before && this.greeted ? headcountChangeText(before, sorted) : null;
-    if (change) this.context(change, 'speakable');
+    if (change) this.context(change, 'say');
   }
 
   private greet(): void {
@@ -159,15 +165,24 @@ export class VoiceCallBridge {
     this.greeted = true;
     this.context(
       this.party.group ? groupGreeting(this.party.agentName, this.onCall ?? []) : greeting(this.party.agentName),
-      'speakable',
+      'say',
     );
     this.ports.greeted?.();
   }
 
-  private context(text: string, channel: ContextChannel, delegationId?: string): void {
+  private context(text: string, use: ContextUse, delegationId?: string): void {
     if (this.closed) return;
-    if (this.live) this.live.context(truncateMiddle(text, OUTPUT_LIMIT_BYTES), channel, delegationId);
-    else this.beforeLive.push([text, channel, delegationId]);
+    if (this.live) this.live.context(truncateMiddle(text, OUTPUT_LIMIT_BYTES), use, delegationId);
+    else this.beforeLive.push([text, use, delegationId]);
+  }
+
+  private checkIn(delegation: string, note: string): boolean {
+    const now = Date.now();
+    const since = this.lastSpoken.get(delegation);
+    if (since === undefined || now - since < CHECK_IN_INTERVAL_MS) return false;
+    this.lastSpoken.set(delegation, now);
+    this.context(checkInText(note), 'check-in', delegation);
+    return true;
   }
 
   private onLive(event: LiveEvent): void {
@@ -190,6 +205,7 @@ export class VoiceCallBridge {
   }
 
   private delegate(id: string, request: string): void {
+    this.lastSpoken.set(id, Date.now());
     if (this.ports.admit) {
       const arrivedAtMs = Date.now();
       this.groupRelays = this.groupRelays
@@ -212,7 +228,7 @@ export class VoiceCallBridge {
         log.warn('Voice call: request may not have reached the session', { err });
         this.context(
           `That request may not have reached ${this.party.agentName}. Ask the caller to check the thread before asking again.`,
-          'speakable',
+          'say',
           id,
         );
       },
@@ -227,16 +243,16 @@ export class VoiceCallBridge {
     } catch (err) {
       log.warn('Voice call: could not read a group request', { err });
       if (!this.closed)
-        this.context(`That request did not reach ${this.party.agentName}. Ask them to say it again.`, 'speakable', id);
+        this.context(`That request did not reach ${this.party.agentName}. Ask them to say it again.`, 'say', id);
       return;
     }
     if (this.closed) return;
     if (admitted === 'empty') {
-      this.context('Nothing was said, so nothing was sent. Stay silent.', 'commentary', id);
+      this.context('Nothing was said, so nothing was sent. Stay silent.', 'know');
       return;
     }
     if (admitted === 'duplicate') {
-      this.context(`${this.party.agentName} already has this request. Stay silent.`, 'commentary', id);
+      this.context(`${this.party.agentName} already has this request. Stay silent.`, 'know');
       return;
     }
     this.sentAny = true;
@@ -249,7 +265,7 @@ export class VoiceCallBridge {
         log.warn('Voice call: request may not have reached the session', { err });
         this.context(
           `That request may not have reached ${this.party.agentName}. Ask them to check the thread before asking again.`,
-          'speakable',
+          'say',
           id,
         );
       },
@@ -267,13 +283,13 @@ export class VoiceCallBridge {
     if (this.closed) return;
     switch (event.type) {
       case 'inbound':
-        this.context(`In the thread, ${event.sender}: ${event.text}`, 'commentary');
+        this.context(`In the thread, ${event.sender}: ${event.text}`, 'say');
         return;
       case 'progress': {
         const named = this.requestNamed(event.inReplyTo);
         if (named === 'finished') return;
         const delegation = named ?? this.active;
-        if (delegation) this.context(event.text, 'commentary', delegation);
+        if (delegation && !this.checkIn(delegation, event.text)) this.context(progressText(event.text), 'know');
         return;
       }
       case 'reply': {
@@ -282,12 +298,16 @@ export class VoiceCallBridge {
         const delegation = named === 'finished' ? null : (named ?? this.active);
         if (delegation) {
           this.inTurn.add(delegation);
-          this.context(event.text, 'speakable', delegation);
-        } else this.context(`${this.party.agentName} posted in the thread: ${event.text}`, 'speakable');
+          this.lastSpoken.set(delegation, Date.now());
+          this.context(event.text, 'say', delegation);
+        } else this.context(`${this.party.agentName} posted in the thread: ${event.text}`, 'say');
         return;
       }
       case 'turn-end':
-        for (const id of this.inTurn) this.done.add(id);
+        for (const id of this.inTurn) {
+          this.done.add(id);
+          this.lastSpoken.delete(id);
+        }
         this.inTurn.clear();
         this.active = null;
         this.ports.status('Live');

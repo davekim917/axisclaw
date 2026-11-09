@@ -1,14 +1,14 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { VoiceCallBridge, type CallPorts } from './call.js';
-import type { ContextChannel, LiveEvent } from './live.js';
+import { CHECK_IN_INTERVAL_MS, VoiceCallBridge, type CallPorts } from './call.js';
+import type { ContextUse, LiveEvent } from './live.js';
 import type { FeedEvent } from './session-feed.js';
 
 interface Harness {
   bridge: VoiceCallBridge;
   live: (event: LiveEvent) => void;
   agent: (event: FeedEvent) => void;
-  appended: Array<{ text: string; channel: ContextChannel; delegationId?: string }>;
+  appended: Array<{ text: string; use: ContextUse; delegationId?: string }>;
   injected: Array<{ text: string; wake: boolean }>;
   mirrored: string[];
   ended: string[];
@@ -35,7 +35,7 @@ async function connect(recent: FeedEvent[] = [], group = false): Promise<Harness
       h.live = onEvent;
       return {
         answer: 'v=0 answer',
-        context: (text, channel, delegationId) => h.appended.push({ text, channel, delegationId }),
+        context: (text, use, delegationId) => h.appended.push({ text, use, delegationId }),
         close: () => {
           h.liveClosed = true;
         },
@@ -79,14 +79,14 @@ describe('VoiceCallBridge', () => {
     h.bridge.peopleOnCall(['Rae', 'Sam']);
     h.bridge.peopleOnCall(['Rae', 'Sam', 'Lee']);
     h.bridge.peopleOnCall(['Rae']);
-    expect(h.appended.map(({ text, channel }) => [channel, text])).toEqual([
-      ['commentary', 'On the call: Rae. One person: everything they say is to you.'],
-      ['speakable', 'The call just connected. Greet Rae with exactly: "Hi Rae, it\'s Atlas."'],
-      ['commentary', 'On the call: Rae and Sam. 2 people: respond only when someone says your name.'],
-      ['speakable', 'Sam joined the call. In one short sentence, tell everyone to say your name when they need you.'],
-      ['commentary', 'On the call: Lee, Rae and Sam. 3 people: respond only when someone says your name.'],
-      ['commentary', 'On the call: Rae. One person: everything they say is to you.'],
-      ['speakable', 'Lee and Sam left the call. In one short sentence, tell Rae they no longer need to say your name.'],
+    expect(h.appended.map(({ text, use }) => [use, text])).toEqual([
+      ['know', 'On the call: Rae. One person: everything they say is to you.'],
+      ['say', 'The call just connected. Greet Rae with exactly: "Hi Rae, it\'s Atlas."'],
+      ['know', 'On the call: Rae and Sam. 2 people: respond only when someone says your name.'],
+      ['say', 'Sam joined the call. In one short sentence, tell everyone to say your name when they need you.'],
+      ['know', 'On the call: Lee, Rae and Sam. 3 people: respond only when someone says your name.'],
+      ['know', 'On the call: Rae. One person: everything they say is to you.'],
+      ['say', 'Lee and Sam left the call. In one short sentence, tell Rae they no longer need to say your name.'],
     ]);
   });
 
@@ -99,7 +99,7 @@ describe('VoiceCallBridge', () => {
     expect(h.appended).toEqual([
       {
         text: expect.stringContaining('"Hi, it\'s Atlas. What can I do?"'),
-        channel: 'speakable',
+        use: 'say',
         delegationId: undefined,
       },
     ]);
@@ -208,11 +208,11 @@ describe('VoiceCallBridge', () => {
     h.agent({ type: 'reply', text: 'Also, the nightly is green.', inReplyTo: 'other-message' });
 
     expect(h.appended).toEqual([
-      { text: '🔧 Running vitest', channel: 'commentary', delegationId: 'd1' },
-      { text: 'Two tests fail.', channel: 'speakable', delegationId: 'd1' },
+      { text: 'Progress, not to be said: 🔧 Running vitest', use: 'know', delegationId: undefined },
+      { text: 'Two tests fail.', use: 'say', delegationId: 'd1' },
       {
         text: 'Atlas posted in the thread: Also, the nightly is green.',
-        channel: 'speakable',
+        use: 'say',
         delegationId: undefined,
       },
     ]);
@@ -223,7 +223,7 @@ describe('VoiceCallBridge', () => {
     h.written = new Promise(() => undefined);
     h.live({ type: 'delegation', id: 'd1', text: 'Check the tests.' });
     h.agent({ type: 'reply', text: 'Two tests fail.', inReplyTo: 'm1' });
-    expect(h.appended).toEqual([{ text: 'Two tests fail.', channel: 'speakable', delegationId: 'd1' }]);
+    expect(h.appended).toEqual([{ text: 'Two tests fail.', use: 'say', delegationId: 'd1' }]);
   });
 
   it('drops progress polled after its turn ended, so it cannot revive the request or claim a later reply', async () => {
@@ -234,8 +234,8 @@ describe('VoiceCallBridge', () => {
     h.agent({ type: 'progress', text: '🔧 Running vitest', inReplyTo: 'm1' });
     h.agent({ type: 'reply', text: 'Lint is clean.', inReplyTo: 'typed-7' });
     expect(h.appended).toEqual([
-      { text: 'Two tests fail.', channel: 'speakable', delegationId: 'd1' },
-      { text: 'Atlas posted in the thread: Lint is clean.', channel: 'speakable', delegationId: undefined },
+      { text: 'Two tests fail.', use: 'say', delegationId: 'd1' },
+      { text: 'Atlas posted in the thread: Lint is clean.', use: 'say', delegationId: undefined },
     ]);
   });
 
@@ -265,7 +265,7 @@ describe('VoiceCallBridge', () => {
     h.agent({ type: 'reply', text: 'Lint is clean.', inReplyTo: 'm2' });
     expect(h.appended.map((a) => [a.text, a.delegationId])).toEqual([
       ['Two tests fail.', 'd1'],
-      ['🔧 Running eslint', 'd2'],
+      ['Progress, not to be said: 🔧 Running eslint', undefined],
       ['Lint is clean.', 'd2'],
     ]);
   });
@@ -278,7 +278,7 @@ describe('VoiceCallBridge', () => {
     h.agent({ type: 'reply', text: 'Lint is clean.', inReplyTo: 'm2' });
     h.agent({ type: 'reply', text: 'Tests pass too.', inReplyTo: 'unknown' });
     expect(h.appended.map((a) => [a.text, a.delegationId])).toEqual([
-      ['tests running', 'd1'],
+      ['Progress, not to be said: tests running', undefined],
       ['Lint is clean.', 'd2'],
       ['Tests pass too.', 'd2'],
     ]);
@@ -299,7 +299,7 @@ describe('VoiceCallBridge', () => {
     h.agent({ type: 'inbound', sender: 'Sam Roe', text: 'is the backfill done?' });
     h.agent({ type: 'progress', text: 'not tied to the call', inReplyTo: 'other-message' });
     expect(h.appended).toEqual([
-      { text: 'In the thread, Sam Roe: is the backfill done?', channel: 'commentary', delegationId: undefined },
+      { text: 'In the thread, Sam Roe: is the backfill done?', use: 'say', delegationId: undefined },
     ]);
     expect(h.injected).toEqual([]);
   });
@@ -402,6 +402,52 @@ describe('VoiceCallBridge', () => {
     bridge.end({ dropped: false, reason: 'ended' });
     await expect(bridge.start('v=0 offer')).rejects.toThrow(/ended/);
     expect([feeds, lives]).toEqual([0, 0]);
+  });
+
+  describe('progress on a running request', () => {
+    afterEach(() => vi.useRealTimers());
+    const at = (ms: number) => vi.setSystemTime(new Date(Date.UTC(2026, 0, 1) + ms));
+
+    it('stays silent and speaks one check-in per interval, however many notes arrive', async () => {
+      vi.useFakeTimers({ toFake: ['Date'] });
+      at(0);
+      const h = await connect([], true);
+      h.live({ type: 'delegation', id: 'd1', text: 'Atlas, check the nightly.' });
+      await new Promise((r) => setTimeout(r, 0));
+      h.appended.length = 0;
+      for (let i = 0; i < 55; i++) {
+        at(Math.round((i * 7 * 60_000) / 54));
+        h.agent({ type: 'progress', text: `💭 note ${i}`, inReplyTo: 'm1' });
+      }
+      expect(h.appended.filter((a) => a.use === 'know')).toHaveLength(52);
+      expect(h.appended.filter((a) => a.use !== 'know')).toEqual([
+        { text: expect.stringContaining('💭 note 16'), use: 'check-in', delegationId: 'd1' },
+        { text: expect.stringContaining('💭 note 32'), use: 'check-in', delegationId: 'd1' },
+        { text: expect.stringContaining('💭 note 48'), use: 'check-in', delegationId: 'd1' },
+      ]);
+    });
+
+    it('counts the interval from the last spoken reply, and never checks in once the request is finished', async () => {
+      vi.useFakeTimers({ toFake: ['Date'] });
+      at(0);
+      const h = await connect();
+      h.live({ type: 'delegation', id: 'd1', text: 'Check the nightly.' });
+      at(CHECK_IN_INTERVAL_MS - 1);
+      h.agent({ type: 'reply', text: 'Shard 3 failed; re-running it.', inReplyTo: 'm1' });
+      at(CHECK_IN_INTERVAL_MS + 1);
+      h.agent({ type: 'progress', text: 'still re-running', inReplyTo: 'm1' });
+      at(2 * CHECK_IN_INTERVAL_MS - 2);
+      h.agent({ type: 'progress', text: 'almost there', inReplyTo: 'm1' });
+      at(2 * CHECK_IN_INTERVAL_MS - 1);
+      h.agent({ type: 'progress', text: 'shard 3 is green', inReplyTo: 'm1' });
+      h.agent({ type: 'turn-end' });
+      at(10 * CHECK_IN_INTERVAL_MS);
+      h.agent({ type: 'progress', text: 'a helper is still writing', inReplyTo: 'm1' });
+      expect(h.appended.filter((a) => a.use !== 'know').map((a) => [a.use, a.text])).toEqual([
+        ['say', 'Shard 3 failed; re-running it.'],
+        ['check-in', expect.stringContaining('shard 3 is green')],
+      ]);
+    });
   });
 
   it('ends when the voice service closes the call', async () => {
