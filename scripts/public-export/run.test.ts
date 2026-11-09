@@ -196,6 +196,17 @@ describe('the AI hold store', () => {
     expect(loadAiHolds(file)).toEqual([{ ...record, originRev: null, texts: null }]);
   });
 
+  it('accepts a record whose quotes are the parts of an elided finding', () => {
+    const file = path.join(dir, 'ai-holds.json');
+    const elided = {
+      ...record,
+      findings: [{ ...record.findings[0], text: 'use the zz-acme … zz-acme tile' }],
+      texts: ['use the zz-acme', 'zz-acme tile'],
+    };
+    fs.writeFileSync(file, JSON.stringify([elided]));
+    expect(loadAiHolds(file)).toEqual([elided]);
+  });
+
   it.each([
     ['not JSON', '{'],
     ['not an array', '{}'],
@@ -207,7 +218,12 @@ describe('the AI hold store', () => {
     ['a record with no quotes to check', JSON.stringify([{ ...record, texts: [] }])],
     ["a record whose quote is not its finding's", JSON.stringify([{ ...record, texts: ['an unrelated safe quote'] }])],
     ['a record with fewer quotes than findings', JSON.stringify([{ ...record, findings: [], texts: record.texts }])],
+    [
+      'a record with a finding none of its quotes stands for',
+      JSON.stringify([{ ...record, findings: [...record.findings, { file: 'src/b.ts', text: 'another zz-acme line' }] }]),
+    ],
     ['a record with a quote too short to stand for its line', JSON.stringify([{ ...record, texts: ['zz-acme'] }])],
+    ['a record quoting part of a finding that elides nothing', JSON.stringify([{ ...record, texts: ['use the zz-acme'] }])],
   ])('fails the run on a store that is %s', (_name, text) => {
     const file = path.join(dir, 'ai-holds.json');
     fs.writeFileSync(file, text);

@@ -444,6 +444,70 @@ describe('runExport retries an AI hold as a squash only when the held text is pr
   });
 });
 
+describe('runExport proves an elided finding by the parts its ellipsis left', () => {
+  const line = 'const help = "open the zz-acme tile from the zz-acme portal";';
+  const elided = (text: string): AiFinding => ({ file: 'src/browser.ts', line: 1, text, why: 'client name' });
+  const elidedRun = (found: AiFinding, squashTree: Record<string, string>) => {
+    const w = world({
+      staging: ['s1'],
+      remote: 's1',
+      trees: { leak: { 'src/browser.ts': `${line}\n` }, sq: squashTree },
+    });
+    const deps = harness(w, {
+      publicRemote: true,
+      copybara: (cw, workflow) => (workflow === 'export' ? adds('leak', 'fix')(cw) : adds('sq')(cw)),
+      gate: (shas) => {
+        const outcome = aiHoldOn('leak')(shas);
+        return outcome.held ? { ...outcome, held: { ...outcome.held, aiFindings: [found] } } : outcome;
+      },
+    });
+    return { w, deps };
+  };
+  const fixed = { 'src/browser.ts': 'const help = "open the example tile from the example portal";\n' };
+
+  it.each([
+    ['three dots', 'open the zz-acme tile ... zz-acme portal'],
+    ['an ellipsis character', 'open the zz-acme tile … zz-acme portal'],
+  ])('publishes the squash once every part of a finding elided with %s is gone', async (_name, text) => {
+    const { w, deps } = elidedRun(elided(text), fixed);
+    expect(await runExport(deps)).toBe(0);
+    expect(w.gated).toEqual([['leak', 'fix'], ['sq']]);
+    expect(w.pushes).toEqual(['sq']);
+    expect(w.status).toMatchObject({ status: 'ok', squashReason: 'ai-hold-fixed-forward' });
+  });
+
+  it('records each part as a quote, and holds while any one of them is still published', async () => {
+    const found = elided('open the zz-acme tile ... zz-acme portal');
+    const { w, deps } = elidedRun(found, { 'src/browser.ts': 'const help = "see the zz-acme portal";\n' });
+    expect(await runExport(deps)).toBe(2);
+    expect(w.gated).toEqual([['leak', 'fix']]);
+    expect(w.pushes).toEqual([]);
+    expect(w.aiHolds).toEqual([
+      { originRev: 'rev-leak', findings: [found], texts: ['open the zz-acme tile', 'zz-acme portal'] },
+    ]);
+  });
+
+  it('records only the parts that are on the finding line', async () => {
+    const found = elided('open the zz-acme tile ... the zz-acme portals list');
+    const { w, deps } = elidedRun(found, { 'src/browser.ts': 'const help = "open the zz-acme tile";\n' });
+    expect(await runExport(deps)).toBe(2);
+    expect(w.gated).toEqual([['leak', 'fix']]);
+    expect(w.aiHolds).toEqual([{ originRev: 'rev-leak', findings: [found], texts: ['open the zz-acme tile'] }]);
+  });
+
+  it.each([
+    ['too short', 'open ... tile ... portal'],
+    ['not on its line', 'show the zz-acme tiles ... the zz-acme portals list'],
+  ])('keeps a finding unprovable, holding every commit, when each part is %s', async (_name, text) => {
+    const found = elided(text);
+    const { w, deps } = elidedRun(found, fixed);
+    expect(await runExport(deps)).toBe(2);
+    expect(w.gated).toEqual([['leak', 'fix']]);
+    expect(w.pushes).toEqual([]);
+    expect(w.aiHolds).toEqual([{ originRev: 'rev-leak', findings: [found], texts: null }]);
+  });
+});
+
 describe('runExport never reads again what an earlier run AI-held', () => {
   const leak = 'use the zz-acme tile';
   const finding = { file: 'src/browser.ts', line: 1, text: leak, why: 'client name' };

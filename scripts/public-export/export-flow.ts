@@ -20,7 +20,7 @@ export interface AiHoldRecord {
   /** Null when the held commit could not be resolved: its quotes cannot be proven, so it holds every commit. */
   originRev: string | null;
   findings: AiFinding[];
-  /** Each finding's quote, proven on its finding's line in the held commit; null when any could not be. */
+  /** Every finding's quotes, each proven on its finding's line in the held commit; null when any finding has none. */
   texts: string[] | null;
   /** Saved before the commit's AI read and replaced by its verdict, so a run that dies mid-read leaves a hold. */
   pending?: true;
@@ -28,6 +28,26 @@ export interface AiHoldRecord {
 
 function isQuote(text: unknown): boolean {
   return typeof text === 'string' && text.trim() === text && text.length >= MIN_HELD_TEXT && !/[\r\n]/.test(text);
+}
+
+/**
+ * The quotes a finding's text may stand for: the whole text, and each part between its ellipses, since an AI that
+ * shortens a line elides its middle and leaves no whole quote of it.
+ */
+function quoteParts(finding: unknown): { whole: string | null; parts: string[] } {
+  const text = (finding as Partial<AiFinding> | null)?.text;
+  if (typeof text !== 'string') return { whole: null, parts: [] };
+  const trimmed = text.trim();
+  const parts = trimmed.split(/\.\.\.|\u2026/).map((part) => part.trim());
+  return {
+    whole: isQuote(trimmed) ? trimmed : null,
+    parts: parts.length > 1 ? [...new Set(parts.filter(isQuote))] : [],
+  };
+}
+
+function quoteCandidates(finding: unknown): string[] {
+  const { whole, parts } = quoteParts(finding);
+  return whole === null ? parts : [whole, ...parts];
 }
 
 export function isAiHoldRecord(value: unknown): value is AiHoldRecord {
@@ -39,14 +59,12 @@ export function isAiHoldRecord(value: unknown): value is AiHoldRecord {
   if (record.pending !== undefined && record.pending !== true) return false;
   if (record.texts === null) return true;
   if (!resolved || record.pending) return false;
-  const findings = record.findings;
+  if (!Array.isArray(record.texts) || record.findings.length === 0) return false;
+  const texts: unknown[] = record.texts;
+  const candidates = record.findings.map(quoteCandidates);
   return (
-    Array.isArray(record.texts) &&
-    record.texts.length > 0 &&
-    record.texts.length === findings.length &&
-    record.texts.every(
-      (text, index) => isQuote(text) && text === (findings[index] as AiFinding | undefined)?.text?.trim(),
-    )
+    texts.every((text) => candidates.some((quotes) => quotes.includes(text as string))) &&
+    candidates.every((quotes) => quotes.some((quote) => texts.includes(quote)))
   );
 }
 
@@ -131,25 +149,30 @@ function requireOriginRev(deps: ExportDeps, sha: string): string {
   return rev;
 }
 
-/** Each finding's trimmed quote, or null when any finding does not quote its own line of its own file. */
+/**
+ * Each finding's quotes found on its own line of its own file: its whole text when that is there, else every
+ * elided part that is. Null when any finding has none.
+ */
 function provableTexts(deps: ExportDeps, sha: string, findings: AiFinding[]): string[] | null {
   if (findings.length === 0) return null;
   const texts: string[] = [];
   for (const finding of findings as unknown[]) {
     if (typeof finding !== 'object' || finding === null) return null;
-    const { file, line, text } = finding as AiFinding;
-    if (typeof file !== 'string' || typeof text !== 'string') return null;
+    const { file, line } = finding as AiFinding;
+    if (typeof file !== 'string') return null;
     if (typeof line !== 'number' || !Number.isInteger(line) || line < 1) return null;
-    const quoted = text.trim();
-    if (quoted.length < MIN_HELD_TEXT || /[\r\n]/.test(quoted)) return null;
     let content: string | null;
     try {
       content = deps.fileAt(sha, file.replace(/^\.\//, ''));
     } catch {
       return null;
     }
-    if (!content?.split('\n')[line - 1]?.includes(quoted)) return null;
-    texts.push(quoted);
+    const named = content?.split('\n')[line - 1];
+    if (named === undefined) return null;
+    const { whole, parts } = quoteParts(finding);
+    const found = whole !== null && named.includes(whole) ? [whole] : parts.filter((part) => named.includes(part));
+    if (found.length === 0) return null;
+    texts.push(...found);
   }
   return texts;
 }
