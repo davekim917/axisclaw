@@ -58,12 +58,16 @@ in full.
 - **Starting one.** With no `PROJECT.md`, draft it with the owner: propose the threads
   that belong to it from the workgroup's `queue.md` and its recent threads, and the
   owner confirms the list once. A thread belongs to one live project at most, so
-  leave out any that another live project lists.
+  leave out any that another live project lists. Then send the confirmed list to the
+  workgroup's Anderton and ask it to hand those threads over. Each thread goes into
+  `PROJECT.md` only when it arrives, together with its open entries and the
+  workgroup's notes on it, by the handoff below. Until then it stays the workgroup's.
 - **One writer, one owner.** Only the project's Anderton writes its folder (while it
   has none, see below), and only the workgroup's Anderton writes `RUNBOOK.md`. A thread the project's Anderton opens
   goes on its list at once. Every other thread moves through the workgroup's Anderton:
-  it sends the `threadId` and that thread's open `queue.md` entries by SendMessage, the
-  project's Anderton adds both and confirms, and only then does the workgroup's
+  it sends the `threadId`, that thread's open `queue.md` entries and anything else it
+  tracks about the thread (a status list, say) by SendMessage, the
+  project's Anderton adds them and confirms, and only then does the workgroup's
   Anderton drop them from its own queue. A thread that belongs to another project goes
   back to the workgroup's Anderton, never across. A call the owner makes that reaches
   beyond the project goes to the workgroup's Anderton for the ledger.
