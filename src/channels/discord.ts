@@ -443,20 +443,6 @@ export function getKnownDiscordBots(): ReadonlyMap<string, DiscordBotIdentity> {
   return knownDiscordBots;
 }
 
-// Read by the patched @chat-adapter/discord at message-arrival time to admit sibling NanoClaw bots while dropping
-// unrelated bots; keep the property name in sync with the patch.
-const NANOCLAW_DISCORD_SIBLINGS = '__nanoclawDiscordSiblings';
-
-interface GlobalWithSiblings {
-  [NANOCLAW_DISCORD_SIBLINGS]?: Set<string>;
-}
-
-function publishSiblingId(userId: string): void {
-  const g = globalThis as unknown as GlobalWithSiblings;
-  if (!g[NANOCLAW_DISCORD_SIBLINGS]) g[NANOCLAW_DISCORD_SIBLINGS] = new Set();
-  g[NANOCLAW_DISCORD_SIBLINGS].add(userId);
-}
-
 /**
  * One REST call at adapter init, cached for the process; null on any failure (mention rewriting then no-ops). Hard
  * timeout because channel-registry awaits factories serially, so a stalled call at boot would block every later
@@ -935,7 +921,6 @@ for (const ws of workspaces) {
       if (identity) {
         knownDiscordBots.set(ws.channelType, identity);
         warmChannelDirectory();
-        publishSiblingId(identity.userId);
       } else {
         log.warn('Discord bot identity unavailable — outbound @-mentions for this bot will not resolve', {
           channelType: ws.channelType,
@@ -983,8 +968,8 @@ for (const ws of workspaces) {
           return raw?.mentions?.some((mention) => mention.id === identity.userId) === true;
         },
         threadRecoveredRootMention: (platformId, message) => openRecoveredMentionThread(rest, platformId, message),
-        // Matches the live Gateway patch: self echoes are removed by the bridge; among other bots only known NanoClaw
-        // siblings are admitted.
+        // Self echoes are removed by the bridge; among other bots only known NanoClaw siblings are admitted. The live
+        // gateway forwards every bot's message, so recovery is the stricter of the two.
         allowRecoveredBotMessage: (message) => {
           const authorId = message.author.userId;
           return authorId !== identity?.userId && [...knownDiscordBots.values()].some((bot) => bot.userId === authorId);

@@ -1,0 +1,15 @@
+diff --git a/dist/index.js b/dist/index.js
+index 4d42fc3..5bc33f5 100644
+--- a/dist/index.js
++++ b/dist/index.js
+@@ -1889,8 +1889,8 @@ var DiscordAdapter = class _DiscordAdapter {
+         "POST",
+         {
+           name: threadName,
+-          auto_archive_duration: 1440
+-          // 24 hours
++          auto_archive_duration: 10080
++          // 1 week
+         }
+       );
+       const result = await response.json();

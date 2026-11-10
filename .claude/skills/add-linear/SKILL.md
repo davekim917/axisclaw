@@ -60,7 +60,7 @@ import './linear.js';
 Pinned to an exact version — the supply-chain policy rejects ranges and `latest`:
 
 ```nc:dep
-@chat-adapter/linear@4.41.1
+@chat-adapter/linear@4.44.0
 ```
 
 ### 4. Build and validate

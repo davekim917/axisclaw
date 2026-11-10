@@ -45,7 +45,7 @@ import './discord.js';
 Pinned to an exact version — the supply-chain policy rejects ranges and `latest`:
 
 ```nc:dep
-@chat-adapter/discord@4.41.1
+@chat-adapter/discord@4.44.0
 ```
 
 ### 4. Build and validate

@@ -321,6 +321,105 @@ describe('Slack inbound through the real adapter and Socket Mode client', () => 
     expect(inbound[0]!.message).toMatchObject({ isMention: false, isDM: false });
   });
 
+  it('keeps a list from Slack’s composer as a list, nested item included', async () => {
+    inbound.length = 0;
+    const item = (text: string) => ({ type: 'rich_text_section', elements: [{ type: 'text', text }] });
+    await sendEnvelope(
+      'env-list',
+      message({
+        type: 'message',
+        channel: CHANNEL,
+        channel_type: 'channel',
+        user: HUMAN,
+        text: 'steps:\n• build\n• ship\n    ◦ tag it',
+        ts: '1790000010.000100',
+        blocks: [
+          {
+            type: 'rich_text',
+            block_id: 'b0',
+            elements: [
+              { type: 'rich_text_section', elements: [{ type: 'text', text: 'steps:\n' }] },
+              { type: 'rich_text_list', style: 'bullet', indent: 0, elements: [item('build'), item('ship')] },
+              { type: 'rich_text_list', style: 'bullet', indent: 1, elements: [item('tag it')] },
+            ],
+          },
+        ],
+      }),
+    );
+    await nextInbound(1);
+
+    expect(inbound[0]!.message.content).toMatchObject({ text: 'steps:\n\n- build\n- ship\n  - tag it' });
+  });
+
+  it('reads an integration’s Block Kit message from its blocks, not its notification text', async () => {
+    inbound.length = 0;
+    await sendEnvelope(
+      'env-blocks',
+      message({
+        type: 'message',
+        channel: CHANNEL,
+        channel_type: 'channel',
+        user: HUMAN,
+        text: 'Deploy report',
+        ts: '1790000011.000100',
+        blocks: [
+          { type: 'header', text: { type: 'plain_text', text: 'Deploy report' } },
+          { type: 'section', text: { type: 'mrkdwn', text: 'web shipped 3 changes' } },
+        ],
+      }),
+    );
+    await nextInbound(1);
+
+    expect(inbound[0]!.message.content).toMatchObject({ text: 'Deploy report\n\nweb shipped 3 changes' });
+  });
+
+  it('delivers a composer list past the markdown parse budget with its punctuation as typed', async () => {
+    inbound.length = 0;
+    const typed = `${'select source_data.x from schema.table where x = 1; '.repeat(240)}R&D, typed &#95; &lt; &amp; <@U0OTHER>`;
+    await sendEnvelope(
+      'env-long-list',
+      message({
+        type: 'message',
+        channel: CHANNEL,
+        channel_type: 'channel',
+        user: HUMAN,
+        text: `• ${typed.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;')} and code \`&amp;#95;\``,
+        ts: '1790000012.000100',
+        blocks: [
+          {
+            type: 'rich_text',
+            block_id: 'b0',
+            elements: [
+              {
+                type: 'rich_text_list',
+                style: 'bullet',
+                indent: 0,
+                elements: [
+                  {
+                    type: 'rich_text_section',
+                    elements: [
+                      { type: 'text', text: typed },
+                      { type: 'text', text: ' and code ' },
+                      { type: 'text', text: '&#95;', style: { code: true } },
+                    ],
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      }),
+    );
+    await nextInbound(1);
+
+    expect(inbound[0]!.message.content).toMatchObject({ text: `- ${typed} and code \`&#95;\`` });
+    // The adapter's unparsed fallback, the path the decoding serves: the whole body in one text node.
+    expect((inbound[0]!.message.content as { formatted: unknown }).formatted).toEqual({
+      type: 'root',
+      children: [{ type: 'paragraph', children: [{ type: 'text', value: `- ${typed} and code \`&#95;\`` }] }],
+    });
+  });
+
   it('keeps a thread reply in its thread', async () => {
     inbound.length = 0;
     await sendEnvelope(

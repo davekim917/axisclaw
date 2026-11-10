@@ -39,7 +39,7 @@ if ! grep -q "import './github.js';" src/channels/index.ts; then
 fi
 
 echo "STEP: pnpm-install"
-pnpm install @chat-adapter/github@4.41.1
+pnpm install @chat-adapter/github@4.44.0
 
 echo "STEP: pnpm-build"
 pnpm run build

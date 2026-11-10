@@ -1,0 +1,79 @@
+diff --git a/dist/chunk-KGHU3EYG.js b/dist/chunk-KGHU3EYG.js
+index 12c741b..4754813 100644
+--- a/dist/chunk-KGHU3EYG.js
++++ b/dist/chunk-KGHU3EYG.js
+@@ -136,8 +136,14 @@ function replaceRange(text, start, end, replacer, angles) {
+   }
+   return result;
+ }
++// NanoClaw: fences (3+ backticks), double-backtick spans (may cross lines) and one-line
++// single-backtick spans are cut out before the scanner runs, because findCodeEnd reads a
++// double-backtick span as two empty spans and would rewrite the @name inside it.
++var NANOCLAW_CODE_REGION_REGEX = /(`{3,}[\s\S]*?`{3,}|``[\s\S]*?``|`[^`\n]+`)/g;
+ function replaceBareMentions(text, replacer) {
+-  return replaceRange(text, 0, text.length, replacer, true);
++  return text.split(NANOCLAW_CODE_REGION_REGEX).map(
++    (segment, index) => index % 2 === 1 ? segment : replaceRange(segment, 0, segment.length, replacer, true)
++  ).join("");
+ }
+ function maskCodeSpans(text, replacement = " ") {
+   let result = "";
+diff --git a/dist/index.d.ts b/dist/index.d.ts
+index 87849a1..c10079d 100644
+--- a/dist/index.d.ts
++++ b/dist/index.d.ts
+@@ -307,6 +307,8 @@ interface DownloadAttachmentOptions {
+  * holds even for a transport that ignores the signal.
+  */
+ declare function downloadAttachment(value: string, options: DownloadAttachmentOptions): Promise<Buffer>;
++/** NanoClaw: defaults for every downloadAttachment call that does not pass its own. */
++declare function setAttachmentDownloadDefaults(defaults: { limit?: number; transport?: AttachmentTransport }): void;
+ 
+ /**
+  * Standardized error types for chat adapters.
+@@ -404,4 +406,4 @@ declare class NetworkError extends AdapterError {
+     constructor(adapter: string, message?: string, originalError?: Error);
+ }
+ 
+-export { AdapterError, AdapterRateLimitError, type AttachmentTransport, AuthenticationError, BUTTON_STYLE_MAPPINGS, type DownloadAttachmentOptions, type EncryptedTokenData, type FallbackTextOptions, type FileDataInput, NetworkError, type NormalizeCodeFencesOptions, PermissionError, type PlatformName, ResourceNotFoundError, type ToBufferOptions, ValidationError, bufferToDataUri, cardToFallbackText, createEmojiConverter, decodeKey, decryptToken, downloadAttachment, encryptToken, escapeTableCell, extractCard, extractFiles, extractPostableAttachments, isEncryptedTokenData, mapButtonStyle, normalizeCodeFences, renderGfmTable, toBuffer, toBufferSync };
++export { AdapterError, AdapterRateLimitError, type AttachmentTransport, AuthenticationError, BUTTON_STYLE_MAPPINGS, type DownloadAttachmentOptions, type EncryptedTokenData, type FallbackTextOptions, type FileDataInput, NetworkError, type NormalizeCodeFencesOptions, PermissionError, type PlatformName, ResourceNotFoundError, type ToBufferOptions, ValidationError, bufferToDataUri, cardToFallbackText, createEmojiConverter, decodeKey, decryptToken, downloadAttachment, encryptToken, escapeTableCell, extractCard, extractFiles, extractPostableAttachments, isEncryptedTokenData, mapButtonStyle, normalizeCodeFences, renderGfmTable, setAttachmentDownloadDefaults, toBuffer, toBufferSync };
+diff --git a/dist/index.js b/dist/index.js
+index d9f5cd9..37c93a7 100644
+--- a/dist/index.js
++++ b/dist/index.js
+@@ -388,6 +388,11 @@ import { BlockList, isIP } from "net";
+ import { pipeline } from "stream";
+ import { createBrotliDecompress, createGunzip, createInflate } from "zlib";
+ var LIMIT = 25 * 1024 * 1024;
++// NanoClaw: the host sets one download limit for every adapter, and a test can serve bytes without a network.
++var nanoclawDownloadDefaults = {};
++function setAttachmentDownloadDefaults(defaults) {
++  nanoclawDownloadDefaults = { ...nanoclawDownloadDefaults, ...defaults };
++}
+ var REDIRECTS = 5;
+ var TIMEOUT = 3e4;
+ var STATUSES = /* @__PURE__ */ new Set([301, 302, 303, 307, 308]);
+@@ -604,13 +609,13 @@ async function downloadAttachment(value, options) {
+     adapter,
+     headers,
+     hosts,
+-    limit = LIMIT,
++    limit = nanoclawDownloadDefaults.limit ?? LIMIT,
+     onResponse,
+     redirects = REDIRECTS,
+     timeoutMs = TIMEOUT,
+     transport
+   } = options;
+-  const send = transport ?? createTransport(adapter);
++  const send = transport ?? nanoclawDownloadDefaults.transport ?? createTransport(adapter);
+   const signal = AbortSignal.timeout(timeoutMs);
+   let url = validateAttachmentUrl(value, adapter, hosts);
+   try {
+@@ -695,6 +700,7 @@ export {
+   normalizeCodeFences,
+   renderGfmTable,
+   replaceBareMentions,
++  setAttachmentDownloadDefaults,
+   toBuffer,
+   toBufferSync
+ };

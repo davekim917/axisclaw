@@ -469,6 +469,115 @@ describe('createChatSdkBridge.deliver — ask_question cards', () => {
     expect(msg.fallbackText?.startsWith(renderedTitle)).toBe(true);
   });
 
+  it('posts no card whose question Slack would cut beside its buttons, so Approve never grants unseen scope', async () => {
+    const { calls, postMessage } = makePostCapture();
+    const bridge = createChatSdkBridge({
+      adapter: stubAdapter({ postMessage }),
+      channelType: 'slack',
+      supportsThreads: false,
+    });
+    const packages = Array.from({ length: 20 }, (_, i) => `@example-scope/package-with-a-long-name-${i}`);
+    const question = `Install these packages?\n\n${packages.map((name) => `- ${name}: ${'why it is needed '.repeat(7)}`).join('\n')}`;
+    expect(question.length).toBeGreaterThan(3000);
+
+    await expect(
+      bridge.deliver('slack:C123', null, {
+        kind: 'chat-sdk',
+        content: {
+          type: 'ask_question',
+          questionId: 'q-scope',
+          title: 'Approve install',
+          question,
+          options: ['Approve'],
+        },
+      }),
+    ).rejects.toThrow('where Slack cuts it');
+    expect(calls).toEqual([]);
+  });
+
+  it('posts no card whose options Slack would cut to the same label', async () => {
+    const { calls, postMessage } = makePostCapture();
+    const bridge = createChatSdkBridge({
+      adapter: stubAdapter({ postMessage }),
+      channelType: 'slack',
+      supportsThreads: false,
+    });
+    const prefix = 'Deploy the example service with the new connection pool settings to ';
+    const options = [`${prefix}staging only`, `${prefix}production too`];
+    expect(options.every((label) => label.length > 75 && label.startsWith(prefix.slice(0, 74)))).toBe(true);
+
+    await expect(
+      bridge.deliver('slack:C123', null, {
+        kind: 'chat-sdk',
+        content: { type: 'ask_question', questionId: 'q-labels', title: 'Deploy', question: 'Where?', options },
+      }),
+    ).rejects.toThrow('where Slack cuts them');
+    expect(calls).toEqual([]);
+  });
+
+  it('posts no card whose question Slack would cut once it expands emoji placeholders', async () => {
+    const { calls, postMessage } = makePostCapture();
+    const bridge = createChatSdkBridge({
+      adapter: stubAdapter({ postMessage }),
+      channelType: 'slack',
+      supportsThreads: false,
+    });
+    const question = `${'{{emoji:info}}'.repeat(180)} Also install example-extra-package`;
+    expect(question.length).toBeLessThanOrEqual(3000);
+
+    await expect(
+      bridge.deliver('slack:C123', null, {
+        kind: 'chat-sdk',
+        content: {
+          type: 'ask_question',
+          questionId: 'q-emoji',
+          title: 'Approve install',
+          question,
+          options: ['Approve'],
+        },
+      }),
+    ).rejects.toThrow('once Slack expands its emoji');
+    expect(calls).toEqual([]);
+  });
+
+  it('keeps a question up to Slack’s cap whole in the card description', async () => {
+    const { calls, postMessage } = makePostCapture();
+    const bridge = createChatSdkBridge({
+      adapter: stubAdapter({ postMessage }),
+      channelType: 'slack',
+      supportsThreads: false,
+    });
+    const question = `Run \`print(2 ** 3)\`? ${'context '.repeat(355)}`;
+    expect(question.length).toBeGreaterThan(2800);
+    expect(question.length).toBeLessThanOrEqual(3000);
+
+    await bridge.deliver('slack:C123', null, {
+      kind: 'chat-sdk',
+      content: { type: 'ask_question', questionId: 'q-fits', title: 'Run code', question, options: ['Approve'] },
+    });
+
+    expect((calls[0].message as { card: { subtitle?: string } }).card.subtitle).toBe(question);
+  });
+
+  it('posts a secret-intake card past Slack’s cap whole on Discord, which shows 4,096 characters', async () => {
+    const { calls, postMessage } = makePostCapture();
+    const bridge = createChatSdkBridge({
+      adapter: stubAdapter({ postMessage }),
+      channelType: 'discord',
+      supportsThreads: false,
+    });
+    const body = `Paste the key for these hosts:\n${Array.from({ length: 60 }, (_, i) => `- api-${i}.example.com`).join('\n')}\n${'note '.repeat(400)}`;
+    expect(body.length).toBeGreaterThan(3000);
+    expect(body.length).toBeLessThan(4096);
+
+    await bridge.deliver('discord:G1:C1', null, {
+      kind: 'chat-sdk',
+      content: { type: 'secret_intake', intakeId: 'intake-1', title: 'Key needed', body },
+    });
+
+    expect((calls[0].message as { card: { subtitle?: string } }).card.subtitle).toBe(body);
+  });
+
   it('puts decision context in the native card description used by Discord and Slack', async () => {
     const { calls, postMessage } = makePostCapture();
     const bridge = createChatSdkBridge({

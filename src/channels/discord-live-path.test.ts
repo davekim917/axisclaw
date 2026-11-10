@@ -61,6 +61,7 @@ const unfaked: string[] = [];
 let renameRetryAfter: string | null = null;
 let renameForbidden = false;
 const posted: Array<{ path: string; body: Record<string, unknown> }> = [];
+const threadsOpened: Array<{ path: string; body: Record<string, unknown> }> = [];
 const inbound: Array<{ platformId: string; threadId: string | null; message: InboundMessage }> = [];
 const waiters: Array<() => void> = [];
 let registry: typeof import('./channel-registry.js');
@@ -105,7 +106,10 @@ function rest(method: string, path: string, body: Record<string, unknown>): [num
     posted.push({ path, body });
     return [200, { id: '123456789000000099', channel_id: path.split('/')[2], content: body.content, author: botUser }];
   }
-  if (method === 'POST' && /^\/channels\/\d+\/messages\/\d+\/threads$/.test(path)) return [201, thread];
+  if (method === 'POST' && /^\/channels\/\d+\/messages\/\d+\/threads$/.test(path)) {
+    threadsOpened.push({ path, body });
+    return [201, thread];
+  }
   unfaked.push(`${method} ${path}`);
   return [404, { message: 'Unknown', code: 0 }];
 }
@@ -267,7 +271,7 @@ describe('Discord inbound and outbound through the real adapter and discord.js g
     );
   });
 
-  it('delivers a guild @mention that discord.js turns circular once it builds its Message', async () => {
+  it('delivers a guild @mention that discord.js turns circular, in a thread it opens for a week', async () => {
     inbound.length = 0;
     dispatch(
       'MESSAGE_CREATE',
@@ -288,6 +292,10 @@ describe('Discord inbound and outbound through the real adapter and discord.js g
     expect(inbound[0]!.message.content).toMatchObject({
       text: expect.stringContaining('status please'),
       author: expect.objectContaining({ userId: HUMAN }),
+    });
+    expect(threadsOpened).toContainEqual({
+      path: `/channels/${CHANNEL}/messages/123456789000000010/threads`,
+      body: expect.objectContaining({ auto_archive_duration: 10080 }),
     });
   });
 
@@ -357,6 +365,29 @@ describe('Discord inbound and outbound through the real adapter and discord.js g
     expect(attachments[0]!.data).toBeUndefined();
     expect(Buffer.from(attachments[1]!.data ?? '', 'base64').length).toBe(30 * MiB);
     expect(requests).toEqual([{ url: big, authorization: undefined }]);
+  });
+
+  it('delivers another bot’s @mention as a bot-authored mention, the way a sibling agent’s handoff arrives', async () => {
+    inbound.length = 0;
+    const member = { roles: [], joined_at: new Date(0).toISOString(), deaf: false, mute: false };
+    const otherBot = { id: '123456789000000030', username: 'example-sibling', discriminator: '0', bot: true };
+    dispatch(
+      'MESSAGE_CREATE',
+      messageCreate('123456789000000031', {
+        channel_id: CHANNEL,
+        guild_id: GUILD,
+        author: { ...otherBot, global_name: null, avatar: null },
+        member,
+        content: `<@${BOT}> your turn`,
+        mentions: [{ ...botUser, member }],
+      }),
+    );
+    await nextInbound(1);
+
+    expect(inbound[0]!.message).toMatchObject({ isMention: true, isDM: false });
+    expect(inbound[0]!.message.content).toMatchObject({
+      author: expect.objectContaining({ userId: otherBot.id, isBot: true }),
+    });
   });
 
   it('delivers a plain guild message as not a mention', async () => {

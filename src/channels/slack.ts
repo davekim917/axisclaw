@@ -545,6 +545,36 @@ for (const channelType of declarationOnlySlackTypes(slackEnv)) {
   registerChannelAdapter(channelType, { defaults: SLACK_DEFAULTS, factory: () => null });
 }
 
+/**
+ * The adapter writes literal punctuation from a message's rich_text blocks as decimal references (`&#95;`), `&`, `<`
+ * and `>` included, and its markdown parse decodes them after converting Slack markup. A message past its parse
+ * budget skips the parse and keeps them encoded, so the agent would read `source&#95;data`. Decoding them after the
+ * adapter's own fallback conversion keeps that order: decoding first would turn a typed `&lt;` into `<` and a typed
+ * `<@U…>` into a mention. Code is left alone, as the parse leaves it: a code run is escaped, not encoded, so a
+ * reference in it was typed.
+ */
+function decodeFallbackReferences(slackAdapter: ReturnType<typeof createSlackAdapter>): void {
+  const converter = (slackAdapter as unknown as { formatConverter?: { incomingFallbackText?(mrkdwn: string): string } })
+    .formatConverter;
+  if (!converter || typeof converter.incomingFallbackText !== 'function') {
+    log.warn('Slack adapter exposes no incomingFallbackText; an over-budget list keeps its punctuation references');
+    return;
+  }
+  const fallback = converter.incomingFallbackText.bind(converter);
+  const decode = (prose: string) =>
+    prose.replace(/&#(\d{1,7});/g, (reference, code: string) => {
+      const point = Number(code);
+      return point > 0 && point <= 0x10ffff ? String.fromCodePoint(point) : reference;
+    });
+  converter.incomingFallbackText = (mrkdwn) =>
+    fallback(mrkdwn)
+      .split(SLACK_CODE_REGION)
+      .map((part, index) => (index % 2 === 1 ? part : decode(part)))
+      .join('');
+}
+
+const SLACK_CODE_REGION = /(`{3,}[\s\S]*?`{3,}|``[\s\S]*?``|`[^`\n]+`)/;
+
 /** Provisioning calls this after adding a token pair so the adapter starts without a host restart. */
 export function registerSlackWorkspace(ws: SlackWorkspace): void {
   registerChannelAdapter(ws.channelType, {
@@ -571,6 +601,7 @@ export function registerSlackWorkspace(ws: SlackWorkspace): void {
       (slackAdapter as unknown as { name: string }).name = ws.channelType;
       // Installed beside the adapter because it wraps the adapter's own Web client; see slack-subtext.ts.
       installSlackSubtextBlocks(slackAdapter);
+      decodeFallbackReferences(slackAdapter);
       const client = new WebClient(ws.botToken, { slackApiUrl: slackApiUrl() });
 
       // Setup publishes the identity provisionally before Socket Mode can deliver inbound events, and rolls it back

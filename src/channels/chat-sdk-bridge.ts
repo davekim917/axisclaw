@@ -18,6 +18,7 @@ import {
   TextInput,
   type ActionEvent,
   type CardChild,
+  type CardElement,
   type Adapter,
   type ConcurrencyStrategy,
   type Message as ChatMessage,
@@ -26,7 +27,7 @@ import {
   getNodeChildren,
   isListNode,
 } from 'chat';
-import { setAttachmentDownloadDefaults } from '@chat-adapter/shared';
+import { createEmojiConverter, setAttachmentDownloadDefaults } from '@chat-adapter/shared';
 
 import { INBOUND_ATTACHMENT_MAX_BYTES, INBOUND_ATTACHMENTS_PER_MESSAGE_MAX_BYTES } from '../config.js';
 import { log } from '../log.js';
@@ -669,6 +670,21 @@ async function clearDiscordComponents(threadId: string, botToken: string, messag
   }
 }
 
+/**
+ * Slack's adapter cuts a card subtitle past 3,000 characters and a button label past 75, measured after it expands
+ * emoji placeholders, and keeps the card's buttons, so an approval would hide part of what Approve grants or show two
+ * different choices alike. Such a card is not posted, as Slack refused it before 4.42.
+ */
+const CARD_TEXT_MAX = 3000;
+const BUTTON_LABEL_MAX = 75;
+const slackEmoji = createEmojiConverter('slack');
+
+function cardWithBody(title: string, body: string, children: CardChild[], slack: boolean): CardElement {
+  if (slack && slackEmoji(body).length > CARD_TEXT_MAX)
+    throw new Error(`card body is over ${CARD_TEXT_MAX} characters once Slack expands its emoji, where Slack cuts it`);
+  return Card({ title, subtitle: body, children });
+}
+
 export function splitForLimit(text: string, limit: number): string[] {
   if (text.length <= limit) return [text];
   const chunks: string[] = [];
@@ -708,6 +724,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
   };
   const bridgeChannelType = config.channelType ?? adapter.name;
   const isDiscordBridge = bridgeChannelType === 'discord' || bridgeChannelType.startsWith('discord-');
+  const isSlackBridge = bridgeChannelType === 'slack' || bridgeChannelType.startsWith('slack-');
   // The instance name becomes a webhook route segment (the route regex is
   // [^/?]+) and ':' is the state-namespace delimiter — reject anything that
   // would break either, at construction time rather than at first webhook.
@@ -1205,11 +1222,12 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
                   ...(isDiscordBridge
                     ? { markdown: `**${title}**\n\n${render.question}\n\n${resolution}` }
                     : {
-                        card: Card({
+                        card: cardWithBody(
                           title,
-                          subtitle: render.question,
-                          children: [CardText(resolution, { style: 'muted' })],
-                        }),
+                          render.question,
+                          [CardText(resolution, { style: 'muted' })],
+                          isSlackBridge,
+                        ),
                         fallbackText: `${title}\n\n${render.question}\n\n${resolution}`,
                       }),
                 }
@@ -1372,10 +1390,10 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       if (content.type === 'secret_intake' && typeof content.intakeId === 'string') {
         const title = fitCardTitle(typeof content.title === 'string' ? content.title : 'Secret requested');
         const body = typeof content.body === 'string' ? content.body : '';
-        const card = Card({
+        const card = cardWithBody(
           title,
-          subtitle: body,
-          children: [
+          body,
+          [
             Actions([
               Button({
                 id: `${SECRET_INTAKE_ACTION_PREFIX}${content.intakeId}`,
@@ -1384,7 +1402,8 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
               }),
             ]),
           ],
-        });
+          isSlackBridge,
+        );
         const result = await adapter.postMessage(tid, { card, fallbackText: `${title}\n\n${body}` });
         return result?.id;
       }
@@ -1411,12 +1430,18 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
             config.maxTextLength,
           );
         }
-        const card = Card({
-          title: displayTitle,
-          // Both adapters render Card.subtitle as the card description; without it the card body is blank beside its
-          // buttons.
-          subtitle: question,
-          children: [
+        const longLabels = isSlackBridge
+          ? options.filter((opt) => slackEmoji(opt.label).length > BUTTON_LABEL_MAX)
+          : [];
+        if (longLabels.length)
+          throw new Error(
+            `${longLabels.length} option label(s) over ${BUTTON_LABEL_MAX} characters once Slack expands its emoji, where Slack cuts them`,
+          );
+        // The question is the card's body; without it the card is blank beside its buttons.
+        const card = cardWithBody(
+          displayTitle,
+          question,
+          [
             Actions(
               // Encode button id/value with the option index rather than the
               // full value. Telegram caps callback_data at 64 bytes, and
@@ -1433,7 +1458,8 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
               ),
             ),
           ],
-        });
+          isSlackBridge,
+        );
         const result = await adapter.postMessage(tid, {
           card,
           fallbackText: `${displayTitle}\n\n${question}\nOptions: ${options.map((o) => o.label).join(', ')}`,

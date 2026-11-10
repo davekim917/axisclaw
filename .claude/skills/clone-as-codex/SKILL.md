@@ -648,11 +648,11 @@ A sibling's shell inherits the credential its container runs on — `claude -p`,
 
 See `container/agent-runner/src/providers/secret-env.ts`. Out of scope: an agent that bypasses the proxy (`NO_PROXY`) and sends data over direct HTTP to a remote it controls.
 
-### Discord-specific: bot filter relaxation
+### Discord-specific: bot messages
 
-Trunk ships a `pnpm patch` on `@chat-adapter/discord` (`patches/@chat-adapter__discord@4.26.0.patch`) that relaxes the upstream "drop all bot-authored messages" filter to "drop only self-echoes, or non-sibling bots." The sibling-allowlist is populated by `src/channels/discord.ts` via a process-wide `globalThis.__nanoclawDiscordSiblings` Set, one entry per bot identity fetched at adapter init via `GET /users/@me`.
+The host runs Discord's gateway in forwarding mode, which hands every bot's message to the host. A sibling bot's `@mention` therefore reaches the other agent as a bot-authored mention (`src/channels/discord-live-path.test.ts`). Both bots must be loaded in the same host process, so each one's identity, fetched at adapter init via `GET /users/@me`, can turn `@username` into `<@id>`. This is the default: `DISCORD_BOT_TOKEN` and `DISCORD_BOT_TOKEN_<SUFFIX>` are both read at startup.
 
-For sibling collab to work in Discord, both bots must be loaded in the same host process (which is the default — both `DISCORD_BOT_TOKEN` and `DISCORD_BOT_TOKEN_<SUFFIX>` are read at startup). A third-party Discord bot in the same guild (e.g. MEE6, a webhook bot) is NOT in the allowlist, so its messages do not wake any NanoClaw agent. Operators with chatty third-party bots may want a custom allowlist; today the boundary is "bots my host loaded = trusted."
+A third-party bot in the same guild (MEE6, a webhook) is not filtered on the live path either: its messages reach the router like anyone else's, under the wiring's engage rules. Only missed-message recovery restricts bots to known NanoClaw siblings (`allowRecoveredBotMessage` in `src/channels/discord.ts`).
 
 ## Guard parity contract
 
