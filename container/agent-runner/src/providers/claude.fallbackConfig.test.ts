@@ -101,7 +101,7 @@ describe('a claude provider fallback reaches the provider without a container-si
     // and rejected every pinned alias, because the host validates only AFTER
     // resolving. The host now resolves before emitting, so there is nothing
     // left to get wrong.
-    expect(fallbackSpawn({ model: 'fable' }).model).toBe('claude-fable-5-1[1m]');
+    expect(fallbackSpawn({ model: 'fable' }).model).toBe('claude-fable-5-2[1m]');
     expect(fallbackSpawn({ model: 'sonnet5' }).model).toBe('claude-sonnet-5');
     expect(fallbackSpawn({ model: 'haiku45' }).model).toBe('claude-haiku-4-5');
     expect(fallbackSpawn({ model: 'opus5' }).model).toBe('claude-opus-5[1m]');

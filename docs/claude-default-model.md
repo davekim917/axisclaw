@@ -1,8 +1,72 @@
 # Migration: the Claude default model
 
-## Current: Haiku default moves to 5.5 (2026-10-18)
+## Current: Fable default moves to 5.2 (2026-11-10)
 
-This section is the current migration. Opus, Sonnet and Fable defaults do not move. The Haiku family default (model and effort), the container's pinned CLI, and the host's own Haiku calls (thread and session titles, now through the Claude Code CLI) move.
+This section is the current migration. Opus, Sonnet and Haiku defaults do not move, and no family default effort moves. The Fable family default model and the container's pinned CLI move.
+
+**What moves.**
+- `DEFAULT_FABLE_MODEL` (`src/flag-parser.ts`) is `claude-fable-5-2[1m]`, was `claude-fable-5-1[1m]`. Every Claude path whose model resolves through the word `fable` runs Fable 5.2: a chat `-m fable`, a `fable` wiring, group, task or `providerFallback` pin, a subagent's `model: fable`, and any call the CLI makes through the word (resolved through `ANTHROPIC_DEFAULT_FABLE_MODEL`, which `claudeSpawnEnv` sets from the same constant). Unpinned groups resolve to Opus and do not move.
+- A frozen id (`claude-fable-5-1[1m]`, `claude-fable-5[1m]`) or version alias (`fable51`, `fable5`, …) does **not** move. New pinned aliases: `fable52` / `fable5-2` / `fable-5-2`.
+- Effort does not move: `defaultEffortForModel` gives `medium` to the word `fable` and every `claude-fable-*` id wherever no layer sets an effort, as before. Fable 5.2 takes `-e low` through `max`.
+
+Fable 5.2 is listed at $8 / $40 per MTok with $0.20 cache reads, with a 1M context window (Claude Code 2.1.321 changelog).
+
+**Detect.** A path moves when its chain ends at the word `fable`. A path that names Fable by full id or version alias stays where it is; to make it follow this and every later bump, repin it to `fable`. Check every layer:
+
+```bash
+# 1. Groups: model / legacy defaultModel / providerConfig.model / providerFallback.model (indented lines are inside providerConfig or providerFallback)
+grep -HiE '"(model|defaultModel)": *"(fable|claude-fable-[^"]*|fable[0-9-]+)"' groups/*/container.json
+# 2. Channel wirings
+pnpm exec tsx scripts/q.ts data/v2.db "select mga.id, mg.name, mga.agent_group_id, mga.default_model, mga.default_effort from messaging_group_agents mga join messaging_groups mg on mg.id = mga.messaging_group_id where lower(coalesce(mga.default_model,'')) like '%fable%'"
+# 3. Task series (pending and paused; repeat after in-flight fires finish)
+ncl tasks list --json | grep -iB1 -A1 '"model_pin": "[^"]*fable'
+# 4. Subagent frontmatter (group-local, then plugin agents)
+grep -rHiE '^model: *[^ ]*fable' groups/*/.claude/agents; find ~/plugins -type d -name agents -not -path '*/node_modules/*' -exec grep -rHiE '^model: *[^ ]*fable' {} +
+# 5. Session stickies: run the sticky sweep in History: 2026-09-22 (Detect §4) and look for `fable`.
+```
+
+Precedence facts that decide whether a repin takes effect:
+- A pure scheduled-task fire ignores session stickies (`effectiveTurnSettings`, `container/agent-runner/src/poll-loop.ts`).
+- A group's `providerConfig.model` outranks the channel wiring (`container/agent-runner/src/providers/claude.ts`: `input.model ?? stickyConfig.model ?? NANOCLAW_CLAUDE_MODEL ?? ANTHROPIC_DEFAULT_OPUS_MODEL`), so a wiring change does nothing for a group whose `providerConfig` sets a model.
+- `providerConfig.model`, `providerFallback.model` and legacy `defaultModel` have no `ncl` verb; edit `groups/<g>/container.json` directly (check `git -C groups status` first).
+
+**Why.** Fable 5.2 replaces Fable 5.1 as Anthropic's Fable model. The container CLI must know the id: an id the CLI binary does not contain silently loses its family behaviour (1M window, effort ladder). 2.1.302 has no `claude-fable-5-2`; 2.1.321 adds it. This change pins exactly claude-code 2.1.322, with agent SDK 0.3.322 in the same patch (`setup/lib/image-version-pins.test.ts` enforces the pair and `versions.json`). Behaviour changes in between: [docs/dependency-changes/2026-11-10-claude-code-2.1.322.md](dependency-changes/2026-11-10-claude-code-2.1.322.md).
+
+**Fix: keep Fable 5.1 on a path, before deploying.** Pins are data and take effect without a deploy:
+
+```bash
+ncl groups config update --id <group-id> --model claude-fable-5-1[1m]
+ncl wirings update <wiring-id> --default-model claude-fable-5-1[1m]
+ncl tasks repin --all --from-model fable --to-model claude-fable-5-1[1m] --dry-run   # literal match; apply without --dry-run
+```
+
+The reverse, making a frozen path follow the family after deploy: `--model fable` / `--default-model fable` / `ncl tasks repin --all --from-model claude-fable-5-1[1m] --to-model fable` (repeat per frozen spelling the Detect step found). Never pin a live task or wiring to `claude-fable-5-2[1m]` or to `fable` while its container still runs the old CLI (see Deploy).
+
+**Deploy.** In this order:
+1. `scripts/deploy.sh`. It rebuilds the base agent image because `container/` changed, then restarts the host in the same run, with no pause between the two. The rebuild is required: the SDK bump changes the runner's deps hash, and `src/agent-runner-image-check.ts` refuses a spawn from an image whose hash does not match.
+2. Right after the restart, rebuild every `imageTag` group's image (`grep -lE '"imageTag"' groups/*/container.json`). A package image (tag `<image base>:<group-id>`, built by `install_packages`) carries the deps label, so until it is rebuilt that group's new spawns are refused with `Refusing spawn — agent image drift`. Rebuild it with `ncl groups restart --id <group-id> --rebuild`, which also recycles the group's containers. Any other tag is an operator image: one with no deps label passes the check with a warning and would run its old CLI with the new `ANTHROPIC_DEFAULT_FABLE_MODEL`, so rebuild it with its own process on the new base.
+
+A host restart **adopts** running containers, which keep their spawn-time runner, CLI and `ANTHROPIC_DEFAULT_FABLE_MODEL`, so a `fable` pin in an adopted container still means Fable 5.1 until it exits. Recycle a group with `ncl groups restart --id <group-id>` at a quiet moment.
+
+**Verify.**
+
+```bash
+docker inspect <fresh claude container> --format '{{range .Config.Env}}{{println .}}{{end}}' | grep ANTHROPIC_DEFAULT_FABLE_MODEL
+docker exec <fresh claude container> claude --version
+pnpm exec tsx scripts/q.ts data/v2.db "select model, effort, count(*) from turn_usage where ts > '<deploy time>' and model like '%fable%' group by 1,2"
+```
+
+Expect `ANTHROPIC_DEFAULT_FABLE_MODEL=claude-fable-5-2[1m]`, CLI 2.1.322, and Fable rows from fresh containers on `claude-fable-5-2` at `medium` where nothing set an effort. Unpinned groups run Opus, so the bump shows in `turn_usage` only on a turn pinned to Fable. A container that still reads `claude-fable-5-1[1m]` was spawned before the deploy.
+
+**Rollback.**
+- **One path:** apply the Fix commands above, then `ncl groups restart --id <group-id>`.
+- **The fleet default:** set `DEFAULT_FABLE_MODEL` back to `claude-fable-5-1[1m]` and redeploy. The CLI/SDK pins can stay: 2.1.322 still carries `claude-fable-5-1`.
+
+---
+
+## History: 2026-10-18 — Haiku default moves to 5.5
+
+Opus, Sonnet and Fable defaults do not move. The Haiku family default (model and effort), the container's pinned CLI, and the host's own Haiku calls (thread and session titles, now through the Claude Code CLI) move.
 
 **What moves.**
 - `DEFAULT_HAIKU_MODEL` (`src/flag-parser.ts`) is `claude-haiku-5-5`, was `claude-haiku-4-5-20251001`. Every Claude path whose model resolves through the word `haiku` runs Haiku 5.5: a chat `-m haiku`, a `haiku` wiring, group, task or `providerFallback` pin, a subagent's `model: haiku`, and any call the CLI itself makes through the word (the CLI resolves it through `ANTHROPIC_DEFAULT_HAIKU_MODEL`, which `claudeSpawnEnv` sets from the same constant). A frozen `claude-haiku-4-5` id or its `haiku45` alias keeps Haiku 4.5. New pinned aliases: `haiku55` / `haiku5-5` / `haiku-5-5`.

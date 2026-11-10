@@ -34,7 +34,7 @@ ARG INSTALL_CJK_FONTS=false
 # Pin CLI versions for reproducibility. Bump deliberately — unpinned installs
 # mean every rebuild silently picks up the latest and can break in lockstep
 # across all users.
-ARG CLAUDE_CODE_VERSION=2.1.302
+ARG CLAUDE_CODE_VERSION=2.1.322
 ARG AGENT_BROWSER_VERSION=0.38.2
 ARG VERCEL_VERSION=62.4.0
 ARG BUN_VERSION=1.4.2
@@ -525,6 +525,11 @@ COPY --chown=root:root --chmod=0644 codex-system/hooks.json codex-system/require
 # --chmod also lands on the directory COPY creates, which would leave node unable to traverse it.
 RUN chmod 0755 /etc/codex
 
+# Keeps a mod the agent writes from loading (its hooks would run above the runner's guards). Only this file can set
+# it: the SDK's managedSettings option drops pluginConfigs.
+COPY --chown=root:root --chmod=0644 claude-system/managed-settings.json /etc/claude-code/
+RUN chmod 0755 /etc/claude-code
+
 # ---- Workspace + permissions -------------------------------------------------
 # Remap the `node` user+group to UID/GID 1001 before any chowns so the
 # container's runtime UID matches the host's non-root user. Host-side
@@ -577,7 +582,10 @@ RUN unreadable="$(find /opt/remotion \( -type f ! -readable -o -type d ! -execut
     && ! test -w /etc/codex \
     && ! test -w /etc/codex/hooks.json \
     && ! test -w /etc/codex/requirements.toml \
-    && ! test -w /etc/codex/hook-bunfig.toml
+    && ! test -w /etc/codex/hook-bunfig.toml \
+    && test -r /etc/claude-code/managed-settings.json \
+    && ! test -w /etc/claude-code \
+    && ! test -w /etc/claude-code/managed-settings.json
 # The runtime cwd is /workspace/agent (agent-runner's CWD constant, passed to
 # every provider). This WORKDIR only sets the entrypoint process's cwd, but it
 # must still name a path that exists inside the session-dir bind at /workspace:

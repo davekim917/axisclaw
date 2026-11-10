@@ -222,8 +222,9 @@ describe('claudeSpawnEnv', () => {
     // This is the unpinned Claude baseline: Opus [1m], and no effort — the
     // container applies Opus's family default (high), which is the value no
     // host-side env could express without also pinning every other group.
-    // The one deliberate literal: a model bump must change it on purpose.
+    // The deliberate literals: a model bump must change them on purpose.
     expect(pairs(claudeSpawnEnv(cfg())).NANOCLAW_CLAUDE_MODEL).toBe('claude-opus-5-5[1m]');
+    expect(pairs(claudeSpawnEnv(cfg())).ANTHROPIC_DEFAULT_FABLE_MODEL).toBe('claude-fable-5-2[1m]');
     expect(claudeSpawnEnv(cfg()).includes('NANOCLAW_EFFORT_OVERRIDE=')).toBe(false);
   });
 

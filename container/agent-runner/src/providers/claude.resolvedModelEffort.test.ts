@@ -105,6 +105,12 @@ describe('family-default effort follows the RESOLVED model, not the opus alias',
     expect(o?.effort).toBe('medium');
   });
 
+  it('test_fable_5_2_pinned_group_gets_fables_family_default', () => {
+    const o = turn({}, { groupModel: 'claude-fable-5-2[1m]' });
+    expect(o?.model).toBe('claude-fable-5-2[1m]');
+    expect(o?.effort).toBe('medium');
+  });
+
   it('test_bare_fable_turn_pin_gets_fables_family_default', () => {
     // A task pin or sticky stores bare `fable` (the CLI resolves it through
     // ANTHROPIC_DEFAULT_FABLE_MODEL); it must default like a Fable id, not

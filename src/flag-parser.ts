@@ -40,6 +40,9 @@ const MODEL_ALIAS_MAP: Record<string, string> = {
   'opus5-5': 'claude-opus-5-5[1m]',
   'opus-5-5': 'claude-opus-5-5[1m]',
   // $10/$50 per MTok: opt-in via flag, never a default.
+  fable52: 'claude-fable-5-2[1m]',
+  'fable5-2': 'claude-fable-5-2[1m]',
+  'fable-5-2': 'claude-fable-5-2[1m]',
   fable51: 'claude-fable-5-1[1m]',
   'fable5-1': 'claude-fable-5-1[1m]',
   'fable-5-1': 'claude-fable-5-1[1m]',
@@ -63,7 +66,7 @@ const MODEL_ALIAS_MAP: Record<string, string> = {
 export const DEFAULT_OPUS_MODEL = 'claude-opus-5-5[1m]';
 export const DEFAULT_SONNET_MODEL = 'claude-sonnet-5-5';
 export const DEFAULT_HAIKU_MODEL = 'claude-haiku-5-5';
-export const DEFAULT_FABLE_MODEL = 'claude-fable-5-1[1m]';
+export const DEFAULT_FABLE_MODEL = 'claude-fable-5-2[1m]';
 
 /**
  * Deliberately NOT in MODEL_ALIAS_MAP: a stored `opus` tracks the family default across bumps, `opus5` freezes.
@@ -141,6 +144,7 @@ const MODEL_EFFORT_SUPPORT: Record<string, ReadonlySet<EffortLevel>> = {
   // Fable: adaptive thinking is always on (`disabled` is rejected), so effort is the only depth control.
   'claude-fable-5[1m]': new Set(['low', 'medium', 'high', 'xhigh', 'max']),
   'claude-fable-5-1[1m]': new Set(['low', 'medium', 'high', 'xhigh', 'max']),
+  'claude-fable-5-2[1m]': new Set(['low', 'medium', 'high', 'xhigh', 'max']),
 };
 
 // `-m`/`-e` vocabulary is per provider: a codex group must accept gpt-* and reject claude ids, and vice versa.
