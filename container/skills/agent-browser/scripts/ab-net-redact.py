@@ -68,13 +68,12 @@ BODY_KEYS = {"postData", "body", "responseBody", "requestBody", "postDataEntries
 JWT = re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}")
 BEARER = re.compile(r"[Bb]earer\s+\S+")
 
-# Credential-shaped query-param VALUES leak through any URL string — HAR
-# `queryString` pairs are structured and already covered by CRED_KEYS via
-# scrub_pairs, but the same param routinely also appears inline in a plain
-# `url` string (both capture shapes carry one). Matched case-insensitively on
-# `[?&#]name=value` and stops at the next `&`/`#` (or end of string).
+# Credential-shaped query-param VALUES, in a plain `url` string (both capture
+# shapes carry one) and in HAR `queryString` and form `postData.params` pairs.
+# `key` (Google's browser API key) is a credential only as a query param: as a
+# JSON field name it is ordinary data, so it stays out of CRED_KEYS.
 QUERY_CRED_PARAMS = (
-    "access_token", "id_token", "refresh_token", "token", "api_key", "apikey",
+    "access_token", "id_token", "refresh_token", "token", "api_key", "apikey", "key",
     "client_secret", "password", "secret", "code", "sig", "signature",
     "x-amz-signature", "x-amz-credential", "x-amz-security-token",
     "x-goog-signature", "x-goog-credential",
@@ -83,6 +82,7 @@ QUERY_PARAM_RE = re.compile(
     r"([?&#](?:" + "|".join(re.escape(p) for p in QUERY_CRED_PARAMS) + r")=)([^&#]+)",
     re.I,
 )
+QUERY_CRED_NAMES = frozenset(p.lower() for p in QUERY_CRED_PARAMS)
 
 
 @functools.lru_cache(maxsize=None)
@@ -173,7 +173,7 @@ def walk(o, url=""):
 
 # ---- Shape 2: HAR 1.2 (`network har stop`) ----
 
-def scrub_pairs(pairs):
+def scrub_pairs(pairs, query=False):
     """A list of HAR {"name":, "value":, ...} pairs — headers, query params."""
     out = []
     for p in pairs:
@@ -181,7 +181,7 @@ def scrub_pairs(pairs):
             out.append(scrub_tree(p))
             continue
         item = dict(p)
-        if CRED_KEYS.match(p["name"]):
+        if CRED_KEYS.match(p["name"]) or (query and p["name"].lower() in QUERY_CRED_NAMES):
             if "value" in item:
                 item["value"] = "[REDACTED]"
         else:
@@ -214,7 +214,7 @@ def redact_har_message(msg, url):
     out = dict(msg)
     for key in ("headers", "queryString"):
         if isinstance(out.get(key), list):
-            out[key] = scrub_pairs(out[key])
+            out[key] = scrub_pairs(out[key], query=key == "queryString")
     if isinstance(out.get("cookies"), list):
         out["cookies"] = redact_cookies(out["cookies"])
     if isinstance(out.get("postData"), dict):
@@ -222,7 +222,7 @@ def redact_har_message(msg, url):
         if "text" in pd:
             pd["text"] = gated_body(pd["text"], url)
         if isinstance(pd.get("params"), list):
-            pd["params"] = scrub_pairs(pd["params"])
+            pd["params"] = scrub_pairs(pd["params"], query=True)
         out["postData"] = pd
     if isinstance(out.get("content"), dict):
         content = dict(out["content"])

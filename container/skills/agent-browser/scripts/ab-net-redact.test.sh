@@ -143,6 +143,40 @@ else
   pass "har-stop: presigned S3 URL redacted in request.url"
 fi
 
+# 5c. Google's bare `key` query param (a browser API key) in a URL string, in
+#     both capture shapes and in HAR's structured queryString pairs; the other
+#     query params survive, and an ordinary JSON `key` field is not touched.
+reset_stubs
+export AB_NET_REDACT_ALLOW_FILE="$ALLOW_FILE"
+GKEY='AIzaFAKEexampleKey0000000000000000000'
+MAPSURL="https://maps.googleapis.com/maps/api/js?key=$GKEY&v=3&libraries=places"
+export STUB_REQUESTS_JSON="[{\"url\":\"$MAPSURL\"},{\"url\":\"https://app.example.com/invoices/list\",\"responseBody\":\"{\\\"items\\\":[{\\\"key\\\":\\\"row-17\\\"}]}\"}]"
+OUT="$("$WRAPPER" requests --json 2>/dev/null)"
+if echo "$OUT" | grep -qF "$GKEY"; then fail "requests: Google key query param survived"; else pass "requests: Google key query param redacted"; fi
+if echo "$OUT" | grep -qF 'key=[REDACTED]&v=3&libraries=places'; then pass "requests: other Maps query params left intact"; else fail "requests: other Maps query params not intact ($OUT)"; fi
+if echo "$OUT" | grep -qF 'row-17'; then pass "requests: ordinary JSON key field left intact"; else fail "requests: ordinary JSON key field was redacted ($OUT)"; fi
+
+reset_stubs
+export STUB_HAR_JSON="{\"log\":{\"entries\":[{\"request\":{\"url\":\"$MAPSURL\",\"queryString\":[{\"name\":\"key\",\"value\":\"$GKEY\"},{\"name\":\"v\",\"value\":\"3\"}]},\"response\":{}}]}}"
+OUT_PATH_MAPS="$WORKDIR/maps.har.json"
+"$WRAPPER" har-stop "$OUT_PATH_MAPS" >/dev/null 2>/dev/null
+if [ -s "$OUT_PATH_MAPS" ] && ! grep -qF "$GKEY" "$OUT_PATH_MAPS"; then pass "har-stop: Google key redacted in request.url and queryString"; else fail "har-stop: Google key survived in HAR ($(cat "$OUT_PATH_MAPS" 2>/dev/null))"; fi
+if jq -e '.log.entries[0].request | (.url | endswith("key=[REDACTED]&v=3&libraries=places")) and .queryString == [{"name":"key","value":"[REDACTED]"},{"name":"v","value":"3"}]' "$OUT_PATH_MAPS" >/dev/null 2>&1; then
+  pass "har-stop: other Maps query params left intact"
+else
+  fail "har-stop: other Maps query params not intact ($(cat "$OUT_PATH_MAPS" 2>/dev/null))"
+fi
+
+reset_stubs
+export STUB_HAR_JSON="{\"log\":{\"entries\":[{\"request\":{\"url\":\"https://app.example.com/geo/lookup\",\"postData\":{\"mimeType\":\"application/x-www-form-urlencoded\",\"params\":[{\"name\":\"key\",\"value\":\"$GKEY\"},{\"name\":\"region\",\"value\":\"north\"}]}},\"response\":{}}]}}"
+OUT_PATH_FORM="$WORKDIR/form.har.json"
+"$WRAPPER" har-stop "$OUT_PATH_FORM" >/dev/null 2>/dev/null
+if jq -e '.log.entries[0].request.postData.params == [{"name":"key","value":"[REDACTED]"},{"name":"region","value":"north"}]' "$OUT_PATH_FORM" >/dev/null 2>&1; then
+  pass "har-stop: Google key redacted in form postData.params, other params intact"
+else
+  fail "har-stop: form postData.params not redacted as expected ($(cat "$OUT_PATH_FORM" 2>/dev/null))"
+fi
+
 # 6. har-stop: HAR with Authorization header, cookie pair, and JWT in an
 #    allowlisted postData.text all redacted in the output; raw temp file
 #    does not survive.
