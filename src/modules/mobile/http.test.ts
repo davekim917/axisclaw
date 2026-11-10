@@ -666,6 +666,50 @@ function withSiblingBots(): void {
   });
 }
 
+const GROUP_DM_TEAM = 'T-GROUP-DM-TEST';
+const OTHER_TEAM = 'T-GROUP-DM-OTHER-TEST';
+
+const rosterHuman = (
+  teamId: string,
+  userId: string,
+  username: string,
+  names: { displayName?: string; realName?: string },
+) => ({ userId, username, teamId, ...names });
+
+/** The person paired, as `robin.vale`, and the members of the group DMs below, in the group DMs' own workspace. */
+const groupDmRoster = () => [
+  rosterHuman(GROUP_DM_TEAM, person.slice('slack:'.length), 'robin.vale', { displayName: 'Robin' }),
+  rosterHuman(GROUP_DM_TEAM, 'U-MIKA', 'mika', { displayName: 'Mika Orr', realName: 'Mikaela Orr' }),
+  rosterHuman(GROUP_DM_TEAM, 'U-TAMSIN', 'tamsin', { realName: 'Tamsin Lee' }),
+  ...['oskar', 'perrin', 'arlo', 'bryn', 'cora', 'desmond'].map((handle) =>
+    rosterHuman(GROUP_DM_TEAM, `U-${handle.toUpperCase()}`, handle, {
+      displayName: handle[0].toUpperCase() + handle.slice(1),
+    }),
+  ),
+];
+
+/**
+ * `asterbot` is a sibling bot, named only by the bot registry. `quill` and `zephyrbot` belong to another workspace, so
+ * they name no member of these group DMs.
+ */
+function withGroupDmWorkspace(): void {
+  const bots: Array<[string, { userId: string; username: string; teamId: string; displayName?: string }]> = [
+    ['slack', { userId: 'U-BOT-JUNIPER', username: 'juniperbot', teamId: GROUP_DM_TEAM }],
+    ['slack-sibling', { userId: 'U-BOT-ASTER', username: 'asterbot', teamId: GROUP_DM_TEAM, displayName: 'Aster Bot' }],
+    ['slack-foreign', { userId: 'U-BOT-ZEPHYR', username: 'zephyrbot', teamId: OTHER_TEAM, displayName: 'Zephyr' }],
+  ];
+  beforeEach(() => {
+    for (const [channelType, identity] of bots) registerSlackBot(channelType, identity);
+    registerSlackWorkspaceHumans(GROUP_DM_TEAM, groupDmRoster());
+    registerSlackWorkspaceHumans(OTHER_TEAM, [rosterHuman(OTHER_TEAM, 'U-QUILL', 'quill', { displayName: 'Quill' })]);
+  });
+  afterEach(() => {
+    for (const [channelType, identity] of bots) unregisterSlackBot(channelType, identity);
+    registerSlackWorkspaceHumans(GROUP_DM_TEAM, []);
+    registerSlackWorkspaceHumans(OTHER_TEAM, []);
+  });
+}
+
 /** Every argument of every log call, as text. */
 const loggedText = () =>
   JSON.stringify(
@@ -2246,6 +2290,87 @@ describe('GET /v1/threads', () => {
       vi.setSystemTime(Date.now() + 60 * 60_000 + 1);
 
       expect((await listing(key)).channels.map((row) => row.name)).toEqual(['#general']);
+    });
+  });
+
+  describe('a Slack group DM', () => {
+    withGroupDmWorkspace();
+
+    it.each([
+      [
+        'two members besides the person paired',
+        'mpdm-robin.vale--mika--tamsin-1',
+        'Group DM with Mika Orr and Tamsin Lee',
+      ],
+      [
+        'three, wherever the person paired sits',
+        'mpdm-mika--oskar--robin.vale--tamsin-2',
+        'Group DM with Mika Orr, Oskar and Tamsin Lee',
+      ],
+      [
+        'more than three, by count',
+        'mpdm-mika--oskar--perrin--robin.vale--tamsin-1',
+        'Group DM with Mika Orr, Oskar and 2 others',
+      ],
+      ['a handle the roster lacks, as written', 'mpdm-mika--robin.vale--wren-1', 'Group DM with Mika Orr and wren'],
+      [
+        'a handle only another workspace knows, as written',
+        'mpdm-mika--quill--robin.vale--zephyrbot-1',
+        'Group DM with Mika Orr, quill and zephyrbot',
+      ],
+      [
+        'a bot, by the name its adapter registered',
+        'mpdm-asterbot--mika--robin.vale-1',
+        'Group DM with Aster Bot and Mika Orr',
+      ],
+      ['a name stored with its #', '#mpdm-robin.vale--mika--tamsin-1', 'Group DM with Mika Orr and Tamsin Lee'],
+      ['no channel that only starts like one', 'mpdm-notes', '#mpdm-notes'],
+      [
+        'a stored roster name, leaving out the person paired',
+        'Group DM: Mika Orr, Robin and Tamsin Lee',
+        'Group DM with Mika Orr and Tamsin Lee',
+      ],
+      [
+        'a stored roster name the person paired is not in',
+        'Group DM: Tamsin Lee and Mika Orr',
+        'Group DM with Mika Orr and Tamsin Lee',
+      ],
+      [
+        'a stored roster name past three, by count',
+        'Group DM: Mika Orr, Oskar, Perrin, Robin and Tamsin Lee',
+        'Group DM with Mika Orr, Oskar and 2 others',
+      ],
+      [
+        'a stored roster name past eight, counting those it left unnamed',
+        'Group DM: Robin, Arlo, Bryn, Cora, Desmond, Mika Orr, Oskar and Perrin +1 more',
+        'Group DM with Arlo, Bryn and 6 others',
+      ],
+      [
+        'a stored name the roster cannot vouch for, as stored, the person paired kept in',
+        'Group DM: Mika Orr, Robin and Someone Renamed',
+        'Group DM with Mika Orr, Robin and Someone Renamed',
+      ],
+    ])('names %s', async (_, slug, shown) => {
+      await channel('mg-group-dm', 'slack:C0TESTGDM', 'slack', slug);
+      await newSession({ messaging_group_id: 'mg-group-dm', thread_id: 'slack:C0TESTGDM:1.0' });
+
+      const list = await listing(await pairedKey(person));
+
+      expect(list.threads.map((row) => row.channelName)).toEqual([shown]);
+      expect(list.channels.map((row) => row.name)).toEqual([shown]);
+    });
+
+    it('keeps the person paired in a stored name when someone else in the workspace shares theirs', async () => {
+      registerSlackWorkspaceHumans(GROUP_DM_TEAM, [
+        ...groupDmRoster(),
+        rosterHuman(GROUP_DM_TEAM, 'U-ROBIN-TWO', 'robin.two', { displayName: 'Robin' }),
+      ]);
+      await channel('mg-group-dm', 'slack:C0TESTGDM', 'slack', 'Group DM: Mika Orr, Robin and Tamsin Lee');
+      await newSession({ messaging_group_id: 'mg-group-dm', thread_id: 'slack:C0TESTGDM:1.0' });
+
+      const list = await listing(await pairedKey(person));
+
+      expect(list.threads.map((row) => row.channelName)).toEqual(['Group DM with Mika Orr, Robin and Tamsin Lee']);
     });
   });
 
@@ -3864,6 +3989,19 @@ describe('GET /v1/places', () => {
         lastActiveAt: null,
       },
     ]);
+  });
+
+  describe('a Slack group DM', () => {
+    withGroupDmWorkspace();
+
+    it('names it by its members, as the thread list does', async () => {
+      await channel('mg-group-dm', 'slack:C0TESTGDM', 'slack', 'mpdm-mika--robin.vale--tamsin-1');
+      await wire('mg-group-dm');
+
+      const places = await placesFor(await pairedKey(person));
+
+      expect(places.map((place) => place.channelName)).toEqual(['Group DM with Mika Orr and Tamsin Lee']);
+    });
   });
 
   it('lists most recently active first, with a channel never used last', async () => {

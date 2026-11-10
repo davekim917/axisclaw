@@ -92,7 +92,7 @@ interface Thread {
   workgroupName: string;
   platform: 'slack' | 'discord';
   channelKey: string; // the `id` of its channel in `channels`
-  channelName: string | null;
+  channelName: string | null; // `#general`, or `Group DM with Mika and Tamsin`; null in the person's own DM
   title: string;
   lastActiveAt: string; // newest last_active across the thread's live sessions
   agents: { sessionId: string; agentGroupId: string; name: string }[]; // sorted by name; empty only in a DM
@@ -105,7 +105,7 @@ interface Channel {
   id: string; // the `channelKey` of `GET /v1/places`: opaque, shared by sibling bots, one per workgroup
   workgroupId: string;
   platform: 'slack' | 'discord';
-  name: string | null; // as shown, `#general`, or `DM with Juniper` for the person's own DM
+  name: string | null; // `#general`, `Group DM with Mika and Tamsin`, or `DM with Juniper` for the person's own DM
 }
 ```
 
@@ -360,6 +360,27 @@ to people who are not in them. That memory is per person and lost on a restart, 
 channels again. It decides only what the filter offers: the threads of a channel still pass the checks above. Which
 platforms offer the filter is `CHANNEL_FILTER_PLATFORMS` in `threads.ts`. The app offers channels in its scope sheet,
 below, once a workgroup is chosen, or the person has only one, when that workgroup lists more than one channel.
+
+A Slack group DM is named by who is in it besides the person paired: `Group DM with Mika and Tamsin`, `Group DM with
+Mika, Oskar and Tamsin`, and past three, `Group DM with Mika, Oskar and 2 others`, sorted by name, never by its stored
+name. The host stores no flag for a group DM (`is_group` stays 0 on one and nothing keeps Slack's `is_mpim`), so it goes
+by the stored name, on a Slack channel type only, in either of its two shapes. Every name is read from memory, with no
+platform read.
+
+- **Slack's slug, `mpdm-<handle>--<handle>--…-<n>`**, which the adapter's metadata fetch stores. The handles are Slack
+  usernames. A person is named by the workspace roster `users.list` loads at start and hourly (display name, else real
+  name), a bot by the name its adapter registered, and a handle neither knows as written; only the wiring's own
+  workspace counts. The person paired is the roster entry with their id, so before the roster loads they can appear
+  under their own handle.
+- **`Group DM: A, B and C`**, the name `conversationDisplayName` stores when the adapter classifies the conversation
+  (auto-wire, channel approval). It lists people only, by display name, so the person paired is matched by theirs. They
+  are left out only when every listed name is a roster name and no one else in the workspace shares theirs. Otherwise
+  the stored list is shown as it stands, with them in it, since a display name holding `, ` or ` and ` would split
+  wrongly.
+
+The app's list and the stored one share one formatter, `formatParticipantList` in `src/channels/adapter.ts`, each in
+its own style. Every channel name the app shows, on a thread, in `channels` and in `GET /v1/places`, comes from `channelNamer`
+in `channel-names.ts`. A search still matches the stored name, not this one.
 
 Each visibility answer is cached in memory per place, channel type and person for 10 minutes, so listing does not page
 Slack on every poll. A failed check is kept for one minute. This cache only decides what the list shows: for up to 10
@@ -657,7 +678,7 @@ interface Place {
   agentName: string;
   messagingGroupId: string;
   platform: 'slack' | 'discord';
-  channelName: string | null;
+  channelName: string | null; // named as the thread list names it
   workgroupName: string;
   lastActiveAt: string | null; // newest last_active of that agent's sessions there, closed ones included
 }

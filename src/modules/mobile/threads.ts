@@ -45,6 +45,7 @@ import {
   startOrJoinGroupCallAs,
 } from '../voice-call/group/service.js';
 import { mayCall, spokenName, voiceCallsEnabledFor, VoiceCallRefused } from '../voice-call/service.js';
+import { type ChannelNamer, channelNamer } from './channel-names.js';
 import { identitiesOf, inOwnWorkspace } from './identity.js';
 import {
   anchorsTable,
@@ -812,14 +813,16 @@ const capped = (text: string, chars: number) => [...text].slice(0, chars).join('
 
 const dmWithOf = (agentNames: string[]) => [...agentNames].sort((a, b) => a.localeCompare(b)).join(', ');
 
-const shownChannel = (name: string | null | undefined) => (name ? `#${name.replace(/^#/, '')}` : null);
-
 export const opaqueId = (value: string) =>
   createHash('sha256').update(value).digest('base64url').slice(0, THREAD_KEY_CHARS);
 
 const opaqueKey = (workgroupId: string, ref: string) => opaqueId(JSON.stringify([workgroupId, ref]));
 
-async function summarize({ rows, sessions }: PooledThread, nameOf: AgentNames): Promise<Thread> {
+async function summarize(
+  { rows, sessions }: PooledThread,
+  nameOf: AgentNames,
+  channelNameOf: ChannelNamer,
+): Promise<Thread> {
   const [{ workgroup_id, workgroup_name, platform_id, thread_ref, thread_title, thread_active }] = rows;
   const [{ place }] = sessions;
   const newestPerAgent = new Map<string, ThreadRow>();
@@ -836,7 +839,8 @@ async function summarize({ rows, sessions }: PooledThread, nameOf: AgentNames): 
   agents.sort((a, b) => a.name.localeCompare(b.name));
   // A DM's messaging group is named for the person in it, which is no channel.
   const dmWith = 'dm' in place ? dmWithOf(agents.map((agent) => agent.name)) : null;
-  const channelName = dmWith === null ? shownChannel(rows.find((row) => row.channel_name)?.channel_name) : null;
+  const named = rows.find((row) => row.channel_name);
+  const channelName = dmWith === null && named ? channelNameOf(named) : null;
   const started = sessions.find(({ row }) => row.anchor !== null)?.row;
   const title =
     (started && (thread_title?.trim() || starterLine(started))) ||
@@ -910,10 +914,12 @@ async function channelsOf(callable: Wiring[], dms: Wiring[], userId: string, nam
   const platform = userPlatform(userId);
   if (!platform || !CHANNEL_FILTER_PLATFORMS.has(platform)) return [];
   const channels = new Map<string, Channel>();
-  for (const { workgroup_id, platform_id, channel_name } of callable) {
+  const channelNameOf = channelNamer(userId);
+  for (const wiring of callable) {
+    const { workgroup_id, platform_id } = wiring;
     const id = opaqueKey(workgroup_id, platform_id);
     if (hasSeenChannel(userId, platform_id) && !channels.get(id)?.name)
-      channels.set(id, { id, workgroupId: workgroup_id, platform, name: shownChannel(channel_name) });
+      channels.set(id, { id, workgroupId: workgroup_id, platform, name: channelNameOf(wiring) });
   }
   const dmAgents = new Map<string, { workgroupId: string; names: string[] }>();
   for (const wiring of dms) {
@@ -1198,8 +1204,9 @@ async function buildList(
   enterStage(progress, 'visibility');
   const { kept: visible, pending } = await keepVisible(pooled, userId, limit);
   enterStage(progress, 'summaries');
+  const channelNameOf = channelNamer(userId);
   return {
-    threads: await Promise.all(visible.map((thread) => summarize(thread, nameOf))),
+    threads: await Promise.all(visible.map((thread) => summarize(thread, nameOf, channelNameOf))),
     workgroups,
     channels: await channels(),
     ...(cutShort ? { textCutShort: true } : {}),
@@ -1247,6 +1254,7 @@ export async function listPlaces(userId: string): Promise<{ places: Place[] }> {
     });
   const { kept: visible } = await keepVisible(ranked, userId, PLACES_LIMIT);
   const nameOf = agentNames();
+  const channelNameOf = channelNamer(userId);
   return {
     places: await Promise.all(
       visible.map(async ({ sessions: [{ row, place }] }) => ({
@@ -1256,7 +1264,7 @@ export async function listPlaces(userId: string): Promise<{ places: Place[] }> {
         avatarUrl: await botAvatar(row.channel_type),
         messagingGroupId: row.messaging_group_id,
         platform: place.platform,
-        channelName: shownChannel(row.channel_name),
+        channelName: channelNameOf(row),
         workgroupName: row.workgroup_name || row.workgroup_id,
         lastActiveAt: lastActive.get(agentKey(row)) ?? null,
       })),

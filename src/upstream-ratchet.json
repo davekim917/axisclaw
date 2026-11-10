@@ -809,7 +809,7 @@
 "src/attachment-safety.ts":{"diff":0,"mode":"100644","sha256":"a7e99d94dee480725f12df691aa2588f1b186d9c392a62c81a3a741a43a67d69"},
 "src/backfill-container-configs.ts":{"diff":14,"mode":"100644","sha256":"adde5429b65fd99d76642adc0fd63eae1ad853d8d756553964fb194d486bbf3d"},
 "src/channels/adapter-hot-start.test.ts":{"diff":205,"mode":"100644","sha256":"be7925ab73c591ac194f4d800aaf174ede7bfc52ed991b5387aa11ba3f8963b2"},
-"src/channels/adapter.ts":{"diff":253,"mode":"100644","sha256":"3b4f7935280d0035d754f1703eead88462130edfba667f26c3c8c778b0be7475"},
+"src/channels/adapter.ts":{"diff":293,"mode":"100644","sha256":"cf36b676de0212a71302c10c5a7625244cb936129ba951c500a3574fe9c026b7"},
 "src/channels/ask-question.test.ts":{"diff":0,"mode":"100644","sha256":"18b710ff64e28d450a4704bb52b49f21e56216ea1d5a2356ca377e40a2fef9c4"},
 "src/channels/ask-question.ts":{"diff":13,"mode":"100644","sha256":"125733bedae6963970c297db28398f06edc58270f85001e98669c012bbde46c9"},
 "src/channels/channel-defaults.test.ts":{"diff":122,"mode":"100644","sha256":"40427fda65438f8cf6d2e3428688bd53a9d3cbf75849d25af3d1a85970032a9e"},

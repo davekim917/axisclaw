@@ -200,17 +200,38 @@ export interface ChannelConversation {
   participantNames?: string[];
 }
 
-const MAX_RENDERED_PARTICIPANTS = 8;
+const GROUP_DM_NAME_PREFIX = 'Group DM: ';
+const OVERFLOW_RE = / \+(\d+) more$/;
+
+/** At most `max` names; past that, the stored name appends "+N more" and the app's ends "and N others". */
+export interface ParticipantListStyle {
+  max: number;
+  rest: 'more' | 'others';
+}
+
+const STORED_PARTICIPANTS: ParticipantListStyle = { max: 8, rest: 'more' };
+
+const sentence = (names: string[]) =>
+  names.length === 1 ? names[0] : `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`;
 
 /**
- * Canonical participant rendering ("Alice", "Alice and Bob", …, "+N more"). Lives beside the interface so core never
- * imports a skill-installed channel module for a formatter.
+ * Canonical participant rendering ("Alice", "Alice and Bob", "Alice, Bob and Carol", then the style's overflow), for
+ * `total` members of whom `names` are the first ones known. Lives beside the interface so core never imports a
+ * skill-installed channel module for a formatter.
  */
-export function formatParticipantList(names: string[]): string {
-  const shown = names.slice(0, MAX_RENDERED_PARTICIPANTS);
-  const extra = names.length - shown.length;
-  const joined = shown.length === 1 ? shown[0] : `${shown.slice(0, -1).join(', ')} and ${shown[shown.length - 1]}`;
-  return extra > 0 ? `${joined} +${extra} more` : joined;
+export function formatParticipantList(
+  names: string[],
+  style: ParticipantListStyle = STORED_PARTICIPANTS,
+  total = names.length,
+): string {
+  if (total <= style.max && total === names.length) return sentence(names);
+  if (style.rest === 'more') {
+    const shown = names.slice(0, style.max);
+    return `${sentence(shown)} +${total - shown.length} more`;
+  }
+  const shown = names.slice(0, style.max - 1);
+  const others = total - shown.length;
+  return `${shown.join(', ')} and ${others} ${others === 1 ? 'other' : 'others'}`;
 }
 
 /**
@@ -219,7 +240,26 @@ export function formatParticipantList(names: string[]): string {
 export function conversationDisplayName(conversation: ChannelConversation): string | null {
   if (conversation.type !== 'group_dm') return conversation.name;
   const names = conversation.participantNames;
-  return names && names.length > 0 ? `Group DM: ${formatParticipantList(names)}` : null;
+  return names && names.length > 0 ? `${GROUP_DM_NAME_PREFIX}${formatParticipantList(names)}` : null;
+}
+
+/**
+ * The members a name `conversationDisplayName` stored lists, or null for any other name. A display name holding
+ * ", " or " and " splits wrongly, so a caller that acts on one name checks each against a roster first.
+ */
+export function storedGroupDmMembers(name: string): { names: string[]; total: number; listed: string } | null {
+  if (!name.startsWith(GROUP_DM_NAME_PREFIX)) return null;
+  const listed = name.slice(GROUP_DM_NAME_PREFIX.length);
+  let list = listed;
+  const overflow = OVERFLOW_RE.exec(list);
+  if (overflow) list = list.slice(0, overflow.index);
+  const items = list.split(', ');
+  const last = items.pop() ?? '';
+  const cut = last.lastIndexOf(' and ');
+  if (cut === -1 && items.length > 0) return null;
+  const names = cut === -1 ? [last] : [...items, last.slice(0, cut), last.slice(cut + ' and '.length)];
+  if (!names.every(Boolean)) return null;
+  return { names, total: names.length + (overflow ? Number(overflow[1]) : 0), listed };
 }
 
 /** Discord's limit, the one platform here whose threads have names. */

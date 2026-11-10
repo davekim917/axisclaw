@@ -126,14 +126,18 @@ export function getKnownSlackHumans(): ReadonlyMap<string, SlackBotIdentity[]> {
   return knownSlackHumans;
 }
 
+/** Precedence matches Slack's autocomplete: `display_name`, then `real_name`, then the legacy username. */
+export function slackShownName(identity: SlackBotIdentity): string | null {
+  return identity.displayName || identity.realName || identity.username || null;
+}
+
 /**
- * Precedence matches Slack's autocomplete: `display_name`, then `real_name`, then the `auth.test` username. Null when
- * the bot is not registered yet (e.g. a spawn racing adapter init); the caller falls through to the next resolver.
+ * Null when the bot is not registered yet (e.g. a spawn racing adapter init); the caller falls through to the next
+ * resolver.
  */
 export function getSlackBotDisplayName(channelType: string): string | null {
   const bot = knownSlackBots.get(channelType);
-  if (!bot) return null;
-  return bot.displayName || bot.realName || bot.username || null;
+  return bot ? slackShownName(bot) : null;
 }
 
 /**
@@ -144,9 +148,7 @@ export function getSlackBotSenderName(channelType: string, userId: string): stri
   const self = knownSlackBots.get(channelType);
   if (!self) return null;
   for (const bot of knownSlackBots.values()) {
-    if (bot.teamId === self.teamId && bot.userId === userId) {
-      return bot.displayName || bot.realName || bot.username || null;
-    }
+    if (bot.teamId === self.teamId && bot.userId === userId) return slackShownName(bot);
   }
   return null;
 }
