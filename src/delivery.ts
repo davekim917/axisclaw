@@ -51,6 +51,7 @@ import { archiveMessage } from './message-archive.js';
 import { notifyOutboundDelivered } from './delivery-events.js';
 import { resolveContinueThread } from './continue-thread.js';
 import { normalizeOptions } from './channels/ask-question.js';
+import { checkCardContent, isAgentCardContent } from './channels/card-spec.js';
 import { clearOutbox, readOutboxFiles, withExistingMailboxSession } from './session-manager.js';
 import { isDispatchSeries, sessionOutboundStorageStat, type NanoclawMailboxSession } from './modules/mailbox/index.js';
 import type { RoutedTaskRow } from './modules/mailbox/ops/lookups.js';
@@ -893,12 +894,12 @@ async function drainSession(session: Session): Promise<DrainOutcome> {
         sentAwaitingAck.get(ackKey) ?? (await withThreadKeyLock(msg, session, () => deliverMessage(msg, session)));
       // deferAck: the handler owns the `delivered` row (e.g. request_bash_gate on approval); auto-acking would
       // silently unblock a gated command.
+      const answer = msg.kind === 'chat' || outboundKindTag(msg) === 'chat-sdk:card';
       if (!result.deferAck) {
         try {
           await ackDelivery(agentGroup.id, session.id, (mailbox) => {
             mailbox.markDelivered(msg.id, result.platformMsgId ?? null, result.taskListRoute);
-            if (msg.kind === 'chat' && !result.recordOnly)
-              for (const id of heldListPosts) mailbox.markDelivered(id, null);
+            if (answer && !result.recordOnly) for (const id of heldListPosts) mailbox.markDelivered(id, null);
           });
         } catch (ackErr) {
           // Not an attempt: the message is out, and a capped retry would give up on a send that succeeded.
@@ -912,7 +913,7 @@ async function drainSession(session: Session): Promise<DrainOutcome> {
           break;
         }
         sentAwaitingAck.delete(ackKey);
-        if (msg.kind === 'chat' && !result.recordOnly) heldListPosts.clear();
+        if (answer && !result.recordOnly) heldListPosts.clear();
         deliveredNow.add(msg.id);
         // Mirror into the central row for the inbox board; only operator-visible platform sends count, or dormant
         // sessions never reach the stale lane.
@@ -1586,6 +1587,15 @@ async function deliverMessage(
   const scrubbedContent = await attachSourcesFooter(humanizeOutboundContent(scrubSecrets(msg.content)), () =>
     sourcesFooterContext(session.agent_group_id),
   );
+  const agentCard = isAgentCardContent(content);
+  if (agentCard) {
+    const checked = checkCardContent(JSON.parse(scrubbedContent) as Record<string, unknown>, msg.channel_type);
+    if ('issues' in checked) {
+      throw new DeliveryRefusal(
+        `The card was rejected and nothing was posted. Fix every issue, then send it again:\n${checked.issues.map((issue) => `- ${issue}`).join('\n')}`,
+      );
+    }
+  }
 
   // Final replies always post fresh, never as an edit of the status bubble, so the answer lands below any
   // follow-up that arrived mid-turn.
@@ -1895,12 +1905,17 @@ async function deliverMessage(
     await settleSessionStatusAfterPublicDelivery(session.id);
   }
 
-  if (msg.kind === 'chat') {
+  if (msg.kind === 'chat' || agentCard) {
     // Scrubbed text, so a leaked secret stays out of searchable history.
     try {
       const parsed = JSON.parse(scrubbedContent) as Record<string, unknown>;
-      const text =
-        typeof parsed.text === 'string' ? parsed.text : typeof parsed.content === 'string' ? parsed.content : '';
+      const text = agentCard
+        ? String(parsed.fallbackText).trim()
+        : typeof parsed.text === 'string'
+          ? parsed.text
+          : typeof parsed.content === 'string'
+            ? parsed.content
+            : '';
       if (text && msg.channel_type && msg.platform_id) {
         notifyOutboundDelivered({
           sessionId: session.id,

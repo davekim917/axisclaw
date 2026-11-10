@@ -47,6 +47,35 @@ function publishRequestCandidates(candidates: Array<{ sequence: number; messageI
     .run('request_candidates', JSON.stringify(candidates), new Date().toISOString());
 }
 
+/** Bind this session to a Slack conversation, as the host does for a chat session. */
+function bindRouting(platformId: string, threadId: string | null): void {
+  const db = getInboundDb();
+  db.exec(
+    'CREATE TABLE IF NOT EXISTS session_routing (id INTEGER PRIMARY KEY, channel_type TEXT, platform_id TEXT, thread_id TEXT)',
+  );
+  db.prepare('INSERT OR REPLACE INTO session_routing (id, channel_type, platform_id, thread_id) VALUES (1, ?, ?, ?)').run(
+    'slack',
+    platformId,
+    threadId,
+  );
+}
+
+/** Run a tool that waits on the host's verdict, and record that verdict on its row the way delivery does. */
+async function withHostVerdict<T>(call: () => Promise<T>, status: 'delivered' | 'failed', error: string | null = null) {
+  const before = getUndeliveredMessages().length;
+  const pending = call();
+  let out = getUndeliveredMessages();
+  for (let i = 0; i < 100 && out.length === before; i++) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    out = getUndeliveredMessages();
+  }
+  const row = out[out.length - 1];
+  getInboundDb()
+    .prepare('INSERT INTO delivered (message_out_id, status, delivered_at, error) VALUES (?, ?, ?, ?)')
+    .run(row.id, status, new Date().toISOString(), error);
+  return { row, result: await pending };
+}
+
 beforeEach(() => {
   initTestSessionDb();
   // Seed a peer agent destination
@@ -97,17 +126,7 @@ describe('sends from a shared session thread into the conversation being answere
   const CHAT = 'slack:CTEST00004';
   const THREAD = 'slack:CTEST00004:1780316121.601669';
 
-  function bindSession(threadId: string | null): void {
-    const db = getInboundDb();
-    db.exec(
-      'CREATE TABLE IF NOT EXISTS session_routing (id INTEGER PRIMARY KEY, channel_type TEXT, platform_id TEXT, thread_id TEXT)',
-    );
-    db.prepare('INSERT OR REPLACE INTO session_routing (id, channel_type, platform_id, thread_id) VALUES (1, ?, ?, ?)').run(
-      'slack',
-      CHAT,
-      threadId,
-    );
-  }
+  const bindSession = (threadId: string | null) => bindRouting(CHAT, threadId);
 
   beforeEach(() => {
     const db = getInboundDb();
@@ -182,8 +201,11 @@ describe('sends from a shared session thread into the conversation being answere
     bindSession(null);
     publishReplyRoute({ inReplyTo: 'inbound-1', platformId: CHAT, threadId: THREAD });
 
-    await sendCard.handler({ card: { title: 'Summary' } });
-    expect(lastThread()).toBe(THREAD);
+    const { row } = await withHostVerdict(
+      () => sendCard.handler({ spec: { root: 'card', elements: {} }, fallbackText: 'Summary' }),
+      'delivered',
+    );
+    expect(row.thread_id).toBe(THREAD);
 
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-send-file-thread-'));
     const filePath = path.join(tmpDir, 'answer.csv');
@@ -217,6 +239,45 @@ describe('sends from a shared session thread into the conversation being answere
       writeFileSpy.mockRestore();
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('send_card MCP tool — the host decides, and the agent hears its verdict', () => {
+  const spec = { root: 'card', elements: { card: { type: 'Card', props: { title: 'Deploys' }, children: [] } } };
+
+  beforeEach(() => bindRouting('slack:CTEST00009', null));
+
+  it('writes the spec and fallback text for the host, and reports a posted card', async () => {
+    const { row, result } = await withHostVerdict(
+      () => sendCard.handler({ spec, fallbackText: ' Deploys: 3 \n' }),
+      'delivered',
+    );
+    expect(row).toMatchObject({ kind: 'chat-sdk' });
+    expect(JSON.parse(row.content)).toEqual({ type: 'card', spec, fallbackText: 'Deploys: 3' });
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toBe(`Card posted (id: ${row.id}).`);
+  });
+
+  it('hands the host’s rejection, every issue included, back as the tool error', async () => {
+    const issues = 'The card was rejected and nothing was posted.\n- open: unknown component "Button"';
+    const { row, result } = await withHostVerdict(() => sendCard.handler({ spec, fallbackText: 'x' }), 'failed', issues);
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toBe(`Error: Card not posted (id: ${row.id}). ${issues}`);
+  });
+
+  it('refuses a card from a session with no conversation, rather than report one posted', async () => {
+    getInboundDb().prepare('UPDATE session_routing SET channel_type = NULL, platform_id = NULL WHERE id = 1').run();
+    const result = await sendCard.handler({ spec, fallbackText: 'Deploys: 3' });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('no conversation to post a card in');
+    expect(getUndeliveredMessages()).toEqual([]);
+  });
+
+  it('refuses a card with no fallback text before writing anything', async () => {
+    const result = await sendCard.handler({ spec, fallbackText: '  ' });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('fallbackText is required');
+    expect(getUndeliveredMessages()).toEqual([]);
   });
 });
 

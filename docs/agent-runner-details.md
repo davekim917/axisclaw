@@ -673,19 +673,19 @@ Implementation:
 
 #### send_card
 
-Send a structured card (interactive or display-only).
+Post a display card: a native Slack or Discord message built from a json-render spec.
 
 ```typescript
 {
   name: 'send_card',
   params: {
-    card: CardElement,     // card structure (title, children, actions)
-    fallbackText?: string, // text fallback for platforms without card support
+    spec: { root: string, elements: Record<string, { type, props, children }> },
+    fallbackText: string, // required: what search, history, the mobile app and the terminal show
   }
 }
 ```
 
-Implementation: write a `messages_out` row with `kind: 'chat-sdk'` and the card structure in content.
+Implementation: refuse when the session has no conversation (a task session with no routing), else write a `messages_out` row (`kind: 'chat-sdk'`, content `{ type: 'card', spec, fallbackText }`) in the current conversation and wait up to 30 s for the host's verdict. The host checks the spec against the catalog in `src/channels/card-spec.ts` and the target platform's caps; on Slack it also renders the card with the converter the adapter posts with and refuses what Slack would refuse, drop or show as text, or cut from a Text, Field or subtitle. A title, button label or alt text past its cap is shortened with an ellipsis. On Discord it refuses an Image child or a Table caption, which the embed drops, a Chart yLabel, which it drops, repeated Chart categories, which it shows with the wrong values, and a line break in a Table cell, which its text table turns into a space. It also refuses what Discord would reject: text past 4,096 characters, more than 25 fields, a field label over 256 characters or value over 1,024, more than 6,000 characters in all, more than 5 rows of buttons, a button label over 80 characters or a URL over 512. Both platforms left-align every Table column, and the guide says `align` is ignored. Only the root element may be a Card. A rejected spec posts nothing, and the tool returns every issue so the agent can fix the spec and call again. A posted card is archived as its fallback text. The catalog leaves out `Button`, because a click back to the agent belongs to `request_choice`. The tool description is generated from that catalog (`pnpm card-guide:generate`, `container/agent-runner/src/mcp-tools/card-guide.generated.ts`).
 
 #### ask_user_question
 

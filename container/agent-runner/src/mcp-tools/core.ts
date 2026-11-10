@@ -19,7 +19,7 @@ import { getMessageIdBySeq, getRoutingBySeq, writeMessageOut } from '../db/messa
 import { chatBudgetExhausted, isChatMuted } from '../modules/mailbox/index.js';
 
 // Edits and reactions stay allowed past the chat budget: amending the sent message is the sanctioned escape hatch.
-function chatSendDenial(): string | null {
+export function chatSendDenial(): string | null {
   if (isChatMuted()) {
     return 'Chat sends are disabled for this task (muteChat). Alerts go through the outbox file contract; your completion report goes in the ledger.';
   }

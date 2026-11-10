@@ -22,6 +22,7 @@
     "container/agent-runner/src/mcp-tools/approved-run.ts": 100,
     "container/agent-runner/src/mcp-tools/backlog.ts": "untested",
     "container/agent-runner/src/mcp-tools/capabilities.ts": "untested",
+    "container/agent-runner/src/mcp-tools/card-guide.generated.ts": 100,
     "container/agent-runner/src/mcp-tools/channel-config.ts": "untested",
     "container/agent-runner/src/mcp-tools/checkout-layout.ts": 100,
     "container/agent-runner/src/mcp-tools/continue-thread.ts": 100,

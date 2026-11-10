@@ -4,9 +4,12 @@
  * ask_user_question is a blocking tool call — it writes a messages_out row
  * with a question card, then polls messages_in for the response.
  */
+import { awaitDeliveryAck } from '../db/delivery-acks.js';
 import { findQuestionResponse, markCompleted } from '../db/messages-in.js';
 import { writeMessageOut } from '../db/messages-out.js';
 import { getSessionRouting, inheritedThreadFor } from '../db/session-routing.js';
+import { CARD_SPEC_GUIDE } from './card-guide.generated.js';
+import { chatSendDenial } from './core.js';
 import { registerTools } from './server.js';
 import { err, generateId, log, ok } from './tool-helpers.js';
 import type { McpToolDefinition } from './types.js';
@@ -115,41 +118,57 @@ const askUserQuestion: McpToolDefinition = {
   },
 };
 
+const SEND_CARD_ACK_TIMEOUT_MS = 30_000;
+
 export const sendCard: McpToolDefinition = {
   tool: {
     name: 'send_card',
-    description:
-      'Send a structured card (interactive or display-only) to the current conversation. Returns immediately — it does not pause your turn or collect a response. Use it to present information more cleanly than prose: summaries, results with contextual buttons, or options the user can read but you are not waiting on. If you need the user to choose something and return a value to you, use ask_user_question instead.',
+    description: CARD_SPEC_GUIDE,
     inputSchema: {
       type: 'object' as const,
       properties: {
-        card: {
-          type: 'object',
-          description: 'Card structure with title, description, and optional children/actions',
+        spec: { type: 'object', description: 'The card: { root, elements }, built from the components above' },
+        fallbackText: {
+          type: 'string',
+          description: 'The card as plain text: what search, history, the mobile app and the terminal show',
         },
-        fallbackText: { type: 'string', description: 'Text fallback for platforms without card support' },
       },
-      required: ['card'],
+      required: ['spec', 'fallbackText'],
     },
   },
   async handler(args) {
-    const card = args.card as Record<string, unknown>;
-    if (!card) return err('card is required');
+    const spec = args.spec;
+    if (!spec || typeof spec !== 'object' || Array.isArray(spec)) {
+      return err('spec must be an object: { root, elements }');
+    }
+    const fallbackText = typeof args.fallbackText === 'string' ? args.fallbackText.trim() : '';
+    if (!fallbackText) return err('fallbackText is required: the card as plain text');
+    const denial = chatSendDenial();
+    if (denial) return err(denial);
 
-    const id = generateId();
     const r = routing();
-
+    if (!r.platform_id || !r.channel_type) {
+      return err('This session has no conversation to post a card in. Use send_message to reach a destination.');
+    }
+    const id = generateId();
     await writeMessageOut({
       id,
       kind: 'chat-sdk',
       platform_id: r.platform_id,
       channel_type: r.channel_type,
       thread_id: r.thread_id,
-      content: JSON.stringify({ type: 'card', card, fallbackText: (args.fallbackText as string) || '' }),
+      content: JSON.stringify({ type: 'card', spec, fallbackText }),
     });
+    log(`send_card: ${id}, awaiting host ack`);
 
-    log(`send_card: ${id}`);
-    return ok(`Card sent (id: ${id})`);
+    const ack = await awaitDeliveryAck(id, SEND_CARD_ACK_TIMEOUT_MS);
+    if (!ack) {
+      return ok(
+        `Card sent (id: ${id}), delivery unconfirmed: the host did not answer within ${SEND_CARD_ACK_TIMEOUT_MS / 1000}s.`,
+      );
+    }
+    if (ack.status === 'delivered') return ok(`Card posted (id: ${id}).`);
+    return err(`Card not posted (id: ${id}). ${ack.error ?? 'Unknown delivery error.'}`);
   },
 };
 

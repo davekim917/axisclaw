@@ -761,51 +761,56 @@ describe('createChatSdkBridge.deliver — ask_question cards (button styles)', (
 });
 
 describe('createChatSdkBridge.deliver — display cards (send_card)', () => {
-  // The send_card MCP tool writes outbound rows with `{ type: 'card', card, fallbackText }`.
-  // Before this branch existed the bridge silently dropped them: cards have no
-  // `text` / `markdown`, so the trailing fallback `if (text)` was false and the
-  // function returned without calling the adapter. These tests pin the contract
-  // for the dedicated card branch.
+  const spec = (card: Record<string, unknown>, ...children: Array<[string, Record<string, unknown>]>) => ({
+    root: 'card',
+    elements: {
+      card: { type: 'Card', props: card, children: children.map(([key]) => key) },
+      ...Object.fromEntries(children.map(([key, el]) => [key, { children: [], ...el }])),
+    },
+  });
 
-  it('renders title, description, and string children, then posts via the adapter', async () => {
+  it('renders the spec into a Chat SDK card and posts it with its fallback text', async () => {
     const { calls, postMessage } = makePostCapture();
-    const bridge = createChatSdkBridge({
-      adapter: stubAdapter({ postMessage }),
-      supportsThreads: false,
-    });
+    const bridge = createChatSdkBridge({ adapter: stubAdapter({ postMessage }), supportsThreads: false });
     const id = await bridge.deliver('telegram:42', null, {
       kind: 'chat-sdk',
       content: {
         type: 'card',
-        card: {
-          title: 'Daily',
-          description: 'Your plate today',
-          children: ['• item one', '• item two'],
-        },
+        spec: spec(
+          { title: 'Daily' },
+          ['plate', { type: 'Text', props: { content: 'Your plate today' } }],
+          ['links', { type: 'Actions', props: {}, children: ['open'] }],
+          ['open', { type: 'LinkButton', props: { label: 'Open', url: 'https://example.com' } }],
+        ),
         fallbackText: 'Daily: your plate',
       },
     });
     expect(id).toBe('msg-stub');
     expect(calls).toHaveLength(1);
-    const msg = calls[0].message as { card?: unknown; fallbackText?: string };
-    expect(msg.fallbackText).toBe('Daily: your plate');
-    expect(msg.card).toBeDefined();
+    expect(calls[0].message).toEqual({
+      card: {
+        type: 'card',
+        title: 'Daily',
+        subtitle: undefined,
+        imageUrl: undefined,
+        children: [
+          { type: 'text', content: 'Your plate today', style: undefined },
+          { type: 'actions', children: [{ type: 'link-button', label: 'Open', url: 'https://example.com' }] },
+        ],
+      },
+      fallbackText: 'Daily: your plate',
+    });
   });
 
   it('caps rendered send_card titles without splitting emoji code points', async () => {
     const { calls, postMessage } = makePostCapture();
-    const bridge = createChatSdkBridge({
-      adapter: stubAdapter({ postMessage }),
-      supportsThreads: false,
-    });
+    const bridge = createChatSdkBridge({ adapter: stubAdapter({ postMessage }), supportsThreads: false });
     await bridge.deliver('slack:C123', null, {
       kind: 'chat-sdk',
       content: {
         type: 'card',
-        card: {
-          title: `${'A'.repeat(148)}🚨 tail`,
-          description: 'body',
-        },
+        spec: spec({ title: `${'A'.repeat(148)}🚨 tail` }, ['body', { type: 'Text', props: { content: 'body' } }]),
+        fallbackText: 'body',
       },
     });
 
@@ -818,68 +823,24 @@ describe('createChatSdkBridge.deliver — display cards (send_card)', () => {
     expect(hasLoneSurrogate(renderedTitle)).toBe(false);
   });
 
-  it('drops actions without url (send_card is fire-and-forget; non-URL buttons would have nowhere to land)', async () => {
+  it('refuses a click-back Button and an empty card without posting (display cards carry links only)', async () => {
     const { calls, postMessage } = makePostCapture();
-    const bridge = createChatSdkBridge({
-      adapter: stubAdapter({ postMessage }),
-      supportsThreads: false,
-    });
-    await bridge.deliver('discord:guild:chan', null, {
-      kind: 'chat-sdk',
-      content: {
-        type: 'card',
-        card: {
-          title: 'Card',
-          description: 'has only label-only actions',
-          actions: [{ label: 'Add' }, { label: 'Skip' }],
-        },
-      },
-    });
-    expect(calls).toHaveLength(1);
-    // Cast through the public Card shape to read the children we set
-    const msg = calls[0].message as { card?: { children?: Array<{ type?: string }> } };
-    const childTypes = (msg.card?.children ?? []).map((c) => c.type);
-    expect(childTypes).not.toContain('actions');
-  });
-
-  it('renders url actions as link buttons inside an Actions row', async () => {
-    const { calls, postMessage } = makePostCapture();
-    const bridge = createChatSdkBridge({
-      adapter: stubAdapter({ postMessage }),
-      supportsThreads: false,
-    });
-    await bridge.deliver('discord:guild:chan', null, {
-      kind: 'chat-sdk',
-      content: {
-        type: 'card',
-        card: {
-          title: 'Docs',
-          actions: [{ label: 'Open', url: 'https://example.com' }, { label: 'No-link' }],
-        },
-      },
-    });
-    const msg = calls[0].message as {
-      card?: { children?: Array<{ type?: string; children?: Array<{ type?: string; url?: string }> }> };
-    };
-    const actionsRow = msg.card?.children?.find((c) => c.type === 'actions');
-    expect(actionsRow).toBeDefined();
-    const buttons = actionsRow?.children ?? [];
-    expect(buttons).toHaveLength(1);
-    expect(buttons[0].type).toBe('link-button');
-    expect(buttons[0].url).toBe('https://example.com');
-  });
-
-  it('skips delivery when the card has neither title nor body content', async () => {
-    const { calls, postMessage } = makePostCapture();
-    const bridge = createChatSdkBridge({
-      adapter: stubAdapter({ postMessage }),
-      supportsThreads: false,
-    });
-    const id = await bridge.deliver('telegram:42', null, {
-      kind: 'chat-sdk',
-      content: { type: 'card', card: {} },
-    });
-    expect(id).toBeUndefined();
+    const bridge = createChatSdkBridge({ adapter: stubAdapter({ postMessage }), supportsThreads: false });
+    const deliver = (cardSpec: unknown) =>
+      bridge.deliver('discord:guild:chan', null, {
+        kind: 'chat-sdk',
+        content: { type: 'card', spec: cardSpec, fallbackText: 'x' },
+      });
+    await expect(
+      deliver(
+        spec(
+          { title: 'Card' },
+          ['row', { type: 'Actions', props: {}, children: ['add'] }],
+          ['add', { type: 'Button', props: { id: 'add', label: 'Add' } }],
+        ),
+      ),
+    ).rejects.toThrow('add: unknown component "Button"');
+    await expect(deliver(spec({}))).rejects.toThrow('the Card needs a title, an image or at least one child');
     expect(calls).toHaveLength(0);
   });
 

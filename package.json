@@ -41,6 +41,7 @@
     "ratchet:report": "tsx scripts/upstream-ratchet-report.ts",
     "upstream-dryrun-report": "tsx scripts/upstream-dry-run-report.ts",
     "build:dashboard": "tsx scripts/build-dashboard-spa.ts --install",
+    "card-guide:generate": "tsx scripts/generate-card-guide.ts",
     "mailbox-model:generate": "cp src/mailbox/model.ts container/agent-runner/src/mailbox/model.generated.ts",
     "mailbox-model:check": "cmp src/mailbox/model.ts container/agent-runner/src/mailbox/model.generated.ts"
   },
@@ -50,6 +51,8 @@
     "@chat-adapter/slack": "4.44.0",
     "@clack/core": "^1.5.1",
     "@clack/prompts": "^1.8.1",
+    "@json-render/chat": "0.22.0",
+    "@json-render/core": "0.22.0",
     "@onecli-sh/sdk": "2.2.1",
     "@slack/web-api": "8.2.0",
     "better-sqlite3": "13.0.3",

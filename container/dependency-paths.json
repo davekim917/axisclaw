@@ -59,6 +59,8 @@
 
     "@clack/core": { "kind": "runtime" },
     "@clack/prompts": { "kind": "runtime" },
+    "@json-render/chat": { "kind": "runtime" },
+    "@json-render/core": { "kind": "runtime" },
     "better-sqlite3": { "kind": "runtime" },
     "chokidar": { "kind": "runtime" },
     "cron-parser": { "kind": "runtime" },

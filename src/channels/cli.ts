@@ -286,6 +286,9 @@ function createAdapter(): ChannelAdapter {
 function extractText(message: OutboundMessage): string | null {
   const content = message.content as Record<string, unknown> | string | undefined;
   if (typeof content === 'string') return content;
+  if (content && typeof content === 'object' && content.type === 'card' && typeof content.fallbackText === 'string') {
+    return content.fallbackText;
+  }
   if (content && typeof content === 'object' && typeof content.text === 'string') {
     return content.text;
   }

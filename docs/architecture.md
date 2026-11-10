@@ -951,7 +951,7 @@ MCP tools write to the container's own `outbound.db`. Anything that needs a chan
 | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `send_message`      | Resolve `to` (destination name) → routing, write `messages_out` row, `kind: 'chat'`. Omit `to` to reply in place. Also the agent-to-agent path: a `to` naming an `agent`-type destination. |
 | `send_file`         | Copy file to `outbox/{msg_id}/`, write `messages_out` (`kind: 'chat'`) with filenames, same `to` resolution                                                                                |
-| `send_card`         | Write `messages_out`, `kind: 'chat-sdk'`, content `{ type: 'card', … }`                                                                                                                    |
+| `send_card`         | Write `messages_out`, `kind: 'chat-sdk'`, content `{ type: 'card', spec, fallbackText }`; the host validates the json-render spec and returns its issues through the delivery ack          |
 | `ask_user_question` | Write `messages_out` (`kind: 'chat-sdk'`, `type: 'ask_question'`). Hold tool call open, poll `inbound.db` for the response matching `questionId`. Return selection as tool result.         |
 | `edit_message`      | Write `messages_out` with `operation: 'edit'` (targets the original message's destination)                                                                                                 |
 | `add_reaction`      | Write `messages_out` with `operation: 'reaction'`                                                                                                                                          |
@@ -975,7 +975,7 @@ See [agent-runner-details.md](agent-runner-details.md) for full MCP tool paramet
 
 ### Cards
 
-**Agent-initiated (outbound):** Tool-based. Agent calls `ask_user_question` (interactive card with options) or `send_card` (structured card). Agent-runner writes the card structure to messages_out. Host/adapter handles platform-specific rendering (Slack Block Kit, Discord embeds, Telegram inline keyboard, text fallback).
+**Agent-initiated (outbound):** Tool-based. Agent calls `ask_user_question` (interactive card with options) or `send_card` (a json-render spec the host validates and renders). Agent-runner writes the card to messages_out. Host/adapter handles platform-specific rendering (Slack Block Kit, Discord embeds, Telegram inline keyboard, text fallback).
 
 **Host-initiated (approval cards):** When an action requires approval, the host generates a standardized approval card and sends it to the admin's DM. These are not agent-initiated — the agent doesn't know about the approval step. The card format is fixed (action description + approve/deny buttons).
 
