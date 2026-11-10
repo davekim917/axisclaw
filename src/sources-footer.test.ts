@@ -296,6 +296,141 @@ describe('buildSourcesFooter + renderSourcesFooter', () => {
   });
 });
 
+describe('Looker query links', () => {
+  const lookerFooter = (objects: unknown[]) =>
+    buildSourcesFooter(
+      { version: 1, systems: [{ system: 'looker', origin: ORIGIN, calls: objects.length, objects }] },
+      ctx,
+    )!;
+  const explore = (query?: Record<string, unknown>) => ({
+    kind: 'explore',
+    model: 'acme_sales',
+    explore: 'orders',
+    ...(query ? { query } : {}),
+  });
+  const EXPLORE_URL = `${ORIGIN}/explore/acme_sales/orders`;
+  const QUERY = {
+    fields: ['orders.region', 'orders.total_revenue'],
+    filters: { 'orders.city': `'Santa Cruz, CA',"Main" 100%`, 'orders.created_date': '7 days' },
+    sorts: ['orders.total_revenue desc'],
+    limit: 50,
+  };
+  const QUERY_URL =
+    `${EXPLORE_URL}?fields=orders.region,orders.total_revenue` +
+    `&f%5Borders.city%5D=%27Santa%20Cruz%2C%20CA%27%2C%22Main%22%20100%25` +
+    `&f%5Borders.created_date%5D=7%20days&sorts=orders.total_revenue%20desc&limit=50`;
+
+  it('links one query to its expanded Explore URL, which reads back as the exact query', () => {
+    const footer = lookerFooter([explore(QUERY)]);
+    expect(renderSourcesFooter(footer, 'slack-mrkdwn')).toBe(
+      `Data read (recorded) · Looker: <${QUERY_URL}|acme_sales/orders> (1 query)`,
+    );
+    expect(renderSourcesFooter(footer, 'discord-markdown')).toBe(
+      `Data read \\(recorded\\) · Looker: [acme\\_sales/orders](<${QUERY_URL}>) \\(1 query\\)`,
+    );
+    const params = new URL(QUERY_URL).searchParams;
+    expect(params.get('fields')).toBe(QUERY.fields.join(','));
+    expect(params.get('f[orders.city]')).toBe(QUERY.filters['orders.city']);
+    expect(params.get('f[orders.created_date]')).toBe('7 days');
+    expect(params.get('sorts')).toBe('orders.total_revenue desc');
+    expect(params.get('limit')).toBe('50');
+  });
+
+  it('drops one pair of outer quotes from a filter value, as the Looker MCP does before it queries', () => {
+    const footer = lookerFooter([explore({ fields: ['orders.city'], filters: { 'orders.city': `"Santa Cruz, CA"` } })]);
+    const url = /<([^|]+)\|/.exec(renderSourcesFooter(footer, 'slack-mrkdwn'))![1];
+    expect(new URL(url).searchParams.get('f[orders.city]')).toBe('Santa Cruz, CA');
+  });
+
+  it('carries pivots, the query timezone and custom fields', () => {
+    const dynamic = [{ table_calculation: 'share', label: 'Share', expression: '${orders.total_revenue} / 2' }];
+    const footer = lookerFooter([
+      explore({ ...QUERY, pivots: ['orders.region'], tz: 'America/Los_Angeles', dynamic_fields: dynamic }),
+    ]);
+    const url = /<([^|]+)\|/.exec(renderSourcesFooter(footer, 'slack-mrkdwn'))![1];
+    const params = new URL(url).searchParams;
+    expect(params.get('pivots')).toBe('orders.region');
+    expect(params.get('query_timezone')).toBe('America/Los_Angeles');
+    expect(JSON.parse(params.get('dynamic_fields')!)).toEqual(dynamic);
+  });
+
+  it('numbers two queries on one Explore, each linked to its own query', () => {
+    const other = { ...QUERY, limit: 10 };
+    const footer = lookerFooter([explore(QUERY), explore(other)]);
+    const otherUrl = QUERY_URL.replace('limit=50', 'limit=10');
+    expect(renderSourcesFooter(footer, 'slack-mrkdwn')).toBe(
+      `Data read (recorded) · Looker: acme_sales/orders (<${QUERY_URL}|q1>, <${otherUrl}|q2>) (2 queries)`,
+    );
+    expect(renderSourcesFooter(footer, 'discord-markdown')).toBe(
+      `Data read \\(recorded\\) · Looker: acme\\_sales/orders \\([q1](<${QUERY_URL}>), [q2](<${otherUrl}>)\\) \\(2 queries\\)`,
+    );
+    expect(renderSourcesFooter(footer, undefined)).toBe(
+      'Data read (recorded) · Looker: acme_sales/orders (q1, q2) (2 queries)',
+    );
+  });
+
+  it('links the same query run twice once', () => {
+    const footer = lookerFooter([explore(QUERY), explore({ ...QUERY })]);
+    expect(renderSourcesFooter(footer, 'slack-mrkdwn')).toBe(
+      `Data read (recorded) · Looker: <${QUERY_URL}|acme_sales/orders> (2 queries)`,
+    );
+  });
+
+  it('links a query too long for the line to its Explore, marked, never a cut URL', () => {
+    const long = { ...QUERY, filters: { 'orders.city': 'x'.repeat(1200) } };
+    const footer = lookerFooter([explore(long)]);
+    for (const markup of ['slack-mrkdwn', 'discord-markdown'] as const) {
+      const line = renderSourcesFooter(footer, markup);
+      expect(line).toContain(EXPLORE_URL);
+      expect(line).not.toContain('x'.repeat(10));
+      expect(line).toContain('Explore only');
+    }
+  });
+
+  it('swaps query links for Explore links, longest first, when together they overflow the line', () => {
+    const sized = (n: number, length: number) => ({ ...QUERY, filters: { 'orders.city': String(n).repeat(length) } });
+    const footer = lookerFooter([explore(sized(1, 150)), explore(sized(2, 200)), explore(sized(3, 400))]);
+    const line = renderSourcesFooter(footer, 'slack-mrkdwn');
+    expect(line.length).toBeLessThanOrEqual(1000);
+    expect(line).toContain('1'.repeat(150));
+    expect(line).toContain('2'.repeat(200));
+    expect(line).not.toContain('3'.repeat(10));
+    expect(line).toContain(`<${EXPLORE_URL}|q3 Explore only>`);
+  });
+
+  it('links an object from a runner without query definitions to its Explore, unmarked', () => {
+    expect(renderSourcesFooter(lookerFooter([explore()]), 'slack-mrkdwn')).toBe(
+      `Data read (recorded) · Looker: <${EXPLORE_URL}|acme_sales/orders> (1 query)`,
+    );
+  });
+
+  it.each([
+    ['a field that is not a LookML name', { ...QUERY, fields: ['orders.region&f[x]=1'] }],
+    ['a filter on a field that is not a LookML name', { ...QUERY, filters: { 'a.b]=1&c[': 'x' } }],
+    ['a filter value that is not text', { ...QUERY, filters: { 'orders.city': ['x'] } }],
+    ['a custom filter, which no documented URL parameter carries', { ...QUERY, filter_expression: '${a.b} > 1' }],
+    ['an argument the URL cannot carry', { ...QUERY, vis_config: { type: 'looker_bar' } }],
+    ['no fields', { filters: QUERY.filters }],
+    ['a malformed sort', { ...QUERY, sorts: ['orders.total_revenue; drop'] }],
+    ['a non-numeric limit', { ...QUERY, limit: '50&x=1' }],
+    ['a query whose time zone the runner could not know', { ...QUERY, tz_unknown: true }],
+    ['an empty time zone, which no URL parameter states', { ...QUERY, tz: '' }],
+    ['an unlimited read, more rows than an Explore shows', { ...QUERY, limit: -1 }],
+    ['a read past the Explore row cap', { ...QUERY, limit: 5001 }],
+    ['a filter value no URL can encode', { ...QUERY, filters: { 'orders.city': '\ud800' } }],
+  ])('links the Explore, marked, for %s', (_name, query) => {
+    const line = renderSourcesFooter(lookerFooter([explore(query)]), 'slack-mrkdwn');
+    expect(line).toBe(`Data read (recorded) · Looker: <${EXPLORE_URL}|acme_sales/orders (Explore only)> (1 query)`);
+  });
+
+  it('never builds a link to another origin', () => {
+    for (const fields of [['@evil.example'], ['//evil.example']]) {
+      const line = renderSourcesFooter(lookerFooter([explore({ fields })]), 'slack-mrkdwn');
+      for (const url of line.matchAll(/<([^|>]+)\|/g)) expect(new URL(url[1]).origin).toBe(ORIGIN);
+    }
+  });
+});
+
 describe('scopedLookerOrigin', () => {
   it('reads only the folder-scoped variable, never the bare one', () => {
     expect(scopedLookerOrigin('acme-corp', { LOOKER_BASE_URL_ACME_CORP: `${ORIGIN}/` })).toBe(ORIGIN);

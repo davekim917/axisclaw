@@ -9,9 +9,16 @@ import { getAgentGroup } from './db/agent-groups.js';
 import { log } from './log.js';
 import { formatLocalTime } from './timezone.js';
 
+/** One Looker query run on an Explore: its exact URL, or none when only the Explore itself can be linked. */
+interface QueryLink {
+  url?: string;
+}
+
 interface FooterSegment {
   text: string;
   url?: string;
+  /** Looker Explores only: each distinct query the turn ran on it, in the order first run. */
+  queries?: QueryLink[];
 }
 
 interface FooterSystem {
@@ -53,6 +60,15 @@ const SYSTEMS = {
 type SystemName = keyof typeof SYSTEMS;
 
 const LOOKML_NAME_RE = /^[A-Za-z0-9_]{1,100}$/;
+// A field as the query tool names it: `view.field`, or a bare name for a custom field or table calculation.
+const LOOKML_FIELD = '[A-Za-z0-9_]{1,100}(?:\\.[A-Za-z0-9_]{1,100})?';
+const LOOKML_FIELD_RE = new RegExp(`^${LOOKML_FIELD}$`);
+const LOOKER_SORT_RE = new RegExp(`^${LOOKML_FIELD}(?: (?:asc|desc))?(?: [0-9]{1,3})?$`, 'i');
+const LOOKER_LIMIT_RE = /^-?[0-9]{1,9}$/;
+const LOOKER_EXPLORE_MAX_ROWS = 5000;
+const LOOKER_TIMEZONE_RE = /^[A-Za-z0-9_+\-/]{1,64}$/;
+/** Marks a link that opens the Explore because the exact query could not be put in one. */
+const EXPLORE_ONLY = 'Explore only';
 const LOOKER_ID_RE = /^[A-Za-z0-9_:-]{1,100}$/;
 const SHEET_ID_RE = /^[A-Za-z0-9_-]{10,100}$/;
 // The runner names a database only in this shape; anything else (a host, a user, a connection string) is refused here too.
@@ -72,15 +88,122 @@ function rec(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
 }
 
+/** Percent-encodes everything but unreserved characters, parentheses and quotes included, so no markup can end a link. */
+function encodeQueryPart(value: string): string {
+  return encodeURIComponent(value).replace(/[!'()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
+}
+
+function fieldList(value: unknown, re: RegExp = LOOKML_FIELD_RE): string[] | null {
+  return Array.isArray(value) && value.every((f) => typeof f === 'string' && re.test(f)) ? (value as string[]) : null;
+}
+
+/**
+ * A filter value as the Looker MCP sends it on: it strips one pair of matching outer quotes, so `'a, b'` reaches
+ * Looker as `a, b` (two values), and the link has to say the same.
+ */
+function lookerFilterValueSent(value: string): string {
+  const first = value[0];
+  return value.length >= 2 && (first === "'" || first === '"') && value[value.length - 1] === first
+    ? value.slice(1, -1)
+    : value;
+}
+
+/**
+ * Looker's expanded Explore URL for the query a `query` call ran, or null when any part of it cannot be carried in
+ * that URL exactly: a link that dropped a filter would show different data from what was read. The Looker MCP's
+ * `filter_expression` (a custom filter) is one such part: no Looker document names its Explore URL parameter.
+ */
+function lookerQueryUrl(origin: string, model: string, explore: string, rawQuery: unknown): string | null {
+  try {
+    return buildLookerQueryUrl(origin, model, explore, rawQuery);
+  } catch {
+    // A lone surrogate in a filter value makes encodeURIComponent throw.
+    return null;
+  }
+}
+
+function buildLookerQueryUrl(origin: string, model: string, explore: string, rawQuery: unknown): string | null {
+  const q = rec(rawQuery);
+  if (!q) return null;
+  const params: string[] = [];
+  for (const key of Object.keys(q)) {
+    if (!['fields', 'filters', 'pivots', 'sorts', 'limit', 'tz', 'dynamic_fields'].includes(key)) return null;
+  }
+  const fields = fieldList(q.fields);
+  if (!fields || fields.length === 0) return null;
+  params.push(`fields=${fields.join(',')}`);
+  if (q.filters !== undefined) {
+    const filters = rec(q.filters);
+    if (!filters) return null;
+    for (const [field, value] of Object.entries(filters)) {
+      if (!LOOKML_FIELD_RE.test(field) || typeof value !== 'string') return null;
+      params.push(`f%5B${field}%5D=${encodeQueryPart(lookerFilterValueSent(value))}`);
+    }
+  }
+  if (q.pivots !== undefined) {
+    const pivots = fieldList(q.pivots);
+    if (!pivots) return null;
+    if (pivots.length > 0) params.push(`pivots=${pivots.join(',')}`);
+  }
+  if (q.sorts !== undefined) {
+    const sorts = fieldList(q.sorts, LOOKER_SORT_RE);
+    if (!sorts) return null;
+    if (sorts.length > 0) params.push(`sorts=${sorts.map(encodeQueryPart).join(',')}`);
+  }
+  if (q.limit !== undefined) {
+    if ((typeof q.limit !== 'number' && typeof q.limit !== 'string') || !LOOKER_LIMIT_RE.test(String(q.limit)))
+      return null;
+    // The API returns every row asked for; an Explore shows at most 5,000, so a bigger read is not reproducible there.
+    const limit = Number(q.limit);
+    if (limit < 0 || limit > LOOKER_EXPLORE_MAX_ROWS) return null;
+    params.push(`limit=${String(q.limit)}`);
+  }
+  if (q.tz !== undefined) {
+    if (typeof q.tz !== 'string' || !LOOKER_TIMEZONE_RE.test(q.tz)) return null;
+    params.push(`query_timezone=${encodeQueryPart(q.tz)}`);
+  }
+  if (q.dynamic_fields !== undefined) {
+    if (!Array.isArray(q.dynamic_fields) || !q.dynamic_fields.every((d) => rec(d) !== null)) return null;
+    if (q.dynamic_fields.length > 0) params.push(`dynamic_fields=${encodeQueryPart(JSON.stringify(q.dynamic_fields))}`);
+  }
+  const url = `${origin}/explore/${model}/${explore}?${params.join('&')}`;
+  return new URL(url).origin === origin ? url : null;
+}
+
+/**
+ * One segment per Explore, every distinct query run on it listed under it. A query too long to ever fit the line, or
+ * one whose definition fails validation, keeps its place as a link to the Explore. An object from a runner that
+ * predates query definitions links to the Explore unmarked, as it always did.
+ */
+function lookerExploreSegments(raws: unknown[], origin: string): Map<string, FooterSegment> {
+  const byExplore = new Map<string, FooterSegment>();
+  for (const raw of raws) {
+    const o = rec(raw);
+    if (!o || o.kind !== 'explore' || !LOOKML_NAME_RE.test(String(o.model)) || !LOOKML_NAME_RE.test(String(o.explore)))
+      continue;
+    const text = `${String(o.model)}/${String(o.explore)}`;
+    let segment = byExplore.get(text);
+    if (!segment) {
+      segment = { text, url: `${origin}/explore/${String(o.model)}/${String(o.explore)}` };
+      byExplore.set(text, segment);
+    }
+    if (!('query' in o)) continue;
+    const url = lookerQueryUrl(origin, String(o.model), String(o.explore), o.query);
+    const queries = (segment.queries ??= []);
+    if (url && url.length <= MAX_MARKUP_LENGTH) {
+      if (!queries.some((q) => q.url === url)) queries.push({ url });
+    } else {
+      queries.push({});
+    }
+  }
+  return byExplore;
+}
+
 function objectSegment(system: SystemName, raw: unknown, ctx: SourcesFooterContext): FooterSegment | null {
   const o = rec(raw);
   if (!o) return null;
   if (system === 'looker') {
     const origin = ctx.lookerOrigin!;
-    if (o.kind === 'explore' && LOOKML_NAME_RE.test(String(o.model)) && LOOKML_NAME_RE.test(String(o.explore))) {
-      const text = `${String(o.model)}/${String(o.explore)}`;
-      return { text, url: `${origin}/explore/${String(o.model)}/${String(o.explore)}` };
-    }
     if ((o.kind === 'look' || o.kind === 'dashboard') && LOOKER_ID_RE.test(String(o.id))) {
       const text = `${o.kind} ${String(o.id)}`;
       const path = o.kind === 'look' ? 'looks' : 'dashboards';
@@ -168,10 +291,30 @@ export function buildSourcesFooter(sources: unknown, ctx: SourcesFooterContext):
       latest = s.lastAt;
 
     const raws = Array.isArray(s.objects) ? s.objects : [];
-    const objects =
-      system === 'sheets'
-        ? sheetObjects(raws)
-        : raws.map((o) => objectSegment(system, o, ctx)).filter((o): o is FooterSegment => o !== null);
+    let objects: FooterSegment[];
+    if (system === 'sheets') {
+      objects = sheetObjects(raws);
+    } else if (system === 'looker') {
+      // Each Explore keeps the place of its first query among the looks and dashboards.
+      const explores = lookerExploreSegments(raws, ctx.lookerOrigin!);
+      const placed = new Set<string>();
+      objects = [];
+      for (const raw of raws) {
+        const o = rec(raw);
+        if (o?.kind === 'explore') {
+          const segment = explores.get(`${String(o.model)}/${String(o.explore)}`);
+          if (segment && !placed.has(segment.text)) {
+            placed.add(segment.text);
+            objects.push(segment);
+          }
+        } else {
+          const segment = objectSegment(system, raw, ctx);
+          if (segment) objects.push(segment);
+        }
+      }
+    } else {
+      objects = raws.map((o) => objectSegment(system, o, ctx)).filter((o): o is FooterSegment => o !== null);
+    }
     const { name, unit } = SYSTEMS[system];
     systems.push({ name, calls, unit: calls === 1 ? unit[0] : unit[1], objects });
   }
@@ -187,21 +330,48 @@ function escapeDiscord(text: string): string {
   return text.replace(/[\\*_~`|[\]()<>]/g, (c) => `\\${c}`);
 }
 
-function renderObject({ text, url }: FooterSegment, markup: SubtextMarkup | undefined): string {
+function renderLink(text: string, url: string | undefined, markup: SubtextMarkup | undefined): string {
   if (markup === 'slack-mrkdwn') return url ? `<${url}|${escapeSlack(text)}>` : escapeSlack(text);
   if (markup === 'discord-markdown') return url ? `[${escapeDiscord(text)}](<${url}>)` : escapeDiscord(text);
   return text;
 }
 
 function renderText(text: string, markup: SubtextMarkup | undefined): string {
-  return renderObject({ text }, markup);
+  return renderLink(text, undefined, markup);
 }
 
-function compose(footer: SourcesFooter, shown: readonly number[], markup: SubtextMarkup | undefined): string {
+/** Query links the line no longer has room for, by object; each then links to its Explore, marked. */
+type Degraded = Map<FooterSegment, Set<number>>;
+
+/**
+ * One query names the Explore and links to the query. Several are numbered under the Explore's name, each linked.
+ * A query without an exact URL links to the Explore and says so.
+ */
+function renderObject(segment: FooterSegment, markup: SubtextMarkup | undefined, degraded: Degraded): string {
+  const { text, url, queries } = segment;
+  if (!queries || queries.length === 0) return renderLink(text, url, markup);
+  const exact = (i: number): string | undefined => (degraded.get(segment)?.has(i) ? undefined : queries[i].url);
+  if (queries.length === 1) {
+    const q = exact(0);
+    return q ? renderLink(text, q, markup) : renderLink(`${text} (${EXPLORE_ONLY})`, url, markup);
+  }
+  const links = queries.map((_, i) => {
+    const q = exact(i);
+    return q ? renderLink(`q${i + 1}`, q, markup) : renderLink(`q${i + 1} ${EXPLORE_ONLY}`, url, markup);
+  });
+  return `${renderText(`${text} (`, markup)}${links.join(renderText(', ', markup))}${renderText(')', markup)}`;
+}
+
+function compose(
+  footer: SourcesFooter,
+  shown: readonly number[],
+  markup: SubtextMarkup | undefined,
+  degraded: Degraded = new Map(),
+): string {
   const parts = [renderText(LABEL, markup)];
   footer.systems.forEach((system, i) => {
     const k = shown[i];
-    const listed = system.objects.slice(0, k).map((o) => renderObject(o, markup));
+    const listed = system.objects.slice(0, k).map((o) => renderObject(o, markup, degraded));
     const more = k > 0 && system.objects.length > k ? `, +${system.objects.length - k} more` : '';
     const names = listed.length > 0 ? `: ${listed.join(', ')}${renderText(more, markup)}` : '';
     parts.push(`${renderText(system.name, markup)}${names}${renderText(` (${system.calls} ${system.unit})`, markup)}`);
@@ -210,17 +380,45 @@ function compose(footer: SourcesFooter, shown: readonly number[], markup: Subtex
   return parts.join(' · ');
 }
 
+/** The longest query URL still linked among the names shown, so swapping it for the Explore's saves the most. */
+function longestExactQuery(
+  footer: SourcesFooter,
+  shown: readonly number[],
+  degraded: Degraded,
+): { segment: FooterSegment; index: number } | null {
+  let best: { segment: FooterSegment; index: number; length: number } | null = null;
+  footer.systems.forEach((system, i) => {
+    for (const segment of system.objects.slice(0, shown[i])) {
+      segment.queries?.forEach((q, index) => {
+        if (q.url && !degraded.get(segment)?.has(index) && (!best || q.url.length > best.length))
+          best = { segment, index, length: q.url.length };
+      });
+    }
+  });
+  return best;
+}
+
 /**
- * One line in the platform's own markup; a platform with no declared markup gets plain text and no links. Too long a
- * line sheds object names one at a time, longest list first, keeping each system's first name until nothing else is
- * left to drop; systems and counts always stay.
+ * One line in the platform's own markup; a platform with no declared markup gets plain text and no links. A line whose
+ * links overflow it first swaps the longest query links for their Explore's link, marked, one at a time. A line still
+ * too long sheds object names one at a time, longest list first, keeping each system's first name until nothing else
+ * is left to drop; systems and counts always stay.
  */
 export function renderSourcesFooter(footer: SourcesFooter, markup: SubtextMarkup | undefined): string {
   const shown = footer.systems.map((s) => Math.min(s.objects.length, MAX_OBJECTS_PER_SYSTEM));
-  const tooLong = (): boolean =>
-    compose(footer, shown, undefined).length > MAX_VISIBLE_LENGTH ||
-    compose(footer, shown, markup).length > MAX_MARKUP_LENGTH;
-  while (tooLong()) {
+  const degraded: Degraded = new Map();
+  for (;;) {
+    const visibleTooLong = compose(footer, shown, undefined, degraded).length > MAX_VISIBLE_LENGTH;
+    if (!visibleTooLong && compose(footer, shown, markup, degraded).length <= MAX_MARKUP_LENGTH) break;
+    if (!visibleTooLong && markup) {
+      const swap = longestExactQuery(footer, shown, degraded);
+      if (swap) {
+        const set = degraded.get(swap.segment) ?? new Set<number>();
+        set.add(swap.index);
+        degraded.set(swap.segment, set);
+        continue;
+      }
+    }
     let pick = -1;
     shown.forEach((k, i) => {
       if (k > 1 && (pick === -1 || k > shown[pick])) pick = i;
@@ -229,7 +427,7 @@ export function renderSourcesFooter(footer: SourcesFooter, markup: SubtextMarkup
     if (pick === -1) break;
     shown[pick] -= 1;
   }
-  return compose(footer, shown, markup);
+  return compose(footer, shown, markup, degraded);
 }
 
 function isFooter(value: unknown): value is SourcesFooter {
@@ -243,12 +441,17 @@ function isFooter(value: unknown): value is SourcesFooter {
       typeof s.calls === 'number' &&
       typeof s.unit === 'string' &&
       Array.isArray(s.objects) &&
-      s.objects.every(
-        (o) =>
-          rec(o) !== null &&
-          typeof (o as FooterSegment).text === 'string' &&
-          ((o as FooterSegment).url === undefined || typeof (o as FooterSegment).url === 'string'),
-      )
+      s.objects.every((raw) => {
+        const o = rec(raw) as Partial<FooterSegment> | null;
+        return (
+          !!o &&
+          typeof o.text === 'string' &&
+          (o.url === undefined || typeof o.url === 'string') &&
+          (o.queries === undefined ||
+            (Array.isArray(o.queries) &&
+              o.queries.every((q) => rec(q) !== null && (q.url === undefined || typeof q.url === 'string'))))
+        );
+      })
     );
   });
 }

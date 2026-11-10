@@ -79,7 +79,14 @@ describe('sources stamp', () => {
           origin: 'https://acme.looker.example',
           calls: 1,
           lastAt: TS,
-          objects: [{ kind: 'explore', model: 'acme_retail', explore: 'web_sessions' }],
+          objects: [
+            expect.objectContaining({
+              kind: 'explore',
+              model: 'acme_retail',
+              explore: 'web_sessions',
+              query: expect.any(Object),
+            }),
+          ],
         },
       ],
     });

@@ -7,7 +7,7 @@
 import type { LedgerEntry } from './source-ledger.js';
 
 type SourceObject =
-  | { kind: 'explore'; model: string; explore: string }
+  | { kind: 'explore'; model: string; explore: string; query?: Record<string, unknown> }
   | { kind: 'look'; id: string }
   | { kind: 'dashboard'; id: string }
   | { kind: 'table'; name: string; database?: string }
@@ -43,12 +43,65 @@ function str(value: unknown): string | null {
   return typeof value === 'string' && value.trim() ? value.trim() : null;
 }
 
-function recognizeLooker(tool: string, args: unknown): Recognized | null {
+function isEmptyArg(value: unknown): boolean {
+  if (value === undefined || value === null || value === '') return true;
+  if (Array.isArray(value)) return value.length === 0;
+  return typeof value === 'object' && Object.keys(value).length === 0;
+}
+
+/**
+ * The zone the Looker MCP ran a query in when the call named none: its `TZ` env (UTC when empty), which the host sets
+ * on every container to a zone it has already validated. Without `TZ` the MCP infers one from `/etc/localtime`; that
+ * case is left unknown.
+ */
+function lookerRuntimeTimezone(env: NodeJS.ProcessEnv): string | null {
+  const tz = env.TZ;
+  if (tz === undefined) return null;
+  return tz === '' ? 'UTC' : tz;
+}
+
+/**
+ * Every argument the call sent except the Explore's own names, empty ones dropped (an empty `filters` or `pivots` is
+ * the tool's default): the host rebuilds the query from this, and refuses to call a link exact if any key is one it
+ * cannot put in a URL. A query that named no zone ran in the MCP's own, so that zone is written in; when it cannot be
+ * known, a key no URL carries says so, and the host links the Explore instead.
+ */
+function lookerQueryDefinition(a: Record<string, unknown>, env: NodeJS.ProcessEnv): Record<string, unknown> {
+  const query: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(a)) {
+    // An empty `tz` is sent to Looker as is: only a missing one makes the MCP use its own zone.
+    if (key === 'model' || key === 'explore' || (isEmptyArg(value) && !(key === 'tz' && value === ''))) continue;
+    query[key] = value;
+  }
+  if (query.tz === undefined) {
+    const tz = lookerRuntimeTimezone(env);
+    if (tz) query.tz = tz;
+    else query.tz_unknown = true;
+  }
+  return query;
+}
+
+/** JSON with every object's keys sorted, so two calls that sent the same query in a different key order match. */
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    const entries = Object.keys(value as Record<string, unknown>)
+      .sort()
+      .map((k) => `${JSON.stringify(k)}:${canonicalJson((value as Record<string, unknown>)[k])}`);
+    return `{${entries.join(',')}}`;
+  }
+  return JSON.stringify(value) ?? 'null';
+}
+
+function recognizeLooker(tool: string, args: unknown, env: NodeJS.ProcessEnv): Recognized | null {
   const a = (args && typeof args === 'object' ? args : {}) as Record<string, unknown>;
   if (tool === 'query') {
     const model = str(a.model);
     const explore = str(a.explore);
-    return { system: 'looker', objects: model && explore ? [{ kind: 'explore', model, explore }] : [] };
+    return {
+      system: 'looker',
+      objects: model && explore ? [{ kind: 'explore', model, explore, query: lookerQueryDefinition(a, env) }] : [],
+    };
   }
   if (tool === 'run_look') {
     const id = str(a.look_id);
@@ -869,11 +922,11 @@ function recognizePostgres(database: string | undefined, tables: readonly string
   return { system: 'postgres', objects };
 }
 
-function recognize(entry: LedgerEntry): Recognized | null {
+function recognize(entry: LedgerEntry, env: NodeJS.ProcessEnv): Recognized | null {
   if (!entry.ok) return null;
   if (entry.recorder === 'mcp') {
     if (entry.server !== 'looker' || !entry.origin) return null;
-    const hit = recognizeLooker(entry.tool, entry.args);
+    const hit = recognizeLooker(entry.tool, entry.args, env);
     return hit && { ...hit, origin: entry.origin };
   }
   if (entry.recorder === 'snowflake') return recognizeSnowflake(entry.sql, entry.truncated === true);
@@ -886,7 +939,7 @@ function objectKey(system: SourceSystem, o: SourceObject): string {
     case 'database':
       return `database:${o.name}`;
     case 'explore':
-      return `explore:${o.model}/${o.explore}`;
+      return `explore:${o.model}/${o.explore}:${o.query ? canonicalJson(o.query) : ''}`;
     case 'look':
     case 'dashboard':
       return `${o.kind}:${o.id}`;
@@ -905,13 +958,16 @@ function withoutNamedDatabases(objects: SourceObject[]): SourceObject[] {
 }
 
 /** Null when no entry recorded a data call: such a reply carries no footer. */
-export function summarizeSources(entries: readonly LedgerEntry[]): SourcesPayload | null {
+export function summarizeSources(
+  entries: readonly LedgerEntry[],
+  env: NodeJS.ProcessEnv = process.env,
+): SourcesPayload | null {
   const groups = new Map<
     string,
     { system: SourceSystem; origin?: string; calls: number; lastAt: string; objects: Map<string, SourceObject> }
   >();
   for (const entry of entries) {
-    const hit = recognize(entry);
+    const hit = recognize(entry, env);
     if (!hit) continue;
     const key = `${hit.system}|${hit.origin ?? ''}`;
     let group = groups.get(key);

@@ -75,12 +75,12 @@ cannot drop one that a recorder saw.
 
 ## What counts
 
-| System    | Counted                                                                                                                                                                        | Not counted                                                                                                                                                                                                                                                                                                     |
-| --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Looker    | `query`, `run_look`, `run_dashboard` that returned without error                                                                                                               | `query_sql` (returns SQL, not rows), metadata tools, failures                                                                                                                                                                                                                                                   |
-| Snowflake | Every `SELECT`/`WITH` statement that returned and reads data, not only catalog views, named by the tables it reads where those can be read                                     | DDL, DML, `SHOW`, `describe()`, a single-relation lookup of one `INFORMATION_SCHEMA`/`SNOWFLAKE.ACCOUNT_USAGE` view, session commands, failures                                                                                                                                                                 |
+| System    | Counted                                                                                                                                                                        | Not counted                                                                                                                                                                                                                                                                                                                                                |
+| --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Looker    | `query`, `run_look`, `run_dashboard` that returned without error                                                                                                               | `query_sql` (returns SQL, not rows), metadata tools, failures                                                                                                                                                                                                                                                                                              |
+| Snowflake | Every `SELECT`/`WITH` statement that returned and reads data, not only catalog views, named by the tables it reads where those can be read                                     | DDL, DML, `SHOW`, `describe()`, a single-relation lookup of one `INFORMATION_SCHEMA`/`SNOWFLAKE.ACCOUNT_USAGE` view, session commands, failures                                                                                                                                                                                                            |
 | Postgres  | A `psql` call that exits 0 and runs a `SELECT`/`WITH`/`TABLE` reading a relation, or a `COPY ... TO`/`\copy ... to`, named as `<database>.<schema>.<table>` from `-c` commands | writes (including a data-modifying CTE, a CTE followed by `UPDATE`/`DELETE`, and `SELECT ... INTO`), DDL, `COPY ... FROM` and its inline data, session and meta-commands, a `SELECT` of no stored relation (`select 1`, a function, `VALUES`), reads of `information_schema`/`pg_catalog` alone, `-l`, failures, a call that can only reach a local server |
-| Sheets    | `gws sheets +read`, `spreadsheets values get/batchGet`, exit 0                                                                                                                 | writes, `--dry-run`, failures                                                                                                                                                                                                                                                                                   |
+| Sheets    | `gws sheets +read`, `spreadsheets values get/batchGet`, exit 0                                                                                                                 | writes, `--dry-run`, failures                                                                                                                                                                                                                                                                                                                              |
 
 The runner and the `send_message` subprocess consume through one `BEGIN IMMEDIATE` on a SQLite cursor, which a
 consumer that dies releases with its process. The ledger is append-only for the container's life; the recorders stop
@@ -125,6 +125,27 @@ The result cache is not visible to any recorder, so the line never says "live". 
 
 ## Shape of the line
 
-Each spreadsheet appears once, linked, named by the tabs it read (`Plan, Summary +7 tabs`), not by every range. A
-system lists up to five names. A line whose visible text (link text, not URLs) runs past 300 characters, or whose markup runs past 1000, sheds names one at a time from the longest
-list, keeping each system's first name until nothing else is left, so systems and counts always stay.
+Each spreadsheet appears once, linked, named by the tabs it read (`Plan, Summary +7 tabs`), not by every range.
+
+A Looker Explore links to the exact query that ran, not to the Explore. The runner keeps each `query` call's arguments
+on its Explore object, one object per distinct query (keys sorted, so the same query run twice is one), and the host
+rebuilds Looker's expanded Explore URL from them (`?fields=…&f[view.field]=…&pivots=…&sorts=…&limit=…&query_timezone=…&dynamic_fields=…`),
+with no Looker API call and nothing written to Looker. One query on an Explore: the Explore's name links to it. Several:
+`sales/orders (q1, q2)`, each numbered link its own query. A query links to the Explore instead, marked `Explore only`,
+when its definition fails validation (a field or sort that is not a LookML name, a non-text filter value), when it
+asks for more rows than an Explore shows (`limit` above 5,000, or `-1`), when it carries an argument no documented URL parameter holds (`filter_expression`, Looker's custom filter, is one: a link
+that dropped it would show different rows), or when its URL does not fit the line. An Explore object without a query
+definition, from a runner older than this, links to the Explore unmarked, as before. A URL is never cut.
+
+The URL carries what the Looker MCP sent Looker, not what the agent typed: it strips one pair of outer quotes from each
+filter value, and a query that names no `tz` runs in the MCP's own zone (the container's `TZ`), which the runner
+writes into the definition. One rewrite is not mirrored: for a LookML `type: unquoted` parameter the MCP escapes `_`
+and `%` after looking the field up, so such a link may open with Looker's "filter is not allowed" error, never with
+other rows.
+
+A system lists up to five names. A line whose visible text (link text, not URLs) runs past 300 characters, or whose
+markup runs past 1000, first swaps its longest query links for their Explore's link, then sheds names one at a time
+from the longest list, keeping each system's first name until nothing else is left, so systems and counts always stay.
+The 1000 is well inside the platforms' own caps (Slack: 3000 for the context block's text, status line included;
+Discord: 2000 for the whole message), and it is what the bridge reserves out of every body chunk for the small print,
+so raising it shortens every chunk of a long reply.

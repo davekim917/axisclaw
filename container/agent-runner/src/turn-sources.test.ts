@@ -332,24 +332,27 @@ describe('summarizeSources', () => {
   });
 
   it('counts each data call and lists each object once, systems in a fixed order', () => {
-    const out = summarizeSources([
-      gws(['sheets', '+read', '--spreadsheet', 'SHEET_ID_123', '--range', 'Summary!A2:F90']),
-      snow('select * from a.fct_orders join a.dim_customer using (id)', true, '2026-11-03T14:05:00.000Z'),
-      looker('query', { model: 'acme_retail', explore: 'web_sessions', fields: ['x'] }),
-      looker('query', { model: 'acme_retail', explore: 'web_sessions' }),
-      looker('run_look', { look_id: 42 }),
-      looker('run_dashboard', { dashboard_id: 'acme_retail::kpis' }),
-      snow('select * from a.fct_orders'),
-      gws([
-        'sheets',
-        'spreadsheets',
-        'values',
-        'batchGet',
-        '--params',
-        JSON.stringify({ spreadsheetId: 'SHEET_ID_123', ranges: ['Tab!A1:B2', 'Summary!A2:F90'] }),
-      ]),
-      gws(['sheets', 'spreadsheets', 'values', 'get', '--params', '{"spreadsheetId":"OTHER_ID_99","range":"X!A1"}']),
-    ]);
+    const out = summarizeSources(
+      [
+        gws(['sheets', '+read', '--spreadsheet', 'SHEET_ID_123', '--range', 'Summary!A2:F90']),
+        snow('select * from a.fct_orders join a.dim_customer using (id)', true, '2026-11-03T14:05:00.000Z'),
+        looker('query', { model: 'acme_retail', explore: 'web_sessions', fields: ['x'] }),
+        looker('query', { model: 'acme_retail', explore: 'web_sessions' }),
+        looker('run_look', { look_id: 42 }),
+        looker('run_dashboard', { dashboard_id: 'acme_retail::kpis' }),
+        snow('select * from a.fct_orders'),
+        gws([
+          'sheets',
+          'spreadsheets',
+          'values',
+          'batchGet',
+          '--params',
+          JSON.stringify({ spreadsheetId: 'SHEET_ID_123', ranges: ['Tab!A1:B2', 'Summary!A2:F90'] }),
+        ]),
+        gws(['sheets', 'spreadsheets', 'values', 'get', '--params', '{"spreadsheetId":"OTHER_ID_99","range":"X!A1"}']),
+      ],
+      { TZ: 'UTC' },
+    );
     expect(out).toEqual({
       version: 1,
       systems: [
@@ -359,7 +362,8 @@ describe('summarizeSources', () => {
           calls: 4,
           lastAt: TS,
           objects: [
-            { kind: 'explore', model: 'acme_retail', explore: 'web_sessions' },
+            { kind: 'explore', model: 'acme_retail', explore: 'web_sessions', query: { fields: ['x'], tz: 'UTC' } },
+            { kind: 'explore', model: 'acme_retail', explore: 'web_sessions', query: { tz: 'UTC' } },
             { kind: 'look', id: '42' },
             { kind: 'dashboard', id: 'acme_retail::kpis' },
           ],
@@ -467,6 +471,80 @@ describe('summarizeSources', () => {
     expect(summarizeSources([snow('select * from identifier($t)'), snow('select current_version()')])?.systems).toEqual(
       [{ system: 'snowflake', calls: 2, lastAt: TS, objects: [] }],
     );
+  });
+
+  it('keeps each distinct Looker query as its own object, and the same query run twice as one', () => {
+    const first = {
+      model: 'acme_retail',
+      explore: 'web_sessions',
+      fields: ['sessions.day', 'sessions.count'],
+      filters: { 'sessions.region': "'North, East'", 'sessions.day': '7 days' },
+      sorts: ['sessions.day desc'],
+      limit: 50,
+      pivots: [],
+    };
+    const sameQueryOtherKeyOrder = {
+      limit: 50,
+      sorts: ['sessions.day desc'],
+      filters: { 'sessions.day': '7 days', 'sessions.region': "'North, East'" },
+      fields: ['sessions.day', 'sessions.count'],
+      explore: 'web_sessions',
+      model: 'acme_retail',
+    };
+    const other = { ...first, limit: 10 };
+    const out = summarizeSources(
+      [looker('query', first), looker('query', sameQueryOtherKeyOrder), looker('query', other)],
+      { TZ: 'America/Chicago' },
+    );
+    expect(out?.systems[0].calls).toBe(3);
+    expect(out?.systems[0].objects).toEqual([
+      {
+        kind: 'explore',
+        model: 'acme_retail',
+        explore: 'web_sessions',
+        query: {
+          fields: ['sessions.day', 'sessions.count'],
+          filters: { 'sessions.region': "'North, East'", 'sessions.day': '7 days' },
+          sorts: ['sessions.day desc'],
+          limit: 50,
+          tz: 'America/Chicago',
+        },
+      },
+      {
+        kind: 'explore',
+        model: 'acme_retail',
+        explore: 'web_sessions',
+        query: {
+          fields: ['sessions.day', 'sessions.count'],
+          filters: { 'sessions.region': "'North, East'", 'sessions.day': '7 days' },
+          sorts: ['sessions.day desc'],
+          limit: 10,
+          tz: 'America/Chicago',
+        },
+      },
+    ]);
+  });
+
+  it.each([
+    ['the zone the query named', { tz: 'Asia/Tokyo' }, { TZ: 'America/Chicago' }, { tz: 'Asia/Tokyo' }],
+    ['the MCP zone when the query named none', {}, { TZ: 'America/Chicago' }, { tz: 'America/Chicago' }],
+    ['UTC when the zone is set empty', {}, { TZ: '' }, { tz: 'UTC' }],
+    ['an empty zone the query named, which the MCP sends as is', { tz: '' }, { TZ: 'America/Chicago' }, { tz: '' }],
+    [
+      'the MCP zone when the query named a null one',
+      { tz: null },
+      { TZ: 'America/Chicago' },
+      { tz: 'America/Chicago' },
+    ],
+    ['that the zone is unknown when nothing sets it', {}, {}, { tz_unknown: true }],
+  ])('records %s', (_name, args, env, expected) => {
+    const out = summarizeSources(
+      [looker('query', { model: 'm', explore: 'e', fields: ['v.f'], ...args })],
+      env as NodeJS.ProcessEnv,
+    );
+    expect(out?.systems[0].objects).toEqual([
+      { kind: 'explore', model: 'm', explore: 'e', query: { fields: ['v.f'], ...expected } },
+    ]);
   });
 
   it('keeps calls to two Looker instances apart, and ignores a call with no recorded instance', () => {
