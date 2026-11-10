@@ -650,9 +650,9 @@ See `container/agent-runner/src/providers/secret-env.ts`. Out of scope: an agent
 
 ### Discord-specific: bot messages
 
-The host runs Discord's gateway in forwarding mode, which hands every bot's message to the host. A sibling bot's `@mention` therefore reaches the other agent as a bot-authored mention (`src/channels/discord-live-path.test.ts`). Both bots must be loaded in the same host process, so each one's identity, fetched at adapter init via `GET /users/@me`, can turn `@username` into `<@id>`. This is the default: `DISCORD_BOT_TOKEN` and `DISCORD_BOT_TOKEN_<SUFFIX>` are both read at startup.
+The host runs Discord's gateway in forwarding mode, which hands every bot's message to the host. The host admits a bot's message only from a known NanoClaw sibling, live and in recovery alike, so a sibling bot's `@mention` reaches the other agent as a bot-authored mention and any other bot's is dropped (`src/channels/discord-live-path.test.ts`). Both bots must be loaded in the same host process: each one's identity, fetched at adapter init via `GET /users/@me`, is what makes it a known sibling and turns `@username` into `<@id>`. A bot whose identity fetch failed at startup is not admitted by its siblings until the next restart (the host logs a warning). This is the default: `DISCORD_BOT_TOKEN` and `DISCORD_BOT_TOKEN_<SUFFIX>` are both read at startup.
 
-A third-party bot in the same guild (MEE6, a webhook) is not filtered on the live path either: its messages reach the router like anyone else's, under the wiring's engage rules. Only missed-message recovery restricts bots to known NanoClaw siblings (`allowRecoveredBotMessage` in `src/channels/discord.ts`).
+A third-party bot in the same guild (MEE6, a webhook) is never routed to an agent as a message, live or in recovery: one predicate in `src/channels/discord.ts` (`admitsBot`) admits only registered NanoClaw bots. Its posts can still appear in the thread history the host backfills when a person mentions the agent in that thread. An integration whose posts an agent should act on needs that rule widened first.
 
 ## Guard parity contract
 

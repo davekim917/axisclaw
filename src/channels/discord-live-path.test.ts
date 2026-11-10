@@ -24,12 +24,17 @@ const CHANNEL = '123456789000000004';
 const DM_CHANNEL = '123456789000000005';
 const THREAD = '123456789000000006';
 const DELETED_THREAD = '123456789000000007';
+const SIBLING_TOKEN = 'live-path-sibling-token';
+const SIBLING = '123456789000000040';
 
 vi.mock('../env.js', async (importOriginal) => {
   const values: Record<string, string> = {
     DISCORD_BOT_TOKEN: TOKEN,
     DISCORD_PUBLIC_KEY: '0'.repeat(64),
     DISCORD_APPLICATION_ID: '123456789000000001',
+    DISCORD_BOT_TOKEN_SIBLING: SIBLING_TOKEN,
+    DISCORD_PUBLIC_KEY_SIBLING: '1'.repeat(64),
+    DISCORD_APPLICATION_ID_SIBLING: SIBLING,
   };
   return {
     ...(await importOriginal<typeof import('../env.js')>()),
@@ -40,6 +45,14 @@ vi.mock('../env.js', async (importOriginal) => {
 });
 
 const botUser = { id: BOT, username: 'example-agent', discriminator: '0', global_name: null, bot: true, avatar: null };
+const siblingUser = {
+  id: SIBLING,
+  username: 'example-sibling',
+  discriminator: '0',
+  global_name: null,
+  bot: true,
+  avatar: null,
+};
 const BOT_AVATAR = '0123456789abcdef0123456789abcdef';
 const humanUser = {
   id: HUMAN,
@@ -71,12 +84,12 @@ let savedApiUrl: string | undefined;
 const restDefaults = DefaultRestOptions as { api: string };
 const savedRestApi = restDefaults.api;
 
-function dispatch(t: string, d: unknown): void {
+function dispatch(t: string, d: unknown, to: WebSocket | null = socket): void {
   seq += 1;
-  socket!.send(JSON.stringify({ op: 0, t, s: seq, d }));
+  to!.send(JSON.stringify({ op: 0, t, s: seq, d }));
 }
 
-function rest(method: string, path: string, body: Record<string, unknown>): [number, unknown] {
+function rest(method: string, path: string, body: Record<string, unknown>, auth?: string): [number, unknown] {
   if (method === 'GET' && path === '/gateway/bot') {
     const { port } = server.address() as AddressInfo;
     return [
@@ -88,7 +101,8 @@ function rest(method: string, path: string, body: Record<string, unknown>): [num
       },
     ];
   }
-  if (method === 'GET' && path === '/users/@me') return [200, { ...botUser, avatar: BOT_AVATAR }];
+  if (method === 'GET' && path === '/users/@me')
+    return [200, auth === `Bot ${SIBLING_TOKEN}` ? siblingUser : { ...botUser, avatar: BOT_AVATAR }];
   if (method === 'GET' && path === `/channels/${CHANNEL}`) return [200, channel];
   if (method === 'GET' && path === `/channels/${THREAD}`) return [200, thread];
   if (method === 'GET' && path === `/channels/${DELETED_THREAD}`)
@@ -166,7 +180,7 @@ beforeAll(async () => {
 
   const answer = async (req: http.IncomingMessage, res: http.ServerResponse): Promise<void> => {
     const path = (req.url ?? '').replace(/^\/api(\/v\d+)?/, '').split('?')[0]!;
-    const [status, body] = rest(req.method ?? 'GET', path, await readBody(req));
+    const [status, body] = rest(req.method ?? 'GET', path, await readBody(req), req.headers.authorization);
     res.statusCode = status;
     if (status === 429 && renameRetryAfter !== null) res.setHeader('retry-after', renameRetryAfter);
     res.setHeader('content-type', 'application/json');
@@ -175,46 +189,58 @@ beforeAll(async () => {
   server = http.createServer((req, res) => void answer(req, res));
   gateway = new WebSocketServer({ server });
   gateway.on('connection', (ws) => {
-    socket = ws;
     ws.on('message', (data) => {
       const frame = JSON.parse(data.toString()) as { op: number; d: { token?: string; intents?: number } };
       if (frame.op === 1) ws.send(JSON.stringify({ op: 11 }));
       if (frame.op === 2) {
-        identifyToken = frame.d.token;
-        identifyIntents = frame.d.intents ?? 0;
+        // The sibling workspace connects too; test events go only to the bot under test.
+        const user = frame.d.token === TOKEN ? botUser : siblingUser;
+        if (frame.d.token === TOKEN) {
+          socket = ws;
+          identifyToken = frame.d.token;
+          identifyIntents = frame.d.intents ?? 0;
+        }
         const { port } = server.address() as AddressInfo;
-        dispatch('READY', {
-          v: 10,
-          user: botUser,
-          guilds: [{ id: GUILD, unavailable: true }],
-          session_id: 'live-path-session',
-          resume_gateway_url: `ws://127.0.0.1:${port}`,
-          application: { id: BOT, flags: 0 },
-        });
-        dispatch('GUILD_CREATE', {
-          id: GUILD,
-          name: 'Example Guild',
-          owner_id: HUMAN,
-          unavailable: false,
-          member_count: 2,
-          roles: [
-            {
-              id: GUILD,
-              name: '@everyone',
-              permissions: '0',
-              position: 0,
-              color: 0,
-              hoist: false,
-              managed: false,
-              mentionable: false,
-            },
-          ],
-          channels: [channel],
-          threads: [],
-          members: [],
-          emojis: [],
-          features: [],
-        });
+        dispatch(
+          'READY',
+          {
+            v: 10,
+            user,
+            guilds: [{ id: GUILD, unavailable: true }],
+            session_id: 'live-path-session',
+            resume_gateway_url: `ws://127.0.0.1:${port}`,
+            application: { id: user.id, flags: 0 },
+          },
+          ws,
+        );
+        dispatch(
+          'GUILD_CREATE',
+          {
+            id: GUILD,
+            name: 'Example Guild',
+            owner_id: HUMAN,
+            unavailable: false,
+            member_count: 2,
+            roles: [
+              {
+                id: GUILD,
+                name: '@everyone',
+                permissions: '0',
+                position: 0,
+                color: 0,
+                hoist: false,
+                managed: false,
+                mentionable: false,
+              },
+            ],
+            channels: [channel],
+            threads: [],
+            members: [],
+            emojis: [],
+            features: [],
+          },
+          ws,
+        );
       }
     });
     ws.send(JSON.stringify({ op: 10, d: { heartbeat_interval: 45_000 } }));
@@ -367,26 +393,37 @@ describe('Discord inbound and outbound through the real adapter and discord.js g
     expect(requests).toEqual([{ url: big, authorization: undefined }]);
   });
 
-  it('delivers another bot’s @mention as a bot-authored mention, the way a sibling agent’s handoff arrives', async () => {
+  it('admits a NanoClaw sibling’s @mention and drops one from any other bot, as recovery does', async () => {
     inbound.length = 0;
+    const { getKnownDiscordBots } = await import('./discord.js');
+    expect([...getKnownDiscordBots().values()].map((bot) => bot.userId)).toContain(SIBLING);
     const member = { roles: [], joined_at: new Date(0).toISOString(), deaf: false, mute: false };
-    const otherBot = { id: '123456789000000030', username: 'example-sibling', discriminator: '0', bot: true };
-    dispatch(
-      'MESSAGE_CREATE',
-      messageCreate('123456789000000031', {
-        channel_id: CHANNEL,
-        guild_id: GUILD,
-        author: { ...otherBot, global_name: null, avatar: null },
-        member,
-        content: `<@${BOT}> your turn`,
-        mentions: [{ ...botUser, member }],
-      }),
-    );
+    const integration = { id: '123456789000000030', username: 'example-integration', discriminator: '0', bot: true };
+    for (const [id, author] of [
+      ['123456789000000031', integration],
+      ['123456789000000032', siblingUser],
+    ] as const) {
+      dispatch(
+        'MESSAGE_CREATE',
+        messageCreate(id, {
+          channel_id: CHANNEL,
+          guild_id: GUILD,
+          author: { ...author, global_name: null, avatar: null },
+          member,
+          content: `<@${BOT}> your turn`,
+          mentions: [{ ...botUser, member }],
+        }),
+      );
+    }
     await nextInbound(1);
+    await new Promise((r) => setTimeout(r, 300));
 
+    expect(inbound.map((entry) => (entry.message.content as { author: { userId: string } }).author.userId)).toEqual([
+      SIBLING,
+    ]);
     expect(inbound[0]!.message).toMatchObject({ isMention: true, isDM: false });
     expect(inbound[0]!.message.content).toMatchObject({
-      author: expect.objectContaining({ userId: otherBot.id, isBot: true }),
+      author: expect.objectContaining({ userId: SIBLING, isBot: true }),
     });
   });
 

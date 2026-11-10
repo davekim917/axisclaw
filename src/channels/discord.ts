@@ -922,9 +922,12 @@ for (const ws of workspaces) {
         knownDiscordBots.set(ws.channelType, identity);
         warmChannelDirectory();
       } else {
-        log.warn('Discord bot identity unavailable — outbound @-mentions for this bot will not resolve', {
-          channelType: ws.channelType,
-        });
+        log.warn(
+          'Discord bot identity unavailable — its outbound @-mentions will not resolve, and its sibling bots drop its posts',
+          {
+            channelType: ws.channelType,
+          },
+        );
       }
 
       const discordAdapter = createDiscordAdapter({
@@ -940,6 +943,12 @@ for (const ws of workspaces) {
       const rest = new REST({ version: '10' }).setToken(ws.botToken);
       installMessageThreadAutoCreate(discordAdapter, rest);
       installThreadParentResolve(discordAdapter, rest);
+      // Among bots, only known NanoClaw siblings reach an agent, live and in recovery alike: the gateway forwards every
+      // bot's message, and an integration or stranger's bot would otherwise wake agents and enter their context.
+      const admitsBot = (message: { author: { userId: string } }): boolean => {
+        const authorId = message.author.userId;
+        return authorId !== identity?.userId && [...knownDiscordBots.values()].some((bot) => bot.userId === authorId);
+      };
       const bridge = createChatSdkBridge({
         adapter: discordAdapter,
         concurrency: 'concurrent',
@@ -961,19 +970,22 @@ for (const ws of workspaces) {
         subtextMarkup: 'discord-markdown',
         // Rewrites raw `<@snowflake>` to `@bot_username` for sibling bots.
         transformInboundText: (text) => resolveIncomingDiscordMentions(text),
-        inboundFilter: isDiscordInbound,
+        inboundFilter: (message) => {
+          if (!isDiscordInbound(message)) return false;
+          if (message.author.isBot !== true || admitsBot(message)) return true;
+          log.info('Discord: dropped a message from a bot that is not a NanoClaw sibling', {
+            channelType: ws.channelType,
+            authorId: message.author.userId,
+          });
+          return false;
+        },
         detectRecoveredMention: (message) => {
           if (!identity) return false;
           const raw = message.raw as { mentions?: Array<{ id?: string }> } | undefined;
           return raw?.mentions?.some((mention) => mention.id === identity.userId) === true;
         },
         threadRecoveredRootMention: (platformId, message) => openRecoveredMentionThread(rest, platformId, message),
-        // Self echoes are removed by the bridge; among other bots only known NanoClaw siblings are admitted. The live
-        // gateway forwards every bot's message, so recovery is the stricter of the two.
-        allowRecoveredBotMessage: (message) => {
-          const authorId = message.author.userId;
-          return authorId !== identity?.userId && [...knownDiscordBots.values()].some((bot) => bot.userId === authorId);
-        },
+        allowRecoveredBotMessage: admitsBot,
         discoverRecoveryTargets: (request) => discoverDiscordRecoveryTargets(rest, request),
         classifyRecoveryError: classifyDiscordRecoveryError,
         fetchThreadAnchor: makeFetchThreadAnchor(ws.botToken),
