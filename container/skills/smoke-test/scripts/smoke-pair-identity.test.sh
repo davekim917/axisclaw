@@ -106,6 +106,50 @@ expect_rc "$(run check "$RUN4" ro)" 2 check-log-unwritable
 chmod 700 "$RUN4/coordinator"
 expect_rc "$(run finish "$RUN4")" 2 finish-no-successful-check
 
+# --- 4b. A transient unreadable read is superseded by the label's next check;
+# each label is judged by its latest record at the current generation only.
+pair_ok() { mk dep-fe000000001 live "$A" > "$SMOKE_PAIR_FIXTURE_DIR/fe.json"; mk dep-be000000001 live "$B" > "$SMOKE_PAIR_FIXTURE_DIR/be.json"; }
+pair_unreadable() { printf 'not json' > "$SMOKE_PAIR_FIXTURE_DIR/fe.json"; }
+RUN4B="$T/run4b"; mkdir -p "$RUN4B"; pair_ok
+expect_rc "$(run start "$RUN4B")" 0 transient-start
+pair_unreadable; expect_rc "$(run check "$RUN4B" lane-a)" 2 transient-unreadable
+pair_ok; expect_rc "$(run check "$RUN4B" lane-a)" 0 transient-recovered
+expect_rc "$(run finish "$RUN4B")" 0 finish-after-unreadable-then-ok
+RUN4C="$T/run4c"; mkdir -p "$RUN4C"; pair_ok
+expect_rc "$(run start "$RUN4C")" 0 regress-start
+expect_rc "$(run check "$RUN4C" lane-a)" 0 regress-ok
+pair_unreadable; expect_rc "$(run check "$RUN4C" lane-a)" 2 regress-unreadable
+pair_ok; expect_rc "$(run finish "$RUN4C")" 2 finish-after-ok-then-unreadable
+out | grep -Fq 'lane-a=unreadable' || fail "finish-after-ok-then-unreadable: did not name lane-a"
+RUN4D="$T/run4d"; mkdir -p "$RUN4D"; pair_ok
+expect_rc "$(run start "$RUN4D")" 0 two-labels-start
+pair_unreadable
+expect_rc "$(run check "$RUN4D" lane-a)" 2 two-labels-a-unreadable
+expect_rc "$(run check "$RUN4D" lane-b)" 2 two-labels-b-unreadable
+pair_ok; expect_rc "$(run check "$RUN4D" lane-a)" 0 two-labels-a-recovered
+expect_rc "$(run finish "$RUN4D")" 2 finish-one-label-not-recovered
+out | grep -Fq 'lane-b=unreadable' && ! out | grep -Fq 'lane-a=' || fail "finish-one-label-not-recovered: should name lane-b only"
+RUN4F="$T/run4f"; mkdir -p "$RUN4F"; pair_ok
+expect_rc "$(run start "$RUN4F")" 0 own-read-start
+expect_rc "$(run check "$RUN4F" lane-a)" 0 own-read-check
+pair_unreadable; expect_rc "$(run finish "$RUN4F")" 2 finish-own-read-unreadable
+pair_ok; expect_rc "$(run finish "$RUN4F")" 0 finish-after-own-transient-read
+RUN4G="$T/run4g"; mkdir -p "$RUN4G"; pair_ok
+expect_rc "$(run start "$RUN4G")" 0 only-own-read-start
+pair_unreadable; expect_rc "$(run check "$RUN4G" finish-prepublication)" 2 only-own-read-unreadable
+pair_ok; expect_rc "$(run finish "$RUN4G")" 2 finish-needs-a-lane-check
+out | grep -Fq 'no lane identity checks' || fail "finish-needs-a-lane-check: refused for the wrong reason"
+RUN4E="$T/run4e"; mkdir -p "$RUN4E"; pair_ok
+expect_rc "$(run start "$RUN4E")" 0 oldgen-start
+mk dep-be000000009 live "$C" > "$SMOKE_PAIR_FIXTURE_DIR/be.json"
+expect_rc "$(run refreeze "$RUN4E" "backend replaced before dispatch")" 0 oldgen-refreeze
+pair_unreadable; expect_rc "$(run check "$RUN4E" lane-a)" 2 oldgen-current-unreadable
+printf '%s\n' "$(tail -1 "$RUN4E/coordinator/identity-checks.ndjson" | jq -c '.verdict = "ok" | .freezeGeneration = 1')" \
+  >> "$RUN4E/coordinator/identity-checks.ndjson"
+mk dep-fe000000001 live "$A" > "$SMOKE_PAIR_FIXTURE_DIR/fe.json"
+expect_rc "$(run finish "$RUN4E")" 2 finish-older-gen-ok-does-not-rescue
+out | grep -Fq 'lane-a=unreadable' || fail "finish-older-gen-ok-does-not-rescue: did not name lane-a"
+
 # --- 5. Bounded re-freeze: first drift may re-freeze once, second is BLOCKED
 # Issue #731 F3's sequence on a real run. The contract declares lanes A, B, C
 # before dispatch; A and B check ok at generation 1, C records drift, and the
@@ -687,6 +731,19 @@ expect_rc "$(run finish "$RM")" 0 moved-after-evidence-finish-again
 cmp -s "$RM/$MOVED_REL" "$T/moved.bak" || fail "moved-after-evidence-finish-again: the write-once record was rewritten"
 expect_rc "$(run check "$RM" late-lane)" 3 moved-check-still-records-drift
 expect_rc "$(run finish "$RM")" 3 moved-finish-after-recorded-drift
+# A transient unreadable after the evidence closed, recovered under the same
+# label, does not withhold the move-after-evidence acceptance.
+RT="$T/run-moved-transient"; evidence_run "$RT"
+printf 'not json' > "$SMOKE_PAIR_FIXTURE_DIR/fe.json"; expect_rc "$(run check "$RT" lane-a)" 2 moved-transient-unreadable
+serve_pair 111 "$A" "$B"; expect_rc "$(run check "$RT" lane-a)" 0 moved-transient-recovered
+serve_pair 112 "$A" "$B"
+expect_rc "$(run finish "$RT")" 0 moved-after-evidence-transient-recovered
+[ -e "$RT/$MOVED_REL" ] || fail "moved-after-evidence-transient-recovered: no move recorded"
+RT2="$T/run-moved-own-transient"; evidence_run "$RT2"
+printf 'not json' > "$SMOKE_PAIR_FIXTURE_DIR/fe.json"; expect_rc "$(run finish "$RT2")" 2 moved-own-read-unreadable
+serve_pair 112 "$A" "$B"
+expect_rc "$(run finish "$RT2")" 0 moved-after-evidence-own-transient-read
+[ -e "$RT2/$MOVED_REL" ] || fail "moved-after-evidence-own-transient-read: no move recorded"
 RM2="$T/run-moved-twice"; evidence_run "$RM2"; serve_pair 112 "$A" "$B"
 expect_rc "$(run finish "$RM2")" 0 moved-twice-first
 serve_pair 113 "$A" "$B"

@@ -9,7 +9,8 @@
 #   refreeze <run-dir> <reason> bounded re-freeze after drift: exactly ONCE per run (see below)
 #   finish   <run-dir>          coordinator pre-publication check: identity.json present; after a
 #                                re-freeze, every required lane redispatched since it; ≥1 prior check
-#                                at the CURRENT freeze generation and every such check ok; live
+#                                at the CURRENT freeze generation, none drift/source-mismatch, and
+#                                each label's latest one ok; live
 #                                pair unchanged, or moved only after the evidence closed (below)
 #   read                        print the current live pair as JSON
 #
@@ -22,7 +23,8 @@
 # garbage, non-live-first, live→deactivated, non-string ids, re-start after
 # drift, unwritable run dir, unwritable check log, bounded re-freeze — first
 # drift ok, second drift blocked, stale generation ignored, finish refused until
-# every lane is redispatched — all fail closed).
+# every lane is redispatched, a transient unreadable superseded by the same
+# label's next ok check — all fail closed).
 #
 # Exit: 0 unchanged/frozen/re-frozen, or finish's pair moved after the evidence closed ·
 #       2 unreadable/invalid/unwritable/misconfigured, or finish refused (a lane not
@@ -282,9 +284,12 @@ def evidence_closed():
         cur = [r for r in (json.loads(l) for l in open(log).read().splitlines() if l.strip())
                if int(r.get("freezeGeneration", 1) or 1) == generation]
     except Exception: return None
-    if not cur or any(r.get("verdict") != "ok" for r in cur): return None
+    if not cur or any(r.get("verdict") in ("drift", "source-mismatch") for r in cur): return None
+    latest = {r.get("label"): r for r in cur}
+    latest.pop("finish-prepublication", None)
+    if any(r.get("verdict") != "ok" for r in latest.values()): return None
     timed = []
-    for i, r in enumerate(cur):
+    for i, r in enumerate(r for r in cur if r.get("verdict") == "ok"):
         try: timed.append((datetime.datetime.strptime(r.get("readAt"), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc).timestamp(), i, r))
         except Exception: pass
     markers = glob.glob(os.path.join(glob.escape(run), "markers", "*.json"))
@@ -565,10 +570,16 @@ if not current:
 verdicts = [rec.get("verdict") for rec in current]
 if "drift" in verdicts: print("finish: drift — a check already recorded drift at the current freeze generation; verdict must be BLOCKED (exit 3)"); sys.exit(3)
 if "source-mismatch" in verdicts: print("finish: source mismatch — a check recorded a pair that does not serve the PR contract sourceSha at the current freeze generation; verdict must be BLOCKED (exit 3)"); sys.exit(3)
-bad = [v for v in verdicts if v != "ok"]
-# What is checked: at least one check exists at the current generation and every check
-# there is ok. Check labels are free-form, so this cannot tell which lane posted which.
-if bad: print(f"finish: unreadable — non-ok identity checks {bad} at the current freeze generation; finish requires every check recorded at this generation to be ok (exit 2)"); sys.exit(2)
+# Drift and source-mismatch above stay final, but an unreadable read proves nothing about the
+# pair, so a later check under the same label supersedes it. The journal is append-only:
+# file order is record order; readAt is whole seconds and cannot order two checks in one second.
+latest = {rec.get("label"): rec for rec in current}
+# finish's own earlier read is superseded by the live read this finish makes next.
+fin = latest.pop("finish-prepublication", None)
+if not latest and (fin or {}).get("verdict") != "ok":
+    print(f"finish: unreadable — no lane identity checks recorded at the current freeze generation ({cur_gen}) (exit 2)"); sys.exit(2)
+bad = [f"{label}={rec.get('verdict')}" for label, rec in latest.items() if rec.get("verdict") != "ok"]
+if bad: print(f"finish: unreadable — the latest identity check at the current freeze generation is not ok for {', '.join(bad)}; re-run check with the same label once the pair reads cleanly (exit 2)"); sys.exit(2)
 PY
       LABEL="finish-prepublication"
       MOVED_RUN="$RUN"

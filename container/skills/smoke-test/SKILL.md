@@ -672,10 +672,17 @@ by calling `start` again. Reachability checks (`smoke-build-identity.sh`'s
 bundle/host and `/healthz`) stay separate from identity — they answer "is
 something serving", not "is it the pair this run claimed."
 
+A `check` that exits 2 on a transient read is retried under the **same
+label**: `finish` judges each label by its latest record at the current freeze
+generation and refuses while any label's latest record is not `ok` (its own
+earlier pre-publication reads excepted; each `finish` reads the pair again).
+Drift and source mismatch are never cleared by a later `ok`.
+
 **One exception, at `finish` only: the pair moved after the evidence
 closed.** When `finish`'s own pre-publication read finds the pair moved (drift,
-never a source mismatch), it exits 0 instead of 3 if every check at the
-current freeze generation is `ok`, at least one `markers/*.json` exists, and
+never a source mismatch), it exits 0 instead of 3 if no check at the
+current freeze generation recorded drift or a source mismatch, each label's
+latest check there is `ok` (`finish`'s own earlier reads excepted), at least one `markers/*.json` exists, and
 the newest `ok` check's `readAt` is strictly later than the modification time
 of every `markers/*.json` and of `challenger/challenge.complete.json` if it
 exists (`readAt` is whole seconds, so a file written in the check's own second
