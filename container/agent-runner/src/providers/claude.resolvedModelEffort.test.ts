@@ -102,22 +102,21 @@ describe('family-default effort follows the RESOLVED model, not the opus alias',
   it('test_fable_pinned_group_gets_fables_family_default', () => {
     const o = turn({}, { groupModel: 'claude-fable-5-1[1m]' });
     expect(o?.model).toBe('claude-fable-5-1[1m]');
-    expect(o?.effort).toBe('medium');
+    expect(o?.effort).toBe('high');
   });
 
   it('test_fable_5_2_pinned_group_gets_fables_family_default', () => {
     const o = turn({}, { groupModel: 'claude-fable-5-2[1m]' });
     expect(o?.model).toBe('claude-fable-5-2[1m]');
-    expect(o?.effort).toBe('medium');
+    expect(o?.effort).toBe('high');
   });
 
   it('test_bare_fable_turn_pin_gets_fables_family_default', () => {
     // A task pin or sticky stores bare `fable` (the CLI resolves it through
-    // ANTHROPIC_DEFAULT_FABLE_MODEL); it must default like a Fable id, not
-    // fall through to the catch-all `high`.
+    // ANTHROPIC_DEFAULT_FABLE_MODEL); it must default like a Fable id.
     const o = turn({}, { groupModel: 'claude-opus-5-5[1m]' }, { model: 'fable' });
     expect(o?.model).toBe('fable');
-    expect(o?.effort).toBe('medium');
+    expect(o?.effort).toBe('high');
   });
 
   it('test_opus_default_group_gets_opus_family_default', () => {
@@ -137,10 +136,11 @@ describe('every other precedence layer is untouched', () => {
   });
 
   it('test_providerConfig_model_still_beats_the_host_default', () => {
-    const o = turn({ providerConfig: { model: 'claude-fable-5-1[1m]' } }, { groupModel: 'claude-sonnet-5' });
+    // The host default is Haiku 4.5 (no effort at all) so its default cannot coincide with Fable's.
+    const o = turn({ providerConfig: { model: 'claude-fable-5-1[1m]' } }, { groupModel: 'claude-haiku-4-5-20251001' });
     expect(o?.model).toBe('claude-fable-5-1[1m]');
     // ...and now the family default follows THAT model, which is the whole point.
-    expect(o?.effort).toBe('medium');
+    expect(o?.effort).toBe('high');
   });
 
   it('test_operator_effort_override_still_beats_the_family_default', () => {

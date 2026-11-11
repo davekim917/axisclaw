@@ -1,8 +1,46 @@
 # Migration: the Claude default model
 
-## Current: subagents default to Opus (2026-11-11)
+## Current: Fable default effort `high` (2026-11-11)
 
-This section is the current migration. No family default model or effort moves, and no pin is rewritten. What moves is the model a Claude subagent runs when nothing names one.
+This section is the current migration. No model moves and no pin is rewritten. Only the Fable family default effort moves.
+
+**What moves.** `defaultEffortForModel` (`container/agent-runner/src/providers/claude.ts`) returns `high`, not `medium`, for the word `fable` and every `claude-fable-*` id. Opus, Sonnet and Haiku defaults do not move, and the effort clamp does not change. A path moves only when **no layer sets an effort**, because the family default is the last step of the runner's chain: `input.effort ?? stickyConfig.effort ?? NANOCLAW_EFFORT_OVERRIDE ?? defaultEffortForModel(model)`, at query start and again in `applySettings` after a live `-m fable`. Every explicit pin keeps its value: a chat `-e`, a session sticky, `container.json` `providerConfig.effort`, a wiring `default_effort` or `container.json` `effort` / `defaultEffort` (folded into `NANOCLAW_EFFORT_OVERRIDE`), a Claude `providerFallback.effort`, a task `effort_pin`, and a subagent's frontmatter `effort:`.
+
+**Detect.** Paths that move run Fable with none of those layers set. List the Fable pins, then run the effort-pin listing in **History: 2026-09-24** below; a Fable path that appears in the first list and not the second moves to `high`.
+
+```bash
+grep -HiE '"(model|defaultModel)": *"[^"]*fable' groups/*/container.json
+pnpm exec tsx scripts/q.ts data/v2.db "select mga.id, mga.agent_group_id, mga.default_model, mga.default_effort from messaging_group_agents mga where lower(coalesce(mga.default_model,'')) like '%fable%'"
+ncl tasks list --json | grep -iE -B2 -A2 '"model_pin": "[^"]*fable'
+```
+
+**Why.** Anthropic's prompting guidance for Fable 5.2 says to start at `high`, and that the model stops early more often at `low` and `medium`. Operator decision, 2026-11-11. `high` thinks more than `medium`, so a moved path costs more per turn.
+
+**Fix: keep `medium` on a Fable path.** Pin it before deploying:
+
+```bash
+ncl groups config update --id <group-id> --effort medium        # group
+ncl wirings update <wiring-id> --default-effort medium          # one channel
+ncl tasks update --id <series> --group <group-id> --effort medium
+```
+
+**Deploy.** Agent-runner source only, no new dependencies, so no image rebuild. The runner source is a boot snapshot taken at host start (`src/agent-runner-source.ts`), so a **host restart** makes it live. Running containers are adopted across the restart and keep the snapshot they spawned with until they exit; recycle one sooner with `ncl groups restart --id <group-id>`.
+
+**Verify.** A Fable turn from a container spawned after the restart, on a path with no effort pin, writes `turn_usage` with `effort = 'high'` and `effort_requested = 'high'`:
+
+```bash
+pnpm exec tsx scripts/q.ts data/v2.db "select model, effort, effort_requested, count(*), round(avg(cost_usd),3) from turn_usage where model like '%fable%' and ts > '<restart time>' group by 1,2,3"
+```
+
+`turn_usage` records the effort a turn ran at, not which layer chose it, so a `medium` Fable row after the restart is either a pin or an adopted container. A NULL effort is either a subagent's row (the same `turn_id` also has a row for the parent's model) or a main-model turn whose effort changed mid-turn; neither shows what the default chose.
+
+**Rollback.** Change the Fable line of `defaultEffortForModel` back to `medium` through a PR, merge, and redeploy (host restart). No pin was written, so there is nothing to unpin.
+
+---
+
+## History: 2026-11-11 — subagents default to Opus
+
+This section was the current migration. No family default model or effort moves, and no pin is rewritten. What moves is the model a Claude subagent runs when nothing names one.
 
 **What moves.** `claudeSpawnEnv` (`src/claude-spawn-defaults.ts`) now sets `CLAUDE_CODE_SUBAGENT_MODEL` to `DEFAULT_OPUS_MODEL` (`claude-opus-5-5[1m]`) in every Claude container, agent and wiki alike. A subagent whose Agent call names no model and whose definition has no `model` field (`general-purpose`, the `bootstrap-orchestrate:worker-*` shims, a group or plugin agent without `model:`) used to inherit its parent's model and now runs Opus. A session on Fable or Sonnet therefore builds with Opus subagents. The variable follows `DEFAULT_OPUS_MODEL`, so a later Opus bump moves it too. Codex and OpenCode are untouched.
 
@@ -50,6 +88,8 @@ Expect `CLAUDE_CODE_SUBAGENT_MODEL=claude-opus-5-5[1m]`, the parent transcript o
 ---
 
 ## History: 2026-11-10 — Fable default moves to 5.2
+
+_Historical. Its effort bullet (Fable at `medium`) is superseded by **2026-11-11 — Fable default effort `high`**; the model half (`claude-fable-5-2[1m]`) is current._
 
 Opus, Sonnet and Haiku defaults do not move, and no family default effort moves. The Fable family default model and the container's pinned CLI move.
 
@@ -224,7 +264,7 @@ Expect `ANTHROPIC_DEFAULT_SONNET_MODEL=claude-sonnet-5-5` and CLI 2.1.284. Unpin
 
 ## History: 2026-09-24 — Opus default effort `high`
 
-_Historical. Still in force for Opus and Fable; the Sonnet default effort it mentions (`xhigh`) is superseded by the section above (now `high`)._
+_Historical. Still in force for Opus; Fable's default effort is superseded by **2026-11-11 — Fable default effort `high`**, and the Sonnet default effort it mentions (`xhigh`) by **2026-09-29 — Sonnet default moves to 5.5** (both now `high`)._
 
 This section was the current migration. The model does not move: `DEFAULT_OPUS_MODEL` stays `claude-opus-5-5[1m]` (see **History: 2026-09-22** below). Only the family default effort moves.
 

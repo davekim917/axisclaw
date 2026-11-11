@@ -1724,7 +1724,7 @@ function defaultEffortForModel(model: string | undefined): string | undefined {
   const m = model.toLowerCase();
   if (m === 'opus' || m.startsWith('claude-opus-')) return 'high';
   if (m === 'sonnet' || m.startsWith('claude-sonnet-')) return 'high';
-  if (m === 'fable' || m.startsWith('claude-fable-')) return 'medium';
+  if (m === 'fable' || m.startsWith('claude-fable-')) return 'high';
   if (m.startsWith('claude-haiku-4-')) return undefined;
   if (m === 'haiku' || m.startsWith('claude-haiku-')) return 'medium';
   return 'high';
