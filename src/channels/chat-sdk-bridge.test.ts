@@ -613,10 +613,12 @@ describe('createChatSdkBridge.deliver — ask_question cards', () => {
         }),
     );
     vi.stubGlobal('fetch', fetchMock);
+    const postCard = vi.fn(async () => 'agent-card');
     const bridge = createChatSdkBridge({
       adapter: stubAdapter({ name: 'discord', postMessage }),
       channelType: 'discord-codex',
       botToken: 'test-bot-token',
+      postCard,
       supportsThreads: true,
       maxTextLength: 2000,
     });
@@ -637,6 +639,7 @@ describe('createChatSdkBridge.deliver — ask_question cards', () => {
 
     expect(id).toBe('discord-message-1');
     expect(postMessage).not.toHaveBeenCalled();
+    expect(postCard).not.toHaveBeenCalled();
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const [url, init] = fetchMock.mock.calls[0];
     expect(url).toBe('https://discord.com/api/v10/channels/THREAD/messages');
@@ -821,6 +824,32 @@ describe('createChatSdkBridge.deliver — display cards (send_card)', () => {
     expect(renderedCodePoints.at(-2)).toBe('🚨');
     expect(renderedCodePoints.at(-1)).toBe('…');
     expect(hasLoneSurrogate(renderedTitle)).toBe(false);
+  });
+
+  it('hands an agent card to the platform poster, title fitted, instead of the adapter', async () => {
+    const { calls, postMessage } = makePostCapture();
+    const postCard = vi.fn(async () => 'agent-card-1');
+    const bridge = createChatSdkBridge({
+      adapter: stubAdapter({ name: 'discord', postMessage }),
+      channelType: 'discord',
+      postCard,
+      supportsThreads: true,
+    });
+    const id = await bridge.deliver('discord:GUILD:PARENT', 'discord:GUILD:PARENT:THREAD', {
+      kind: 'chat-sdk',
+      content: {
+        type: 'card',
+        spec: spec({ title: 'A'.repeat(200) }, ['body', { type: 'Text', props: { content: 'Your plate today' } }]),
+        fallbackText: 'Your plate today',
+      },
+    });
+    expect(id).toBe('agent-card-1');
+    expect(calls).toHaveLength(0);
+    expect(postCard).toHaveBeenCalledTimes(1);
+    const [threadId, card] = postCard.mock.calls[0] as unknown as [string, { title: string; children: unknown[] }];
+    expect(threadId).toBe('discord:GUILD:PARENT:THREAD');
+    expect(Array.from(card.title)).toHaveLength(150);
+    expect(card.children).toEqual([{ type: 'text', content: 'Your plate today', style: undefined }]);
   });
 
   it('refuses a click-back Button and an empty card without posting (display cards carry links only)', async () => {

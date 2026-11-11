@@ -253,6 +253,8 @@ export interface ChatSdkBridgeConfig {
   concurrency?: ConcurrencyStrategy;
   /** Bot token for authenticating forwarded Gateway events (required for interaction handling). */
   botToken?: string;
+  /** Posts an agent card in the platform's own format instead of through the adapter; returns the message id. */
+  postCard?: (threadId: string, card: CardElement) => Promise<string>;
   /** Platform-specific reply context extraction. */
   extractReplyContext?: ReplyContextExtractor;
   /**
@@ -1471,6 +1473,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         const checked = checkCardContent(content, bridgeChannelType);
         if ('issues' in checked) throw new CardSpecError(checked.issues);
         const card = checked.card.title ? { ...checked.card, title: fitCardTitle(checked.card.title) } : checked.card;
+        if (config.postCard) return config.postCard(tid, card);
         const result = await adapter.postMessage(tid, { card, fallbackText: checked.fallbackText });
         return result?.id;
       }

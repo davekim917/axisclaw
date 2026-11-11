@@ -24,6 +24,9 @@ const CHANNEL = '123456789000000004';
 const DM_CHANNEL = '123456789000000005';
 const THREAD = '123456789000000006';
 const DELETED_THREAD = '123456789000000007';
+const ANCHOR = '123456789000000008';
+const OTHER_CHANNEL = '123456789000000009';
+const OTHER_THREAD = '123456789000000010';
 const SIBLING_TOKEN = 'live-path-sibling-token';
 const SIBLING = '123456789000000040';
 
@@ -73,6 +76,7 @@ let identifyIntents = 0;
 const unfaked: string[] = [];
 let renameRetryAfter: string | null = null;
 let renameForbidden = false;
+let anchorThreadOpen = false;
 const posted: Array<{ path: string; body: Record<string, unknown> }> = [];
 const threadsOpened: Array<{ path: string; body: Record<string, unknown> }> = [];
 const inbound: Array<{ platformId: string; threadId: string | null; message: InboundMessage }> = [];
@@ -116,6 +120,19 @@ function rest(method: string, path: string, body: Record<string, unknown>, auth?
   }
   if (method === 'GET' && path === `/channels/${DM_CHANNEL}`) return [200, { id: DM_CHANNEL, type: 1 }];
   if (method === 'GET' && path === `/guilds/${GUILD}/channels`) return [200, [channel]];
+  if (method === 'GET' && path === `/channels/${CHANNEL}/messages/${ANCHOR}`)
+    return [200, { id: ANCHOR, channel_id: CHANNEL, content: 'Weekly deploys', author: botUser }];
+  if (method === 'GET' && path === `/channels/${ANCHOR}`)
+    return anchorThreadOpen ? [200, { ...thread, id: ANCHOR }] : [404, { message: 'Unknown Channel', code: 10003 }];
+  if (method === 'POST' && path === `/channels/${ANCHOR}/messages` && !anchorThreadOpen)
+    return [404, { message: 'Unknown Channel', code: 10003 }];
+  if (method === 'GET' && path === `/channels/${OTHER_THREAD}`)
+    return [200, { ...thread, id: OTHER_THREAD, parent_id: OTHER_CHANNEL }];
+  if (method === 'POST' && path === `/channels/${CHANNEL}/messages/${ANCHOR}/threads`) {
+    anchorThreadOpen = true;
+    threadsOpened.push({ path, body });
+    return [201, { ...thread, id: ANCHOR }];
+  }
   if (method === 'POST' && /^\/channels\/\d+\/messages$/.test(path)) {
     posted.push({ path, body });
     return [200, { id: '123456789000000099', channel_id: path.split('/')[2], content: body.content, author: botUser }];
@@ -467,6 +484,81 @@ describe('Discord inbound and outbound through the real adapter and discord.js g
 
     expect(posted.map((p) => p.path)).toContain(`/channels/${THREAD}/messages`);
     expect(JSON.stringify(posted)).toContain('a reply from the agent');
+  });
+
+  it('posts an agent card as a Components V2 message, with no embed a client could hide', async () => {
+    const adapter = registry.getChannelAdapterExact('discord')!;
+    posted.length = 0;
+    await adapter.deliver(`discord:${GUILD}:${CHANNEL}`, `discord:${GUILD}:${CHANNEL}:${THREAD}`, {
+      kind: 'chat-sdk',
+      content: {
+        type: 'card',
+        fallbackText: 'Weekly deploys: 12',
+        spec: {
+          root: 'card',
+          elements: {
+            card: { type: 'Card', props: { title: 'Weekly deploys' }, children: ['kpis', 'rows'] },
+            kpis: { type: 'Fields', props: {}, children: ['total'] },
+            total: { type: 'Field', props: { label: 'Deploys', value: '12' }, children: [] },
+            rows: { type: 'Table', props: { headers: ['Service'], rows: [['ledger-api']] }, children: [] },
+          },
+        },
+      },
+    });
+
+    expect(posted).toHaveLength(1);
+    const { path, body } = posted[0]!;
+    expect(path).toBe(`/channels/${THREAD}/messages`);
+    expect(body.flags).toBe(1 << 15);
+    expect(body.embeds).toBeUndefined();
+    expect(body.allowed_mentions).toEqual({ parse: [] });
+    const [container] = body.components as Array<{
+      type: number;
+      components: Array<{ type: number; content: string }>;
+    }>;
+    expect(container!.type).toBe(17);
+    const text = container!.components
+      .filter((c) => c.type === 10)
+      .map((c) => c.content)
+      .join('\n');
+    for (const piece of ['Weekly deploys', 'Deploys', '12', 'ledger-api']) expect(text).toContain(piece);
+  });
+
+  it('opens the thread on an anchor message that has none, then posts the card in it', async () => {
+    const adapter = registry.getChannelAdapterExact('discord')!;
+    posted.length = 0;
+    threadsOpened.length = 0;
+    await adapter.deliver(`discord:${GUILD}:${CHANNEL}`, `discord:${GUILD}:${CHANNEL}:${ANCHOR}`, {
+      kind: 'chat-sdk',
+      content: {
+        type: 'card',
+        fallbackText: 'Deploys: 12',
+        spec: {
+          root: 'card',
+          elements: { card: { type: 'Card', props: { title: 'Deploys' }, children: [] } },
+        },
+      },
+    });
+
+    expect(threadsOpened.map((t) => t.path)).toEqual([`/channels/${CHANNEL}/messages/${ANCHOR}/threads`]);
+    expect(posted.map((p) => p.path)).toEqual([`/channels/${ANCHOR}/messages`]);
+    expect(posted[0]!.body.flags).toBe(1 << 15);
+  });
+
+  it('refuses a card for a thread that belongs to another channel, posting nothing', async () => {
+    const adapter = registry.getChannelAdapterExact('discord')!;
+    posted.length = 0;
+    const delivered = adapter.deliver(`discord:${GUILD}:${CHANNEL}`, `discord:${GUILD}:${CHANNEL}:${OTHER_THREAD}`, {
+      kind: 'chat-sdk',
+      content: {
+        type: 'card',
+        fallbackText: 'Deploys: 12',
+        spec: { root: 'card', elements: { card: { type: 'Card', props: { title: 'Deploys' }, children: [] } } },
+      },
+    });
+
+    await expect(delivered).rejects.toThrow(`does not belong to channel ${CHANNEL}`);
+    expect(posted).toEqual([]);
   });
 
   describe('thread names', () => {

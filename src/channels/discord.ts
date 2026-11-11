@@ -6,6 +6,7 @@
  * stay bound to the primary token.
  */
 import { createDiscordAdapter } from '@chat-adapter/discord';
+import type { CardElement } from 'chat';
 import {
   ChannelType,
   Constants,
@@ -22,6 +23,7 @@ import { readEnvFileMatching } from '../env.js';
 import { log } from '../log.js';
 import { getOwners } from '../modules/permissions/db/user-roles.js';
 import { transformOutsideProtectedRegions } from '../text-styles.js';
+import { discordCardPayload } from './card-spec.js';
 import { createChatSdkBridge, type OutboundBody, type ReplyContext } from './chat-sdk-bridge.js';
 import { createAdapterLogger } from './post-deploy-inbound.js';
 import { registerChannelAdapter } from './channel-registry.js';
@@ -607,6 +609,27 @@ export async function discordPostParent(
   return { messageId: msg.id };
 }
 
+/**
+ * Posts to a thread only after the adapter's own check that it belongs to the channel delivery addressed, as the
+ * adapter's post does. Mentions in a card's text never ping: an embed card's never could.
+ */
+export async function discordPostCard(
+  adapter: ReturnType<typeof createDiscordAdapter>,
+  rest: DiscordRestClient,
+  threadId: string,
+  card: CardElement,
+): Promise<string> {
+  const { channelId, threadId: thread } = adapter.decodeThreadId(threadId);
+  const target = await (
+    adapter as unknown as { resolveThreadChannelId(channelId: string, threadId?: string): Promise<string> }
+  ).resolveThreadChannelId(channelId, thread);
+  const { flags, components } = discordCardPayload(card);
+  const msg = (await rest.post(Routes.channelMessages(target), {
+    body: { flags, components, allowed_mentions: { parse: [] } },
+  })) as { id: string };
+  return msg.id;
+}
+
 export async function discordCreateThread(
   rest: DiscordRestClient,
   platformId: string,
@@ -782,8 +805,9 @@ export async function openRecoveredMentionThread(
 }
 
 function isDiscordUnknownChannelError(err: unknown): boolean {
-  // @chat-adapter/discord serialises HTTP failures into the message text, not a code field; pinned by the "real
-  // @chat-adapter/discord" test in discord.test.ts.
+  // discord.js's REST client sets the code; @chat-adapter/discord serialises HTTP failures into the message text, not
+  // a code field. Both are pinned by tests that throw the real library's error.
+  if ((err as { code?: unknown }).code === RESTJSONErrorCodes.UnknownChannel) return true;
   const message = err instanceof Error ? err.message : String(err);
   return /\b404\b/.test(message) && new RegExp(`"code":\\s*${RESTJSONErrorCodes.UnknownChannel}\\b`).test(message);
 }
@@ -798,12 +822,14 @@ function isDiscordUnknownChannelError(err: unknown): boolean {
  * A workstream root post opens its thread at once: until a thread exists the channel's thread list does not show the
  * work, and a session looking for it opens another. Failing here leaves the post delivered and the 404 path above
  * opens the thread on the next post, so the failure only logs.
+ *
+ * Returns the same open-and-retry for a post that does not go through the adapter.
  */
 export function installMessageThreadAutoCreate(
   adapter: ReturnType<typeof createDiscordAdapter>,
   rest: DiscordThreadRestClient,
   addThreadMembers: (rest: DiscordThreadRestClient, threadId: string) => Promise<void> = addDiscordThreadMembers,
-): void {
+): <T>(threadId: string, post: () => Promise<T>) => Promise<T> {
   const target = adapter as unknown as {
     postMessage: (threadId: string, message: unknown) => Promise<{ id?: string } | undefined>;
   };
@@ -835,21 +861,14 @@ export function installMessageThreadAutoCreate(
     void addThreadMembers(rest, messageId);
   };
 
-  target.postMessage = async (threadId, message) => {
+  const inThread = async <T>(
+    threadId: string,
+    workstreamThread: boolean | undefined,
+    post: () => Promise<T>,
+  ): Promise<T> => {
     const [scheme, guildId, channelId, messageId] = threadId.split(':');
-    const { workstreamThread } = message as OutboundBody;
     try {
-      const posted = await original(threadId, message);
-      if (workstreamThread && scheme === 'discord' && guildId !== '@me' && channelId && !messageId && posted?.id) {
-        await openThread(channelId, posted.id, workstreamThread).catch((err: unknown) => {
-          log.warn('Discord thread open for a workstream post failed; the next post retries', {
-            channelId,
-            messageId: posted.id,
-            err: err instanceof Error ? err.message : String(err),
-          });
-        });
-      }
-      return posted;
+      return await post();
     } catch (err) {
       if (scheme !== 'discord' || guildId === '@me' || !channelId || !messageId) throw err;
       if (!isDiscordUnknownChannelError(err)) throw err;
@@ -863,9 +882,26 @@ export function installMessageThreadAutoCreate(
         });
         throw err;
       }
-      return original(threadId, message);
+      return post();
     }
   };
+
+  target.postMessage = async (threadId, message) => {
+    const [scheme, guildId, channelId, messageId] = threadId.split(':');
+    const { workstreamThread } = message as OutboundBody;
+    const posted = await inThread(threadId, workstreamThread, () => original(threadId, message));
+    if (workstreamThread && scheme === 'discord' && guildId !== '@me' && channelId && !messageId && posted?.id) {
+      await openThread(channelId, posted.id, workstreamThread).catch((err: unknown) => {
+        log.warn('Discord thread open for a workstream post failed; the next post retries', {
+          channelId,
+          messageId: posted.id,
+          err: err instanceof Error ? err.message : String(err),
+        });
+      });
+    }
+    return posted;
+  };
+  return (threadId, post) => inThread(threadId, undefined, post);
 }
 
 export interface DiscordWorkspace {
@@ -941,7 +977,7 @@ for (const ws of workspaces) {
       // second would silently drop it. Name it after the channelType (as slack.ts does).
       (discordAdapter as unknown as { name: string }).name = ws.channelType;
       const rest = new REST({ version: '10' }).setToken(ws.botToken);
-      installMessageThreadAutoCreate(discordAdapter, rest);
+      const postInThread = installMessageThreadAutoCreate(discordAdapter, rest);
       installThreadParentResolve(discordAdapter, rest);
       // Among bots, only known NanoClaw siblings reach an agent, live and in recovery alike: the gateway forwards every
       // bot's message, and an integration or stranger's bot would otherwise wake agents and enter their context.
@@ -953,6 +989,8 @@ for (const ws of workspaces) {
         adapter: discordAdapter,
         concurrency: 'concurrent',
         botToken: ws.botToken,
+        postCard: (threadId, card) =>
+          postInThread(threadId, () => discordPostCard(discordAdapter, rest, threadId, card)),
         extractReplyContext,
         supportsThreads: true,
         maxTextLength: 1900,

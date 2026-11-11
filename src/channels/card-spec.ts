@@ -1,9 +1,10 @@
 import { defineCatalog, type PromptContext, type Spec } from '@json-render/core';
 import { CardSpecError, schema, standardComponentDefinitions, toCard, type CardLimits } from '@json-render/chat';
 import { createEmojiConverter } from '@chat-adapter/shared';
-import { cardToDiscordPayload } from '@chat-adapter/discord';
+import { cardToDiscordPayload, DiscordContentFormat } from '@chat-adapter/discord';
+import { ValidationError } from '@chat-adapter/shared';
 import { cardToBlockKit } from '@chat-adapter/slack';
-import type { CardChild, CardElement } from 'chat';
+import { chartElementToFallbackText, tableElementToAscii, type CardChild, type CardElement } from 'chat';
 
 import { isChannelVariant } from '../types.js';
 
@@ -32,16 +33,12 @@ const SLACK_LIMITS: CardLimits = {
   chartSeries: 12,
   chartPoints: 20,
 };
-// One Discord embed holds at most 25 fields.
-const DISCORD_LIMITS: CardLimits = { fields: 25 };
 
 const isSlack = (channelType: string) => channelType === 'slack' || isChannelVariant(channelType, 'slack');
 const isDiscord = (channelType: string) => channelType === 'discord' || isChannelVariant(channelType, 'discord');
 
 function limitsFor(channelType: string): CardLimits | undefined {
-  if (isSlack(channelType)) return SLACK_LIMITS;
-  if (isDiscord(channelType)) return DISCORD_LIMITS;
-  return undefined;
+  return isSlack(channelType) ? SLACK_LIMITS : undefined;
 }
 
 // Block Kit caps: Slack refuses a message past 50 blocks, an actions block past 25 elements or a button URL past
@@ -102,25 +99,72 @@ function slackLosses(card: CardElement): string[] {
   return issues;
 }
 
+const codeBlock = (text: string) => `\`\`\`\n${text}\n\`\`\``;
+
 /**
- * Discord's embed shows no Image child and renders a Table without its caption. It shows a bar, area or line Chart as a
- * text table that looks values up by category, so a repeated category shows its first value twice, and it never
- * shows the yLabel. Its text table replaces a line break in a cell with a space.
+ * Discord markdown has no tables, so a Table or Chart goes out as a monospaced text table in a code block, which keeps
+ * its columns lined up; the adapter's own rendering is GFM pipe syntax, which Discord shows as written. A Section is
+ * spread into the card, because the adapter's V2 Section puts all its text ahead of its other children.
+ */
+function discordChildren(children: CardChild[]): CardChild[] {
+  return children.flatMap((child): CardChild[] => {
+    if (child.type === 'section') return discordChildren(child.children);
+    if (child.type === 'table') {
+      const table = codeBlock(tableElementToAscii(child.headers, child.rows));
+      return [{ type: 'text', content: child.caption ? `*${child.caption}*\n${table}` : table }];
+    }
+    if (child.type === 'chart') {
+      const table = chartElementToFallbackText(child).slice(child.title.length + 1);
+      return [{ type: 'text', content: `**${child.title}**\n${codeBlock(table)}` }];
+    }
+    return [child];
+  });
+}
+
+/**
+ * The Components V2 message an agent card posts as on Discord. A client can hide embeds and still show components, and
+ * an embed card there showed only its buttons. Throws the adapter's ValidationError past Discord's 40-component or
+ * 4,000-character caps.
+ */
+type V2Component = {
+  type: number;
+  components?: V2Component[];
+  content?: string;
+  description?: string;
+  items?: Array<{ description?: string }>;
+  label?: string;
+  url?: string;
+  accessory?: V2Component;
+};
+
+export function discordCardPayload(card: CardElement): { flags: number; components: V2Component[] } {
+  return cardToDiscordPayload(
+    { ...card, children: discordChildren(card.children) },
+    { contentFormat: DiscordContentFormat.ComponentsV2 },
+  ) as { flags: number; components: V2Component[] };
+}
+
+/**
+ * Discord's text table shows a repeated Chart category with its first value twice and never shows a yLabel. A line
+ * break in a cell or chart label breaks the table's columns, and a code fence in one ends the code block it is drawn in.
  */
 function discordLosses(card: CardElement): string[] {
   const children = flatten(card.children);
   const issues: string[] = [];
-  if (children.some((child) => child.type === 'image'))
-    issues.push('Discord shows no Image inside a card; use the Card imageUrl, or a LinkButton to the image');
-  if (children.some((child) => child.type === 'table' && child.caption))
-    issues.push('Discord drops a Table caption; put it in a Text beside the Table');
-  if (
-    children.some(
-      (child) => child.type === 'table' && [child.headers, ...child.rows].flat().some((cell) => /[\r\n]/.test(cell)),
-    )
-  )
+  const cells = children.flatMap((child) => {
+    if (child.type === 'table') return [child.headers, ...child.rows].flat();
+    if (child.type !== 'chart') return [];
+    const { chart } = child;
+    if (chart.type === 'pie') return chart.segments.map((segment) => segment.label);
+    return [chart.xLabel ?? '', ...chart.categories, ...chart.series.map((series) => series.name)];
+  });
+  if (cells.some((cell) => /[\r\n]/.test(cell)))
     issues.push(
-      'Discord shows a Table as text and turns a line break in a header or cell into a space; put that content in a Text',
+      'Discord shows a Table or Chart as text, where a line break in a header or cell breaks its columns; put that content in a Text',
+    );
+  if (cells.some((cell) => cell.includes('```')))
+    issues.push(
+      'Discord shows a Table or Chart in a code block, which a ``` in a header or cell would end; put that content in a Text',
     );
   const axisCharts = children.flatMap((child) =>
     child.type === 'chart' && child.chart.type !== 'pie' ? [child.chart] : [],
@@ -134,49 +178,30 @@ function discordLosses(card: CardElement): string[] {
   return issues;
 }
 
-// Discord refuses a message past these, and its adapter sends a card's embed and buttons uncut. The bridge shortens a
-// long title, so a title is counted only toward the total.
-const DISCORD_MAX_DESCRIPTION = 4096;
-const DISCORD_MAX_FIELDS = 25;
-const DISCORD_MAX_FIELD_NAME = 256;
-const DISCORD_MAX_FIELD_VALUE = 1024;
-const DISCORD_MAX_EMBED = 6000;
-const DISCORD_MAX_ROWS = 5;
+// Discord refuses a message with a link button or image description past these; the adapter checks the component
+// and text caps itself.
 const DISCORD_MAX_LABEL = 80;
 const DISCORD_MAX_URL = 512;
+const DISCORD_MAX_MEDIA_DESCRIPTION = 1024;
 
 function discordRefusals(card: CardElement): string[] {
-  const payload = cardToDiscordPayload(card) as {
-    embeds: Array<{ title?: string; description?: string; fields?: Array<{ name: string; value: string }> }>;
-    components: Array<{ components?: Array<{ label?: string; url?: string }> }>;
-  };
-  const issues: string[] = [];
-  for (const embed of payload.embeds) {
-    const fields = embed.fields ?? [];
-    const description = embed.description ?? '';
-    if (description.length > DISCORD_MAX_DESCRIPTION)
-      issues.push(
-        `the card's text comes to ${description.length} characters on Discord, which takes ${DISCORD_MAX_DESCRIPTION}; trim Text, Tables or Charts, or split the card`,
-      );
-    if (fields.length > DISCORD_MAX_FIELDS)
-      issues.push(`the card has ${fields.length} Fields and Discord takes ${DISCORD_MAX_FIELDS} in all`);
-    if (
-      fields.some((field) => field.name.length > DISCORD_MAX_FIELD_NAME || field.value.length > DISCORD_MAX_FIELD_VALUE)
-    )
-      issues.push(
-        `a Field label is over ${DISCORD_MAX_FIELD_NAME} characters or its value over ${DISCORD_MAX_FIELD_VALUE}, which Discord refuses`,
-      );
-    const total = [embed.title ?? '', description, ...fields.flatMap((field) => [field.name, field.value])].join(
-      '',
-    ).length;
-    if (total > DISCORD_MAX_EMBED)
-      issues.push(`the card comes to ${total} characters on Discord, which takes ${DISCORD_MAX_EMBED} in one message`);
+  let payload: { components: V2Component[] };
+  try {
+    payload = discordCardPayload(card);
+  } catch (err) {
+    if (err instanceof ValidationError) return [err.message];
+    throw err;
   }
-  if (payload.components.length > DISCORD_MAX_ROWS)
-    issues.push(
-      `the card makes ${payload.components.length} rows of buttons on Discord, which takes ${DISCORD_MAX_ROWS}: use at most ${DISCORD_MAX_ROWS * 5} LinkButtons`,
-    );
-  const buttons = payload.components.flatMap((row) => row.components ?? []);
+  const all = (components: V2Component[]): V2Component[] =>
+    components.flatMap((c) => [c, ...all(c.components ?? []), ...(c.accessory ? [c.accessory] : [])]);
+  const buttons = all(payload.components).filter((c) => c.url !== undefined || c.label !== undefined);
+  const issues: string[] = [];
+  const descriptions = all(payload.components).flatMap((c) => [
+    c.description,
+    ...(c.items ?? []).map((i) => i.description),
+  ]);
+  if (descriptions.some((description) => (description ?? '').length > DISCORD_MAX_MEDIA_DESCRIPTION))
+    issues.push(`an Image alt is over ${DISCORD_MAX_MEDIA_DESCRIPTION} characters, which Discord refuses`);
   if (buttons.some((button) => (button.label ?? '').length > DISCORD_MAX_LABEL))
     issues.push(`a LinkButton label is over ${DISCORD_MAX_LABEL} characters, which Discord refuses`);
   if (buttons.some((button) => (button.url ?? '').length > DISCORD_MAX_URL))
@@ -231,6 +256,7 @@ const SLACK_LIMIT_NOTES = [
   `${SLACK_LIMITS.tableRows} rows including the header and ${SLACK_LIMITS.tableColumns} columns per Table`,
   `${SLACK_LIMITS.chartPoints} categories, ${SLACK_LIMITS.chartSeries} series or segments, ${SLACK_LIMITS.chartLabel}-character labels and a ${SLACK_LIMITS.chartTitle}-character title per Chart`,
   `${SLACK_MAX_BLOCKS} blocks per card, ${SLACK_MAX_ACTIONS} LinkButtons per Actions, and ${SLACK_MAX_TEXT} characters per Text.`,
+  'Discord: at most 4,000 characters of text, tables and charts included, and 40 components per card.',
 ].join(', ');
 
 const DISPLAY_RULES: Record<string, string> = {

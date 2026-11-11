@@ -3,7 +3,7 @@ import path from 'node:path';
 
 import { describe, expect, it } from 'vitest';
 
-import { CardSpecError, renderCardSpec, renderCardGuideModule } from './card-spec.js';
+import { CardSpecError, discordCardPayload, renderCardSpec, renderCardGuideModule } from './card-spec.js';
 
 function card(...children: Array<{ type: string; props: Record<string, unknown> }>) {
   return {
@@ -52,18 +52,6 @@ describe('card spec', () => {
       'inner: only the root may be a Card',
     ],
     [
-      'an Image child, which Discord’s embed drops',
-      'discord-example',
-      card({ type: 'Image', props: { url: 'https://example.com/chart.png', alt: 'Chart' } }),
-      'Discord shows no Image inside a card',
-    ],
-    [
-      'a Table caption, which Discord drops',
-      'discord',
-      card({ type: 'Table', props: { headers: ['x'], rows: [['1']], caption: 'Week to date' } }),
-      'Discord drops a Table caption',
-    ],
-    [
       'a caption on a Table with no rows, which Slack drops',
       'slack',
       card({ type: 'Table', props: { headers: ['Week'], rows: [], caption: 'No deploys this week' } }),
@@ -88,34 +76,43 @@ describe('card spec', () => {
       'Discord does not show a Chart yLabel',
     ],
     [
-      'a card past the 4,096 characters Discord’s embed takes',
+      'a card past the 4,000 characters of text Discord takes',
       'discord',
-      card(text('x'.repeat(4097))),
-      'characters on Discord, which takes 4096',
+      card(text('x'.repeat(3993))),
+      'allow up to 4000 characters across all text',
     ],
     [
-      'Fields past the 25 Discord takes in all, across two groups',
+      'a card past the 40 components Discord takes',
       'discord',
-      {
-        root: 'card',
-        elements: {
-          card: { type: 'Card', props: { title: 'KPIs' }, children: ['a', 'b'] },
-          a: { type: 'Fields', props: {}, children: Array.from({ length: 13 }, (_, i) => `a${i}`) },
-          b: { type: 'Fields', props: {}, children: Array.from({ length: 13 }, (_, i) => `b${i}`) },
-          ...Object.fromEntries(
-            [...Array.from({ length: 13 }, (_, i) => `a${i}`), ...Array.from({ length: 13 }, (_, i) => `b${i}`)].map(
-              (key) => [key, { type: 'Field', props: { label: key, value: '1' }, children: [] }],
-            ),
-          ),
-        },
-      },
-      'Discord takes 25 in all',
+      card(...Array.from({ length: 39 }, () => text('a line'))),
+      'allow up to 40 components',
     ],
     [
-      'a line break in a Table cell, which Discord’s text table turns into a space',
+      'a line break in a Table cell, which breaks the columns of Discord’s text table',
       'discord',
       card({ type: 'Table', props: { headers: ['query'], rows: [['SELECT 1 -- first\nUNION ALL SELECT 2']] } }),
-      'turns a line break in a header or cell into a space',
+      'a line break in a header or cell breaks its columns',
+    ],
+    [
+      'an Image alt past the 1,024 characters Discord takes for a media description',
+      'discord',
+      card({ type: 'Image', props: { url: 'https://example.com/chart.png', alt: 'x'.repeat(1025) } }),
+      'an Image alt is over 1024 characters',
+    ],
+    [
+      'a code fence in a Table cell, which would end the code block Discord draws the table in',
+      'discord-example',
+      card(table('```sql')),
+      'a ``` in a header or cell would end',
+    ],
+    [
+      'a code fence in a Chart label, which would end the code block Discord draws the chart in',
+      'discord',
+      card({
+        type: 'Chart',
+        props: { title: 'Share', chart: { type: 'pie', segments: [{ label: '```', value: 1 }] } },
+      }),
+      'a ``` in a header or cell would end',
     ],
   ])('refuses %s', (_name, channelType, spec, issue) => {
     expect(issuesFor(spec, channelType)).toEqual([expect.stringContaining(issue)]);
@@ -124,6 +121,72 @@ describe('card spec', () => {
   it('passes a Chart Discord shows whole, and a yLabel Slack shows', () => {
     expect(issuesFor(barChart({}), 'discord')).toEqual([]);
     expect(issuesFor(barChart({ yLabel: 'Seconds' }), 'slack')).toEqual([]);
+  });
+
+  it('posts a Discord card as Components V2 text, with its table and chart lined up in code blocks', () => {
+    const report = renderCardSpec(
+      {
+        root: 'card',
+        elements: {
+          card: { type: 'Card', props: { title: 'Weekly deploys' }, children: ['note', 'kpis', 'rows', 'days', 'pic'] },
+          note: { type: 'Text', props: { content: 'All services green' }, children: [] },
+          kpis: { type: 'Fields', props: {}, children: ['total'] },
+          total: { type: 'Field', props: { label: 'Deploys', value: '12' }, children: [] },
+          rows: {
+            type: 'Table',
+            props: { headers: ['Service', 'Count'], rows: [['ledger-api', '9']], caption: 'By service' },
+            children: [],
+          },
+          days: {
+            type: 'Chart',
+            props: {
+              title: 'Per day',
+              chart: { type: 'bar', categories: ['Mon'], series: [{ name: 'n', values: [3] }] },
+            },
+            children: [],
+          },
+          pic: { type: 'Image', props: { url: 'https://example.com/chart.png', alt: 'Chart' }, children: [] },
+        },
+      },
+      'discord',
+    );
+    const payload = discordCardPayload(report);
+    expect(payload.flags).toBe(1 << 15);
+    expect(payload.components).toHaveLength(1);
+    expect(payload.components[0]!.components!.map((c) => (c.type === 10 ? c.content : c.type))).toEqual([
+      '# Weekly deploys',
+      'All services green',
+      '**Deploys**\n12',
+      '*By service*\n```\nService    | Count\n-----------|------\nledger-api | 9\n```',
+      '**Per day**\n```\n    | n\n----|--\nMon | 3\n```',
+      12,
+    ]);
+  });
+
+  it('keeps a Discord card in spec order through nested Sections', () => {
+    const report = renderCardSpec(
+      {
+        root: 'card',
+        elements: {
+          card: { type: 'Card', props: { title: 'Deploys' }, children: ['envs'] },
+          envs: { type: 'Section', props: {}, children: ['prod', 'prodRuns', 'stage', 'stageRuns'] },
+          prod: { type: 'Text', props: { content: 'Production' }, children: [] },
+          prodRuns: { type: 'Section', props: {}, children: ['prodCount'] },
+          prodCount: { type: 'Text', props: { content: 'Deploys: 12' }, children: [] },
+          stage: { type: 'Text', props: { content: 'Staging' }, children: [] },
+          stageRuns: { type: 'Section', props: {}, children: ['stageCount'] },
+          stageCount: { type: 'Text', props: { content: 'Deploys: 3' }, children: [] },
+        },
+      },
+      'discord',
+    );
+    expect(discordCardPayload(report).components[0]!.components!.map((c) => c.content)).toEqual([
+      '# Deploys',
+      'Production',
+      'Deploys: 12',
+      'Staging',
+      'Deploys: 3',
+    ]);
   });
 
   it('is described to agents by the guide generated into the runner tree', () => {
@@ -142,7 +205,7 @@ describe('card spec', () => {
       '55 Text elements, past the 50 blocks Slack keeps',
       card(...Array.from({ length: 55 }, () => text('a line'))),
       'Slack blocks',
-      [],
+      ['allow up to 40 components'],
     ],
     ['a Text element Slack would cut', card(text('x'.repeat(3001))), 'where Slack cuts it', []],
     [
@@ -155,7 +218,7 @@ describe('card spec', () => {
       'a Table whose cells Slack would show as text',
       card(table('x'.repeat(10_001))),
       'a Table would reach Slack as plain text',
-      ['characters on Discord, which takes 4096', 'which takes 6000 in one message'],
+      ['allow up to 4000 characters across all text'],
     ],
     [
       'a Field Slack would cut once it converts label and value apart',
@@ -168,7 +231,7 @@ describe('card spec', () => {
         },
       },
       'where Slack cuts it',
-      ['Field label is over 256'],
+      [],
     ],
     [
       'a LinkButton URL Slack refuses',
@@ -203,7 +266,7 @@ describe('card spec', () => {
         },
       },
       'Slack takes 25',
-      ['rows of buttons on Discord'],
+      [],
     ],
   ])('refuses %s on Slack, and holds it to Discord’s own limits', (_name, spec, issue, discordIssues: string[]) => {
     expect(issuesFor(spec, 'slack')).toEqual([expect.stringContaining(issue)]);
