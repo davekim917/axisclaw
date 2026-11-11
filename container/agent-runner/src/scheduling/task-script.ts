@@ -248,7 +248,8 @@ export async function runScript(
 /**
  * Why a script gated its task: deliberate wakeAgent=false vs a broken script vs
  * a destructive script the classifier refused to run. 'blocked' acks like
- * 'error' (backoff) so a misconfigured/hostile series throttles itself.
+ * 'error'; its gate row carries `guardRefused`, because a refusal repeats on
+ * every retry and the host pauses the series on the first one.
  */
 type ScriptSkipReason = 'gated' | 'error' | 'blocked';
 
@@ -318,7 +319,11 @@ export async function applyPreTaskScripts(messages: MessageInRow[]): Promise<Tas
     const verdict = await classifyScript(script);
     if (!verdict.safe) {
       log(`task ${msg.id} BLOCKED: destructive pre-task script refused — ${verdict.reason}`);
-      if (!(await writeGateRow(msg.id, null, `refused by the destructive-command classifier: ${verdict.reason}`)))
+      if (
+        !(await writeGateRow(msg.id, null, `refused by the destructive-command classifier: ${verdict.reason}`, {
+          guardRefused: true,
+        }))
+      )
         continue;
       skipped.push({ id: msg.id, reason: 'blocked' });
       continue;

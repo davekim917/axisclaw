@@ -12,10 +12,11 @@ export async function writeGateRow(
   occurrenceId: string,
   result: { wakeAgent: boolean; observation?: unknown } | null,
   failure: string,
+  opts: { guardRefused?: boolean } = {},
 ): Promise<boolean> {
   const gate =
     result === null
-      ? { occurrenceId, wakeAgent: false, error: failure }
+      ? { occurrenceId, wakeAgent: false, error: failure, ...(opts.guardRefused ? { guardRefused: true } : {}) }
       : {
           occurrenceId,
           wakeAgent: result.wakeAgent,

@@ -133,6 +133,15 @@ describe('gate rows', () => {
     expect(String(gateRows()[0]!.gate.error)).toMatch(/^refused by the destructive-command classifier: /);
   });
 
+  it('marks a classifier refusal guardRefused, and an ordinary failure not', async () => {
+    queueTask('t-refused', { script: `rm -rf /workspace/workgroup\n${printed({ wakeAgent: false })}` });
+    queueTask('t-exit', { script: 'exit 3' });
+    await applyPreTaskScripts(getPendingMessages());
+    const byId = new Map(gateRows().map((row) => [row.gate.occurrenceId, row.gate]));
+    expect(byId.get('t-refused')!.guardRefused).toBe(true);
+    expect(byId.get('t-exit')!).not.toHaveProperty('guardRefused');
+  });
+
   it('writes nothing for a row whose result the host already recorded', async () => {
     queueTask('t-host', { script: 'exit 1', scriptHost: true, scriptOutput: { n: 3 } });
     await applyPreTaskScripts(getPendingMessages());

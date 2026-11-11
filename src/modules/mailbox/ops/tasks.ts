@@ -251,6 +251,8 @@ export interface RecurringMessage {
    * the status `armNextTask` settles it to while arming the successor paused.
    */
   paused_ack_status?: 'completed' | 'failed';
+  /** The guard's reason when this failed run was a refusal of its script, which every retry would repeat. */
+  guard_refusal?: string;
 }
 
 // Includes 'failed' AND 'expired' so one bad or missed fire doesn't strand the
@@ -264,16 +266,42 @@ export function getCompletedRecurring(
 ): RecurringMessage[] {
   const rows = db
     .prepare("SELECT * FROM messages_in WHERE status IN ('completed', 'failed', 'expired') AND recurrence IS NOT NULL")
-    .all() as RecurringMessage[];
+    .all() as Array<RecurringMessage & { status: string }>;
   if (outDb === null) return rows;
   const paused = db
     .prepare("SELECT * FROM messages_in WHERE status = 'paused' AND recurrence IS NOT NULL")
-    .all() as RecurringMessage[];
+    .all() as Array<RecurringMessage & { status: string }>;
   for (const row of paused) {
     const settled = terminalAckStatus(outDb, row.id);
     if (settled !== null) rows.push({ ...row, paused_ack_status: settled });
   }
-  return rows;
+  return rows.map((row) => {
+    if ((row.paused_ack_status ?? row.status) !== 'failed') return row;
+    const refusal = guardRefusal(outDb, row.id);
+    return refusal === null ? row : { ...row, guard_refusal: refusal };
+  });
+}
+
+/**
+ * Only a run the runner itself failed: its gate row precedes its ack, so the newest row is that run's. A host-gated
+ * failure writes no ack, and a row left by an earlier crashed run must not be pinned on it.
+ */
+function guardRefusal(outDb: Database.Database, occurrenceId: string): string | null {
+  const acked = outDb
+    .prepare("SELECT 1 FROM processing_ack WHERE message_id = ? AND status = 'script-skip:error'")
+    .get(occurrenceId);
+  if (acked === undefined) return null;
+  const row = outDb
+    .prepare(
+      `SELECT json_extract(content, '$.gate.error') AS error, json_extract(content, '$.gate.guardRefused') AS refused
+         FROM messages_out
+        WHERE kind = 'task_log'
+          AND CASE WHEN json_valid(content) THEN json_extract(content, '$.gate.occurrenceId') END = ?
+        ORDER BY seq DESC
+        LIMIT 1`,
+    )
+    .get(occurrenceId) as { error: unknown; refused: unknown } | undefined;
+  return row?.refused === 1 && typeof row.error === 'string' ? row.error : null;
 }
 
 export function insertRecurrence(

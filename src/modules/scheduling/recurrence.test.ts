@@ -519,3 +519,82 @@ describe('pausing a series whose current occurrence ran before its ack synced', 
     expect(taskRows(db)[0]).toMatchObject({ id: 'task-once', status: 'completed' });
   });
 });
+
+describe('a script the command guard refused', () => {
+  const OUT_PATH = path.join(TEST_DIR, 'outbound.db');
+
+  function fire(guardRefused: boolean, { runnerAcked = true } = {}) {
+    const db = freshDb();
+    ensureSchema(OUT_PATH, 'outbound');
+    const out = openOutboundDbWritable(OUT_PATH);
+    const mailbox = composeNanoclawSession(db, () => out);
+    insertTaskRow(db, {
+      id: 'task-g',
+      seriesId: 'task-g',
+      processAfter: '2020-01-01T00:00:00.000Z',
+      recurrence: '* * * * *',
+      content: JSON.stringify({ prompt: 'prep', script: 'some-gate.sh' }),
+    });
+    const error = guardRefused
+      ? "refused by the destructive-command classifier: The guard can't read this command"
+      : 'error: Command failed: bash /tmp/task-script-task-g.sh (exit code 1)';
+    out.prepare("INSERT INTO messages_out (id, timestamp, kind, content) VALUES ('gate-g', ?, 'task_log', ?)").run(
+      new Date().toISOString(),
+      JSON.stringify({
+        gate: { occurrenceId: 'task-g', wakeAgent: false, error, ...(guardRefused && { guardRefused: true }) },
+      }),
+    );
+    if (runnerAcked) {
+      out
+        .prepare(
+          "INSERT INTO processing_ack (message_id, status, status_changed) VALUES ('task-g', 'script-skip:error', ?)",
+        )
+        .run(new Date().toISOString());
+      mailbox.syncProcessingAcks();
+    } else {
+      mailbox.resolvePendingTask('task-g', 'failed');
+    }
+    return { db, mailbox };
+  }
+
+  const successor = (db: ReturnType<typeof freshDb>) =>
+    db.prepare(`SELECT status, process_after FROM messages_in WHERE kind = 'task' AND id != 'task-g'`).get() as {
+      status: string;
+      process_after: string;
+    };
+  const notices = (db: ReturnType<typeof freshDb>) =>
+    db.prepare(`SELECT content FROM messages_in WHERE id LIKE 'task-%paused-%'`).all() as Array<{ content: string }>;
+
+  it('pauses the series on the first refusal and tells the agent what the guard said', async () => {
+    const { db, mailbox } = fire(true);
+    await handleRecurrence(mailbox, fakeSession());
+
+    expect(successor(db).status).toBe('paused');
+    const [notice] = notices(db);
+    const { text, _system } = JSON.parse(notice!.content);
+    expect(text).toContain("The guard can't read this command");
+    expect(text).toContain('ncl tasks resume task-g');
+    expect(_system).toMatchObject({ kind: 'task-auto-paused', seriesId: 'task-g', cause: 'guard-refused' });
+    const runLog = fs.readFileSync(path.join(TEST_DIR, 'groups', 'g-test', 'tasks', 'task-g.md'), 'utf8');
+    expect(runLog).toContain("The guard can't read this command");
+  });
+
+  it('an ordinary script failure still backs off without pausing or notifying', async () => {
+    const { db, mailbox } = fire(false);
+    await handleRecurrence(mailbox, fakeSession());
+
+    const next = successor(db);
+    expect(next.status).toBe('pending');
+    const deltaMin = (new Date(next.process_after).getTime() - Date.now()) / 60_000;
+    expect(deltaMin).toBeGreaterThan(scriptBackoffMinutes(1) - 0.5);
+    expect(notices(db)).toEqual([]);
+  });
+
+  it('a refusal left by an earlier crashed run is not pinned on a later host-gated failure', async () => {
+    const { db, mailbox } = fire(true, { runnerAcked: false });
+    await handleRecurrence(mailbox, fakeSession());
+
+    expect(successor(db).status).toBe('pending');
+    expect(notices(db)).toEqual([]);
+  });
+});

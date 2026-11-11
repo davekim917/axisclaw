@@ -42,15 +42,30 @@ const SCRIPT_BACKOFF_CAP_MIN = 60;
  * `dueCount > 0` branch), so the obligation lands even on an otherwise idle
  * agent. Dedup id is the series, so one pause raises one note.
  */
+type PauseCause =
+  | { kind: 'script-fails'; scriptFails: number }
+  | { kind: 'guard-refused'; occurrenceId: string; reason: string };
+
 function notifyOwnerOfPause(
   mailbox: NanoclawMailboxSession,
   session: Session,
   seriesId: string,
-  scriptFails: number,
+  cause: PauseCause,
 ): void {
+  // A guard pause is keyed by its occurrence: a resumed script the guard refuses again pauses again, and that pause
+  // owes its own notice.
+  const id = cause.kind === 'guard-refused' ? `task-guard-paused-${cause.occurrenceId}` : `task-paused-${seriesId}`;
+  const why =
+    cause.kind === 'guard-refused'
+      ? `auto-paused on its first fire refused by the command guard and is NOT running. Every retry would be ` +
+        `refused the same way. The guard said: ${cause.reason}\nRewrite the script so the guard accepts it, then run ` +
+        `\`ncl tasks resume ${seriesId}\`, or post once to the humans who depend on it naming what you need.`
+      : `auto-paused after ${cause.scriptFails} consecutive script failures and is NOT running. Diagnose the script, ` +
+        `then either fix it and run \`ncl tasks resume ${seriesId}\`, or post once to the humans who depend on it ` +
+        `naming what you need.`;
   try {
     mailbox.insertDeferredMessageWithContextIfNew({
-      id: `task-paused-${seriesId}`,
+      id,
       kind: 'chat',
       timestamp: new Date().toISOString(),
       platformId: session.agent_group_id,
@@ -58,13 +73,17 @@ function notifyOwnerOfPause(
       threadId: null,
       content: JSON.stringify({
         text:
-          `[system] Scheduled series \`${seriesId}\` auto-paused after ${scriptFails} consecutive ` +
-          `script failures and is NOT running. Diagnose the script, then either fix it and run ` +
-          `\`ncl tasks resume ${seriesId}\`, or post once to the humans who depend on it naming what ` +
-          `you need. Do not leave it paused silently — while it is paused, whatever it watches is unwatched.`,
+          `[system] Scheduled series \`${seriesId}\` ${why} ` +
+          `Do not leave it paused silently — while it is paused, whatever it watches is unwatched.`,
         sender: 'system',
         senderId: 'system',
-        _system: { kind: 'task-auto-paused', seriesId, scriptFails },
+        _system: {
+          kind: 'task-auto-paused',
+          seriesId,
+          ...(cause.kind === 'guard-refused'
+            ? { cause: 'guard-refused', guardReason: cause.reason }
+            : { scriptFails: cause.scriptFails }),
+        },
       }),
       processAfter: new Date().toISOString(),
       recurrence: null,
@@ -124,7 +143,9 @@ export async function handleRecurrence(mailbox: NanoclawMailboxSession, session:
 
       const scriptFails = mailbox.trailingFailedRuns(msg.series_id ?? msg.id);
 
-      if (scriptFails >= SCRIPT_FAIL_PAUSE_CAP) {
+      const guardReason = msg.guard_refusal;
+      if (guardReason !== undefined || scriptFails >= SCRIPT_FAIL_PAUSE_CAP) {
+        const seriesId = msg.series_id ?? msg.id;
         // Re-arm PAUSED at the cron time so `ncl tasks resume` revives the
         // series in place; leave the why in the run log. Insert + clear are
         // one transaction: a crash between them would leave the predecessor
@@ -139,14 +160,31 @@ export async function handleRecurrence(mailbox: NanoclawMailboxSession, session:
         await appendHostTaskNote(
           session.agent_group_id,
           msg.series_id,
-          `auto-paused after ${scriptFails} consecutive script failures (host); fix the script, then \`ncl tasks resume ${msg.series_id}\``,
+          guardReason !== undefined
+            ? `auto-paused: the command guard refused the script (host): ${guardReason}; fix the script, then \`ncl tasks resume ${msg.series_id}\``
+            : `auto-paused after ${scriptFails} consecutive script failures (host); fix the script, then \`ncl tasks resume ${msg.series_id}\``,
         );
-        notifyOwnerOfPause(mailbox, session, msg.series_id ?? msg.id, scriptFails);
-        log.warn('Task series auto-paused: script keeps failing', {
-          seriesId: msg.series_id,
-          scriptFails,
-          sessionId: session.id,
-        });
+        notifyOwnerOfPause(
+          mailbox,
+          session,
+          seriesId,
+          guardReason !== undefined
+            ? { kind: 'guard-refused', occurrenceId: msg.id, reason: guardReason }
+            : { kind: 'script-fails', scriptFails },
+        );
+        if (guardReason !== undefined) {
+          log.warn('Task series auto-paused: command guard refused its script', {
+            seriesId,
+            reason: guardReason,
+            sessionId: session.id,
+          });
+        } else {
+          log.warn('Task series auto-paused: script keeps failing', {
+            seriesId: msg.series_id,
+            scriptFails,
+            sessionId: session.id,
+          });
+        }
         continue;
       }
 
