@@ -82,6 +82,8 @@ export interface ApiError {
    * else the client needs, so nothing else is threaded through here.
    */
   required_confirmations?: number;
+  /** `session_cannot_wake`'s cause, e.g. "session is closed". */
+  reason?: string;
 }
 
 async function apiFetch<T>(url: string, init?: RequestInit): Promise<T> {
@@ -91,12 +93,14 @@ async function apiFetch<T>(url: string, init?: RequestInit): Promise<T> {
       error?: string;
       retry_after?: number;
       required_confirmations?: number;
+      reason?: string;
     };
     const apiErr: ApiError = {
       status: res.status,
       error: body.error ?? 'unknown',
       ...(body.retry_after != null ? { retry_after: body.retry_after } : {}),
       ...(body.required_confirmations != null ? { required_confirmations: body.required_confirmations } : {}),
+      ...(typeof body.reason === 'string' ? { reason: body.reason } : {}),
     };
     throw apiErr;
   }

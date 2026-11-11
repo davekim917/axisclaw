@@ -396,7 +396,10 @@ export function ThreadWorkspace({
         const rejection = err as Partial<ApiError> | null;
         // These validations run before sendThreadMessage can reserve or write anything.
         // An uncertain transport/server failure must keep its immutable retry payload.
-        if (rejection?.status === 400 && ['invalid_request', 'empty_message', 'message_too_long'].includes(rejection.error ?? ''))
+        if (
+          (rejection?.status === 400 && ['invalid_request', 'empty_message', 'message_too_long'].includes(rejection.error ?? '')) ||
+          (rejection?.status === 409 && rejection.error === 'session_cannot_wake')
+        )
           attempts.current.delete(scopeKey);
         setFailure(actionError(err));
         setBusy(false);

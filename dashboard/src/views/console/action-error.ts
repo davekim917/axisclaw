@@ -41,6 +41,8 @@ export function actionError(e: unknown, who?: string): string {
     return wait ? `too fast — try again in ${Math.ceil(wait)}s` : 'too fast — wait a moment';
   }
   if (code === 'mismatched_idempotency_payload') return 'you just sent that';
+  if (code === 'session_cannot_wake')
+    return `${who ?? 'that agent'} cannot take messages there — ${err?.reason ?? 'its session has ended'}`;
 
   if (code === 'empty_message') return 'say something first';
   if (code === 'message_too_long') return 'too long — shorten it';

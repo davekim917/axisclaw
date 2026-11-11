@@ -10,9 +10,10 @@ import { withCentralSync } from '../db/central-lease.js';
 import { getSession } from '../db/sessions.js';
 import { getMessagingGroup } from '../db/messaging-groups.js';
 import { log } from '../log.js';
-import { writeSessionMessage } from '../session-manager.js';
+import { SessionWriteRefusedError, writeSessionMessage } from '../session-manager.js';
 import { readSessionInbound } from '../modules/mailbox/index.js';
 import { requestWake } from '../request-wake.js';
+import { sessionStillActive, unwakeableReason } from '../container-runner.js';
 import { getChannelAdapter } from '../channels/channel-registry.js';
 import { isOwner, isGlobalAdmin, isAdminOfAgentGroup } from '../modules/permissions/db/user-roles.js';
 import { isMember } from '../modules/permissions/db/agent-group-members.js';
@@ -20,6 +21,7 @@ import {
   reserveIdempotency,
   applyIdempotency,
   claimEchoAttempted,
+  hasSteerReservation,
   IdempotencyConflict,
   type SteerResponse,
   type SteerTarget,
@@ -137,6 +139,13 @@ async function _writeAndEchoSteer(
     return { status: 404, body: { error: 'not_found' } };
   }
 
+  // A row written to a session that cannot wake is never read. A new key is refused before it is reserved; a known
+  // key goes on, so an applied request still replays its 202 and a pending one meets the guard at the insert.
+  const unwakeable = unwakeableReason(await getSession(exec.childSessionId));
+  if (unwakeable && !(await hasSteerReservation(userId, idempotencyKey))) {
+    return { status: 409, body: { error: 'session_cannot_wake', reason: unwakeable } };
+  }
+
   const rateLimitKey = `${userId}:${exec.childSessionId}`;
   const rateCheck = checkRateLimit(rateLimitKey);
   if (!rateCheck.allowed) {
@@ -192,21 +201,33 @@ async function _writeAndEchoSteer(
   if (!inboundExists) {
     const now = new Date().toISOString();
     try {
-      await writeSessionMessage(exec.childAgentGroupId, exec.childSessionId, {
-        id: resolvedMessageId,
-        kind: 'chat',
-        timestamp: now,
-        content: JSON.stringify({
-          text: trimmedText,
-          sender: displayName,
-          _via: 'dashboard',
-          _steer: exec.envelope,
-        }),
-        trigger: 1,
-      });
+      await writeSessionMessage(
+        exec.childAgentGroupId,
+        exec.childSessionId,
+        {
+          id: resolvedMessageId,
+          kind: 'chat',
+          timestamp: now,
+          content: JSON.stringify({
+            text: trimmedText,
+            sender: displayName,
+            _via: 'dashboard',
+            _steer: exec.envelope,
+          }),
+          trigger: 1,
+        },
+        { guard: sessionStillActive(exec.childSessionId) },
+      );
     } catch (err: unknown) {
+      // The session can close or start archiving after the check above; the writer then refuses before inserting. The
+      // reservation stays pending: same-key requests share it, and one still waiting on the writer may yet land.
+      const refusal =
+        err instanceof SessionWriteRefusedError ? err.reason : unwakeableReason(await getSession(exec.childSessionId));
       const code = (err as { code?: string }).code;
-      if (code === 'SQLITE_CONSTRAINT_PRIMARYKEY' || code === 'SQLITE_CONSTRAINT_UNIQUE') {
+      if (refusal) {
+        refundRateLimit(rateLimitKey);
+        return { status: 409, body: { error: 'session_cannot_wake', reason: refusal } };
+      } else if (code === 'SQLITE_CONSTRAINT_PRIMARYKEY' || code === 'SQLITE_CONSTRAINT_UNIQUE') {
         // Concurrent-retry race (PK on id, UNIQUE on seq) — treat as success.
       } else if (code === 'SQLITE_BUSY') {
         refundRateLimit(rateLimitKey);

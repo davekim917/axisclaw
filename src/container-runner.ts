@@ -572,7 +572,7 @@ interface QueuedWake {
  * Why this row cannot take a wake, or `null` when it can: THE one definition for the wake path and the opt-in
  * guard. `archived_at` is a second axis: an archive-only thread close leaves `status` reading `active`.
  */
-function unwakeableReason(fresh: Session | undefined): string | null {
+export function unwakeableReason(fresh: Session | undefined): string | null {
   if (!fresh) return 'session no longer exists';
   if (fresh.status !== 'active') return `session is ${fresh.status}`;
   if (fresh.archived_at != null) return 'session is archived';

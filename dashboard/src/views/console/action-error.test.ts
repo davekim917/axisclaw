@@ -28,6 +28,9 @@ describe('actionError', () => {
 
   it('translates the executor refusals the composer can hit', () => {
     expect(actionError({ status: 409, error: 'mismatched_idempotency_payload' })).toBe('you just sent that');
+    expect(actionError({ status: 409, error: 'session_cannot_wake', reason: 'session is closed' }, 'ava')).toBe(
+      'ava cannot take messages there — session is closed',
+    );
     expect(actionError({ status: 400, error: 'empty_message' })).toBe('say something first');
     expect(actionError({ status: 400, error: 'message_too_long' })).toBe('too long — shorten it');
   });

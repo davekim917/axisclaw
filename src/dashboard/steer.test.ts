@@ -2,11 +2,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import http from 'http';
 
 import { closeDb, createAgentGroup, getRawDb, initMigratedTestDb } from '../db/index.js';
+import { withCentralSync } from '../db/central-lease.js';
 import { applySessionSteer, _resetRateLimitForTesting } from './steer.js';
 import type { AuthedRequestContext } from './router.js';
 
 // These imports resolve AFTER vi.mock hoisting — they are the vi.fn() instances.
-import { writeSessionMessage as _wsmRaw } from '../session-manager.js';
+import { SessionWriteRefusedError, writeSessionMessage as _wsmRaw } from '../session-manager.js';
 import { readSessionInbound as _rsiRaw } from '../modules/mailbox/read-only.js';
 import { wakeContainer as _wcRaw } from '../container-runner.js';
 import { getChannelAdapter as _gcaRaw } from '../channels/channel-registry.js';
@@ -265,6 +266,96 @@ describe('applySessionSteer — C5', () => {
       created_at: now(),
     });
   }
+
+  it.each([
+    { label: 'closed', set: "status = 'closed'", reason: 'session is closed' },
+    { label: 'archived while active', set: 'archived_at = ?', reason: 'session is archived' },
+  ])('a $label session is refused with 409 before anything is written or echoed', async ({ set, reason }) => {
+    seedMessagingGroupAndEchoSession();
+    const stmt = getRawDb().prepare(`UPDATE sessions SET ${set} WHERE id = 'sess-echo'`);
+    if (set.includes('?')) stmt.run(now());
+    else stmt.run();
+    const deliverMock = vi.fn().mockResolvedValue(undefined);
+    mockGetChannelAdapter.mockReturnValue({ deliver: deliverMock } as unknown as ReturnType<typeof _gcaRaw>);
+
+    const r = await applySessionSteer(
+      'sess-echo',
+      { idempotency_key: VALID_IKEY, text: 'hi' },
+      makeCtx('owner-s', { no_filter: true }),
+    );
+    await new Promise((res) => setImmediate(res));
+
+    expect(r).toEqual({ status: 409, body: { error: 'session_cannot_wake', reason } });
+    expect(mockWriteSessionMessage).not.toHaveBeenCalled();
+    expect(deliverMock).not.toHaveBeenCalled();
+    expect(mockWakeContainer).not.toHaveBeenCalled();
+    expect(getRawDb().prepare('SELECT COUNT(*) AS n FROM steer_idempotency').get()).toEqual({ n: 0 });
+  });
+
+  it('a request accepted while the session was active still replays its 202 after the session closes', async () => {
+    const ctx = makeCtx('owner-s', { no_filter: true });
+    const first = await applySessionSteer('sess-direct', { idempotency_key: VALID_IKEY, text: 'hi' }, ctx);
+    getRawDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = 'sess-direct'").run();
+    const replay = await applySessionSteer('sess-direct', { idempotency_key: VALID_IKEY, text: 'hi' }, ctx);
+
+    expect(first.status).toBe(202);
+    expect(replay).toEqual(first);
+    expect(mockWriteSessionMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('a session that closes before the insert is refused there with 409 and no echo', async () => {
+    seedMessagingGroupAndEchoSession();
+    mockWriteSessionMessage.mockRejectedValueOnce(new SessionWriteRefusedError('session is closed'));
+    const deliverMock = vi.fn().mockResolvedValue(undefined);
+    mockGetChannelAdapter.mockReturnValue({ deliver: deliverMock } as unknown as ReturnType<typeof _gcaRaw>);
+
+    const r = await applySessionSteer(
+      'sess-echo',
+      { idempotency_key: VALID_IKEY, text: 'hi' },
+      makeCtx('owner-s', { no_filter: true }),
+    );
+    await new Promise((res) => setImmediate(res));
+
+    expect(r).toEqual({ status: 409, body: { error: 'session_cannot_wake', reason: 'session is closed' } });
+    expect(deliverMock).not.toHaveBeenCalled();
+    expect(getRawDb().prepare('SELECT status FROM steer_idempotency').all()).toEqual([{ status: 'pending' }]);
+    const { guard } = mockWriteSessionMessage.mock.calls[0]![3] as { guard: () => unknown };
+    expect(await withCentralSync(guard, 'test')).toBe(true);
+    getRawDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = 'sess-echo'").run();
+    expect(await withCentralSync(guard, 'test')).toEqual({ ok: false, reason: 'session is closed' });
+
+    // The pending key is not refused up front; its replay goes back through the guarded insert.
+    mockWriteSessionMessage.mockRejectedValueOnce(new SessionWriteRefusedError('session is closed'));
+    const replay = await applySessionSteer(
+      'sess-echo',
+      { idempotency_key: VALID_IKEY, text: 'hi' },
+      makeCtx('owner-s', { no_filter: true }),
+    );
+    expect(replay).toEqual(r);
+    expect(mockWriteSessionMessage).toHaveBeenCalledTimes(2);
+  });
+
+  it('a session that starts archiving before the insert is refused with 409, not a 500', async () => {
+    mockWriteSessionMessage.mockImplementationOnce(async () => {
+      getRawDb().prepare("UPDATE sessions SET status = 'archiving' WHERE id = 'sess-direct'").run();
+      throw new Error('session sess-direct is being archived; route this message to a fresh session');
+    });
+
+    const r = await applySessionSteer(
+      'sess-direct',
+      { idempotency_key: VALID_IKEY, text: 'hi' },
+      makeCtx('owner-s', { no_filter: true }),
+    );
+
+    expect(r).toEqual({ status: 409, body: { error: 'session_cannot_wake', reason: 'session is archiving' } });
+  });
+
+  it('a member is told not-found, not that the session is closed', async () => {
+    getRawDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = 'sess-direct'").run();
+    const ctx = makeCtx('member-s', { allowed_group_ids: ['ag-1'] });
+    const r = await applySessionSteer('sess-direct', { idempotency_key: VALID_IKEY, text: 'hi' }, ctx);
+    expect(r).toEqual({ status: 404, body: { error: 'session_not_found' } });
+  });
 
   it('echoes to the session messaging group + thread when present', async () => {
     seedMessagingGroupAndEchoSession();

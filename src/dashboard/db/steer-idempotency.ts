@@ -54,6 +54,10 @@ async function selectExisting(userId: string, idempotencyKey: string): Promise<E
   );
 }
 
+export async function hasSteerReservation(userId: string, idempotencyKey: string): Promise<boolean> {
+  return (await selectExisting(userId, idempotencyKey)) !== undefined;
+}
+
 /** Convert an existing row into the caller's result, or throw on a mismatched replay. */
 function fromExistingRow(existing: ExistingRow, target: SteerTarget, requestHash: string): ReservedSteer {
   if (existing.target_type !== target.type || existing.target_id !== target.id) {
