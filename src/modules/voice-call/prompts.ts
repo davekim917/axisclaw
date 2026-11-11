@@ -143,6 +143,14 @@ Speaking for ${agentName}:
 - When told the call connected, say the greeting you are given once.`;
 }
 
+/** Silent context for the voice: a file someone on the call shared, which the agent already has. */
+export const sharedFileNote = (who: string, file: string, agentName: string) =>
+  `${who} shared a file on the call: "${file}". ${agentName} can see it. Say nothing about it now. When someone asks about it, for example "look at this", delegate the request to ${agentName} as usual and name "${file}" in it.`;
+
+/** The words that carry a file shared on a call into the agent's session. */
+export const sharedFileText = (who: string, file: string) =>
+  `${who} shared ${file} on the call, to look at when someone on the call asks about it.`;
+
 export const groupGreeting = (agentName: string, onCall: string[]) =>
   onCall.length === 1
     ? `The call just connected. Greet ${onCall[0]} with exactly: "Hi ${onCall[0]}, it's ${agentName}."`

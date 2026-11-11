@@ -29,6 +29,7 @@ import {
   startConnect,
 } from './slack-send.js';
 import { readThreadMessages } from './thread-messages.js';
+import { DAY_MS, MINUTE_MS, overLimit, SEND_LIMITS, type Limit } from './limits.js';
 import { discardFiles, MAX_FILES_PER_REPLY, receiveUpload, takeUploads, type ReplyFile } from './uploads.js';
 import {
   callInTaskThread,
@@ -51,14 +52,7 @@ const MAX_LABEL_CHARS = 64;
 const CALL_PATH_RE = /^\/v1\/threads\/([^/]+)\/call$/;
 const DM_CALL_PATH_RE = /^\/v1\/threads\/([^/]+)\/dm-call$/;
 const MESSAGES_PATH_RE = /^\/v1\/threads\/([^/]+)\/messages$/;
-const MINUTE_MS = 60_000;
-const DAY_MS = 24 * 60 * MINUTE_MS;
 const UNPRINTABLE_RE = /[\p{Cc}\p{Cf}]/gu;
-
-interface Limit {
-  max: number;
-  windowMs: number;
-}
 
 /** Each request makes live platform checks and can hold one of the host's few call slots. */
 const CALL_LIMITS: Limit[] = [{ max: 6, windowMs: MINUTE_MS }];
@@ -81,12 +75,6 @@ const TEXT_WALK_LIMITS: Limit[] = [{ max: 60, windowMs: MINUTE_MS }];
  */
 const READ_LIMITS: Limit[] = [{ max: 30, windowMs: MINUTE_MS }];
 
-/** Each one posts as the person, or in their name, which nothing here can take back. */
-const SEND_LIMITS: Limit[] = [
-  { max: 10, windowMs: MINUTE_MS },
-  { max: 300, windowMs: DAY_MS },
-];
-
 /** Each one holds a sign-in open, or DMs the person a link, for ten minutes. */
 const CONNECT_LIMITS: Limit[] = [
   { max: 3, windowMs: MINUTE_MS },
@@ -100,15 +88,6 @@ const recentConnects = new Map<string, number[]>();
 const recentReads = new Map<string, number[]>();
 const recentNewThreads = new Map<string, number[]>();
 const recentTextWalks = new Map<string, number[]>();
-
-function overLimit(recent: Map<string, number[]>, deviceId: string, limits: Limit[]): boolean {
-  const now = Date.now();
-  const longest = Math.max(...limits.map((limit) => limit.windowMs));
-  const kept = (recent.get(deviceId) ?? []).filter((at) => at > now - longest);
-  const over = limits.some(({ max, windowMs }) => kept.filter((at) => at > now - windowMs).length >= max);
-  recent.set(deviceId, over ? kept : [...kept, now]);
-  return over;
-}
 
 export const isMobileHost = (host: string | undefined) => host?.toLowerCase() === appHost().toLowerCase();
 

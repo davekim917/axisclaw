@@ -107,6 +107,7 @@ const listen = () => {
     const e = JSON.parse(m.data);
     if (e.type === 'status') $('status').textContent = e.text;
     else if (e.type === 'request') line(e.speaker + ' to ' + agent, e.text);
+    else if (e.type === 'shared') line(e.speaker, 'Shared ' + e.file);
     else if (e.type === 'caption') {
       if (!voiceLine) voiceLine = line(agent, '');
       keepPinned($('log'), () => (voiceLine.querySelector('.text').textContent += e.text));

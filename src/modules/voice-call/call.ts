@@ -114,6 +114,8 @@ export class VoiceCallBridge {
   private checkInsOff = false;
   /** What the voice was last told about the check-ins. */
   private toldOff = false;
+  /** Silent notes waiting for the caller to finish speaking. */
+  private held: string[] = [];
   private callerTurn = '';
   private beforeLive: Array<[string, ContextUse, string | undefined]> = [];
   private sentAny = false;
@@ -212,8 +214,24 @@ export class VoiceCallBridge {
     if (event.type === 'transcript') this.ports.caption(event.role, event.text, false);
     else this.ports.caption(event.role, '', true);
     this.spoken.add(event);
-    if (event.role === 'caller') this.heardCaller(event);
-    else if (event.type === 'turn-done') this.tellCheckIns();
+    if (event.role === 'caller') {
+      this.heardCaller(event);
+      if (event.type === 'turn-done') this.tellHeld();
+    } else if (event.type === 'turn-done') {
+      this.tellCheckIns();
+      this.tellHeld();
+    }
+  }
+
+  /** Tells the voice something it should know but not say, once the caller is not mid-sentence. */
+  knowSoon(text: string): void {
+    this.held.push(text);
+    this.tellHeld();
+  }
+
+  private tellHeld(): void {
+    if (this.callerTurn.trim() !== '') return;
+    for (const text of this.held.splice(0)) this.context(text, 'know');
   }
 
   /**

@@ -1,4 +1,8 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import fs from 'fs';
+import http from 'http';
+import type { AddressInfo } from 'net';
+
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 
 const H = vi.hoisted(() => {
   process.env.PREVIEW_ORIGIN_SUFFIX = 'calls.example';
@@ -7,6 +11,10 @@ const H = vi.hoisted(() => {
   return {
     asker: 'slack-test:U1',
     platform: 'slack:C0TEST',
+    channelType: 'slack-test',
+    threadId: null as string | null,
+    poster: null as null | 'throws' | { name: string | null; files: boolean },
+    posterAsked: [] as unknown[][],
     minted: 0,
     members: new Set(['U1', 'U2']),
     dms: new Map<string, string>(),
@@ -30,6 +38,8 @@ const H = vi.hoisted(() => {
     present: ['p-someone'] as string[],
     live: null as null | ((event: unknown) => void),
     told: [] as string[],
+    notes: [] as Array<{ text: string; use: string }>,
+    postedFiles: [] as Array<{ text: string; files: Array<{ filename: string; data: Buffer }> }>,
     voiceTrack: 'heard' as 'published' | 'heard' | null,
     written: [] as Array<{ content: string }>,
     discordBusy: false,
@@ -44,18 +54,22 @@ vi.mock('../../../caller-identity.js', () => ({
   }),
 }));
 vi.mock('../../../db/sessions.js', () => ({
-  getSession: async (id: string) => ({ id, agent_group_id: 'ag-test', messaging_group_id: 'mg-test' }),
+  getSession: async (id: string) => ({
+    id,
+    agent_group_id: 'ag-test',
+    messaging_group_id: 'mg-test',
+    thread_id: H.threadId,
+  }),
 }));
 vi.mock('../../../db/messaging-groups.js', () => ({
   getMessagingGroup: async () => ({
     id: 'mg-test',
-    channel_type: 'slack-test',
+    channel_type: H.channelType,
     platform_id: H.platform,
-    instance: 'slack-test',
+    instance: H.channelType,
   }),
 }));
 vi.mock('../../../db/agent-groups.js', () => ({ getAgentGroup: async () => ({ id: 'ag-test', name: 'Pixel' }) }));
-vi.mock('../../../types.js', async (orig) => ({ ...(await orig<object>()), isChannelVariant: () => true }));
 vi.mock('../../../db/central-lease.js', () => ({ withCentralSync: async (fn: () => unknown) => fn() }));
 vi.mock('../../../channels/slack-lib.js', () => ({
   botTokenKeyForChannelType: () => 'SLACK_BOT_TOKEN_TEST',
@@ -106,7 +120,12 @@ vi.mock('../service.js', async (orig) => ({
   },
   mayCall: (userId: string) => !H.denied.has(userId),
   spokenName: async () => 'Pixel',
-  deliverText: async (route: { platformId: string }, text: string) => {
+  deliverText: async (
+    route: { platformId: string },
+    text: string,
+    files?: Array<{ filename: string; data: Buffer }>,
+  ) => {
+    if (files) H.postedFiles.push({ text, files });
     if (route.platformId.startsWith('dm:')) await H.dmHold;
     if (route.platformId.startsWith('dm:')) H.dms.set(route.platformId.slice(3), text);
     else H.posts.push(text);
@@ -116,7 +135,14 @@ vi.mock('../live.js', () => ({
   openLiveCall: async ({ onEvent }: { onEvent: (event: unknown) => void }) => {
     if (H.liveFails) throw new Error('login refused');
     H.live = onEvent;
-    return { answer: 'v=0 answer', context: (text: string) => void H.told.push(text), close() {} };
+    return {
+      answer: 'v=0 answer',
+      context: (text: string, use: string) => {
+        H.told.push(text);
+        H.notes.push({ text, use });
+      },
+      close() {},
+    };
   },
   readCodexLogin: async () => ({ token: 't', accountId: 'a' }),
 }));
@@ -127,7 +153,14 @@ vi.mock('./place.js', async (orig) => {
     whoCanSee: (...args: Parameters<typeof real.whoCanSee>) =>
       H.discordBusy
         ? Promise.reject(new real.DiscordBusy('Discord guilds check failed: 429'))
-        : real.whoCanSee(...args),
+        : args[0].platform === 'discord'
+          ? Promise.resolve(new Set(args[2].map(real.rawUserId).filter((id) => H.members.has(id))))
+          : real.whoCanSee(...args),
+    discordPoster: async (...args: Parameters<typeof real.discordPoster>) => {
+      H.posterAsked.push(args.slice(0, 3));
+      if (H.poster === 'throws') throw new Error('Discord read failed');
+      return H.poster;
+    },
   };
 });
 vi.mock('./livekit.js', () => ({
@@ -191,6 +224,9 @@ const {
   startOrJoinGroupCallAs,
 } = await import('./service.js');
 const { getHostShutdownCallbacks } = await import('../../../host-lifecycle.js');
+const { handleGroupCallRequest } = await import('./http.js');
+const { _setUploadBaseForTest, MAX_FILE_BYTES } = await import('../../mobile/uploads.js');
+const { MAX_DISCORD_FILE_BYTES } = await import('./place.js');
 
 const linkOf = (user: string) => /https:\/\/([0-9a-f]{32})\./.exec(H.dms.get(`slack-test:${user}`) ?? '')![1];
 
@@ -250,10 +286,16 @@ afterEach(async () => {
   H.stops = 0;
   H.present = ['p-someone'];
   H.platform = 'slack:C0TEST';
+  H.channelType = 'slack-test';
+  H.threadId = null;
+  H.poster = null;
+  H.posterAsked.length = 0;
   H.minted = 0;
   H.feed = null;
   H.live = null;
   H.told.length = 0;
+  H.notes.length = 0;
+  H.postedFiles.length = 0;
   H.voiceTrack = 'heard';
   H.written.length = 0;
   H.members = new Set(['U1', 'U2']);
@@ -744,5 +786,222 @@ describe('group calls', () => {
     const late: unknown[] = [];
     listen(stays, (event) => late.push(event));
     expect(late).toEqual([{ type: 'ended', text: 'You are no longer on this call.' }]);
+  });
+});
+
+describe('sharing a file on a group call', () => {
+  const UPLOADS = uniqueTmpRoot('group-call-uploads');
+  const PNG = Buffer.concat([Buffer.from('89504e470d0a1a0a', 'hex'), Buffer.alloc(5000, 7)]);
+  const PROGRAM = Buffer.concat([Buffer.from('MZ\x90\x00\x03\x00', 'latin1'), Buffer.alloc(5000, 0)]);
+  let server: http.Server;
+  let port: number;
+
+  beforeAll(async () => {
+    fs.mkdirSync(UPLOADS, { recursive: true });
+    _setUploadBaseForTest(UPLOADS);
+    server = http.createServer((req, res) => {
+      const link = (req.headers.host ?? '').split('.')[0];
+      if (!handleGroupCallRequest(link, req, res)) res.writeHead(404).end();
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    port = (server.address() as AddressInfo).port;
+  });
+
+  afterAll(async () => {
+    await new Promise((resolve) => server.close(resolve));
+    _setUploadBaseForTest(null);
+    fs.rmSync(UPLOADS, { recursive: true, force: true });
+  });
+
+  const onDisk = () => fs.readdirSync(UPLOADS).flatMap((dir) => fs.readdirSync(`${UPLOADS}/${dir}`));
+  const fileRows = () => H.written.filter((row) => JSON.parse(row.content).attachments);
+
+  function attach(
+    link: string,
+    body: Buffer | ((req: http.ClientRequest) => void),
+    opts: { token?: string; origin?: string; headers?: http.OutgoingHttpHeaders } = {},
+  ): Promise<{ status: number; body: Record<string, unknown> }> {
+    const token = opts.token ?? linkFor(link)?.person.pageToken ?? '';
+    return new Promise((resolve, reject) => {
+      const req = http.request(
+        {
+          host: '127.0.0.1',
+          port,
+          method: 'POST',
+          path: `/attach?t=${token}`,
+          headers: {
+            host: `${link}.calls.example`,
+            origin: opts.origin ?? `https://${link}.calls.example`,
+            'content-type': 'image/png',
+            'x-file-name': 'shot.png',
+            ...opts.headers,
+          },
+        },
+        (res) => {
+          let text = '';
+          res.on('data', (chunk) => (text += chunk));
+          res.on('end', () => resolve({ status: res.statusCode ?? 0, body: text ? JSON.parse(text) : {} }));
+        },
+      );
+      req.on('error', (err: NodeJS.ErrnoException) =>
+        err.code === 'EPIPE' || err.code === 'ECONNRESET' ? undefined : reject(err),
+      );
+      if (typeof body === 'function') body(req);
+      else req.end(body);
+    });
+  }
+
+  async function liveCallWith(...users: string[]) {
+    H.present = users.map((user) => `p-${user}`);
+    const links = await callWith(...users);
+    for (const user of users) await until(() => claimLink(links[user]));
+    await until(() => H.live);
+    return links;
+  }
+
+  it.each([
+    { refused: 'a wrong page token', opts: { token: 'f'.repeat(32) } },
+    { refused: 'no page token', opts: { token: '' } },
+    { refused: 'another origin', opts: { origin: 'https://other.calls.example' } },
+  ])('refuses $refused and shares nothing', async ({ opts }) => {
+    const links = await liveCallWith('U1');
+    expect((await attach(links.U1, PNG, opts)).status).toBe(403);
+    expect([fileRows(), H.postedFiles, onDisk()]).toEqual([[], [], []]);
+  });
+
+  it('refuses a file over the size cap, and one whose bytes are not the kind its name claims', async () => {
+    const links = await liveCallWith('U1');
+    const oversized = await attach(links.U1, (req) => req.end(), {
+      headers: { 'content-length': String(MAX_FILE_BYTES + 1) },
+    });
+    const disguised = await attach(links.U1, PROGRAM);
+    expect([oversized.status, disguised.status]).toEqual([413, 415]);
+    expect([fileRows(), H.postedFiles, onDisk()]).toEqual([[], [], []]);
+  });
+
+  it('gives the file to the agent for its next turn, tells the voice once, and shows everyone on the call', async () => {
+    const links = await liveCallWith('U1', 'U2');
+    const seen: Record<string, unknown[]> = { U1: [], U2: [] };
+    for (const user of ['U1', 'U2']) listen(linkFor(links[user])!.person, (event) => seen[user].push(event));
+
+    const res = await attach(links.U1, PNG);
+
+    expect(res).toEqual({ status: 200, body: { ok: true, name: 'shot.png', inThread: true } });
+    const [row] = fileRows() as Array<{ id: string; trigger: number; content: string }>;
+    expect(fileRows()).toHaveLength(1);
+    expect(row.id.startsWith(`voice-${linkFor(links.U1)!.call.id}-`)).toBe(true);
+    expect(row.trigger).toBe(0);
+    expect(JSON.parse(row.content)).toEqual({
+      text: 'Someone shared shot.png on the call, to look at when someone on the call asks about it.',
+      sender: 'Someone (on the call)',
+      attachments: [
+        { type: 'image', name: 'shot.png', mimeType: 'image/png', size: PNG.length, data: PNG.toString('base64') },
+      ],
+    });
+    expect(H.notes.filter((note) => note.text.includes('shot.png'))).toEqual([
+      {
+        text: expect.stringMatching(/^Someone shared a file on the call: "shot\.png"\. Pixel can see it\./),
+        use: 'know',
+      },
+    ]);
+    const shared = { type: 'shared', speaker: 'Someone', file: 'shot.png' };
+    expect([seen.U1, seen.U2]).toEqual([[shared], [shared]]);
+    await until(() => H.postedFiles.length);
+    expect(H.postedFiles).toEqual([
+      { text: '📎 Someone shared shot.png on the call', files: [{ filename: 'shot.png', data: PNG }] },
+    ]);
+    expect(onDisk()).toEqual([]);
+  });
+
+  const allowed = { name: 'Ana', files: true };
+  it.each([
+    {
+      row: 'may attach files',
+      threadId: 'discord:G1:C1:T1',
+      poster: allowed,
+      over: false,
+      inThread: true,
+      asked: true,
+    },
+    {
+      row: 'may post but not attach',
+      threadId: 'discord:G1:C1:T1',
+      poster: { name: 'Ana', files: false },
+      over: false,
+      inThread: false,
+      asked: true,
+    },
+    { row: 'may not post', threadId: 'discord:G1:C1:T1', poster: null, over: false, inThread: false, asked: true },
+    {
+      row: 'whose permissions cannot be read',
+      threadId: 'discord:G1:C1:T1',
+      poster: 'throws' as const,
+      over: false,
+      inThread: false,
+      asked: true,
+    },
+    { row: 'in a channel, not a thread', threadId: null, poster: allowed, over: false, inThread: false, asked: false },
+    {
+      row: 'with a file over Discord’s cap',
+      threadId: 'discord:G1:C1:T1',
+      poster: allowed,
+      over: true,
+      inThread: false,
+      asked: false,
+    },
+  ])(
+    'on Discord, posts the file only where the uploader could attach it: $row',
+    async ({ threadId, poster, over, inThread, asked }) => {
+      H.channelType = 'discord';
+      H.platform = 'discord:G1:C1';
+      H.threadId = threadId;
+      H.poster = poster;
+      H.present = ['p-someone'];
+      const thread = { sessionId: 'sess-test', agentGroupId: 'ag-test' };
+      await startOrJoinGroupCallAs(thread, 'discord:U1');
+      const joined = await startOrJoinGroupCallAs(thread, 'discord:U2');
+      const link = /^https:\/\/([0-9a-f]{32})\./.exec(joined.url)![1];
+      await until(() => claimLink(link));
+      await until(() => H.live);
+      const body = over ? Buffer.concat([PNG, Buffer.alloc(MAX_DISCORD_FILE_BYTES + 1 - PNG.length)]) : PNG;
+
+      const res = await attach(link, body);
+
+      await until(() => H.posts.find((post) => post.startsWith('📎')));
+      expect(H.postedFiles.map(({ files }) => files.map(({ filename }) => filename))).toEqual(
+        inThread ? [['shot.png']] : [],
+      );
+      expect(H.posts.filter((post) => post.startsWith('📎'))).toEqual(['📎 Someone shared shot.png on the call']);
+      expect(H.posterAsked).toEqual(
+        asked ? [[{ platform: 'discord', guildId: 'G1', channelId: 'C1', threadId: 'T1' }, 'discord', 'U2']] : [],
+      );
+      expect(fileRows()).toHaveLength(1);
+      expect(res).toEqual({ status: 200, body: { ok: true, name: 'shot.png', inThread } });
+    },
+  );
+
+  it('refuses a file whose call ends while it arrives, and any file once the call is over', async () => {
+    const links = await liveCallWith('U1');
+    let finish!: () => void;
+    const arriving = attach(links.U1, (req) => {
+      req.write(PNG.subarray(0, 4096));
+      finish = () => req.end(PNG.subarray(4096));
+    });
+    await until(() => onDisk().length > 0);
+    for (const shutdown of getHostShutdownCallbacks()) await shutdown();
+    finish();
+
+    expect((await arriving).status).toBe(409);
+    expect((await attach(links.U1, PNG, { token: 'f'.repeat(32) })).status).toBe(404);
+    expect([fileRows(), H.postedFiles, onDisk()]).toEqual([[], [], []]);
+  });
+  it('counts a person’s files as a phone’s replies are counted, and refuses past ten a minute', async () => {
+    const links = await liveCallWith('U2');
+    const answers: number[] = [];
+    for (let n = 0; n < 11; n++) answers.push((await attach(links.U2, PNG)).status);
+
+    expect(answers).toEqual([...Array<number>(10).fill(200), 429]);
+    expect(fileRows()).toHaveLength(10);
+    expect(onDisk()).toEqual([]);
   });
 });

@@ -585,6 +585,21 @@ describe('VoiceCallBridge', () => {
     });
   });
 
+  it('gives the voice a silent note at once, or once the caller has finished a sentence they are in', async () => {
+    const h = await connect([], true);
+    const notes = () => h.appended.filter((a) => a.text.includes('.pdf'));
+    h.bridge.knowSoon('Rae shared plan.pdf.');
+    h.live({ type: 'transcript', role: 'caller', text: 'Atlas, look at' });
+    h.bridge.knowSoon('Sam shared notes.pdf.');
+    expect(notes()).toEqual([{ text: 'Rae shared plan.pdf.', use: 'know', delegationId: undefined }]);
+
+    h.live({ type: 'turn-done', role: 'caller', transcript: 'Atlas, look at this' });
+    expect(notes()).toEqual([
+      { text: 'Rae shared plan.pdf.', use: 'know', delegationId: undefined },
+      { text: 'Sam shared notes.pdf.', use: 'know', delegationId: undefined },
+    ]);
+  });
+
   it('ends when the voice service closes the call', async () => {
     const h = await connect();
     h.live({ type: 'closed', reason: null });

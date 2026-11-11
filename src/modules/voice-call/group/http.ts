@@ -5,10 +5,50 @@ import { timingSafeEqual } from 'crypto';
 import { log } from '../../../log.js';
 import { json, readBody, send, streamEvents } from '../http.js';
 import { logMicReport, MIC_REPORT_MAX_BYTES } from '../mic-report.js';
+import { overLimit, SEND_LIMITS } from '../../mobile/limits.js';
+import { discardFiles, receiveFile } from '../../mobile/uploads.js';
 import { livekitClientScript } from './bridge-page.js';
 import { joinPageHtml } from './join-page.js';
-import { claimLink, gate, groupCallUrl, leave, linkFor, listen, type GroupPageEvent } from './service.js';
+import {
+  claimLink,
+  gate,
+  groupCallUrl,
+  leave,
+  linkFor,
+  listen,
+  mayShare,
+  shareOnCall,
+  type GroupPageEvent,
+} from './service.js';
 import { platformName } from '../prompts.js';
+
+/** Links with a file still arriving: one at a time each, so one page cannot fill the host's disk in parallel. */
+const sending = new Set<string>();
+/** Files each person shared, on a budget of their own with a phone's reply limits: each one posts in their name. */
+const recentShares = new Map<string, number[]>();
+
+const NOT_LIVE = 'Files can be shared only while the call is live.';
+
+async function attach(linkId: string, userId: string, req: IncomingMessage, res: ServerResponse): Promise<void> {
+  if (!mayShare(linkId)) return json(res, 409, { error: NOT_LIVE });
+  if (sending.has(linkId)) return json(res, 429, { error: 'One file at a time. Wait for the last one to finish.' });
+  if (overLimit(recentShares, userId, SEND_LIMITS))
+    return json(res, 429, { error: 'That is a lot of files at once. Wait a minute and try again.' });
+  sending.add(linkId);
+  try {
+    const received = await receiveFile(req);
+    if (!('file' in received)) return json(res, received.status, { error: received.error });
+    try {
+      const shared = await shareOnCall(linkId, received.file);
+      if (shared) json(res, 200, { ok: true, name: received.file.name, inThread: shared.inThread });
+      else json(res, 409, { error: NOT_LIVE });
+    } finally {
+      discardFiles([received.file]);
+    }
+  } finally {
+    sending.delete(linkId);
+  }
+}
 
 function pageTokenMatches(expected: string | null, url: URL): boolean {
   const given = Buffer.from(url.searchParams.get('t') ?? '');
@@ -53,10 +93,12 @@ export function handleGroupCallRequest(linkId: string, req: IncomingMessage, res
     else streamEvents<GroupPageEvent>(req, res, (write) => listen(person, write));
     return true;
   }
-  if (method !== 'POST' || !['/claim', '/leave', '/mic'].includes(url.pathname)) {
+  if (method !== 'POST' || !['/claim', '/leave', '/mic', '/attach'].includes(url.pathname)) {
     json(res, 404, { error: 'Not found.' });
     return true;
   }
+  // A refused upload is answered before its body arrives, so closing stops a phone still sending up to 25 MB.
+  if (url.pathname === '/attach') res.setHeader('connection', 'close');
   // Every preview is a sibling subdomain running agent-written code, so a state change must come from this page.
   if (req.headers.origin !== groupCallUrl(linkId)) {
     json(res, 403, { error: 'Wrong origin.' });
@@ -71,6 +113,7 @@ export function handleGroupCallRequest(linkId: string, req: IncomingMessage, res
         return;
       }
       if (!pageTokenMatches(person.pageToken, url)) json(res, 403, { error: 'Not this call.' });
+      else if (url.pathname === '/attach') await attach(linkId, person.userId, req, res);
       else if (url.pathname === '/mic') {
         logMicReport(call.id, await readBody(req, MIC_REPORT_MAX_BYTES));
         json(res, 200, { ok: true });

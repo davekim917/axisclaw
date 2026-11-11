@@ -1,5 +1,6 @@
 import { randomBytes } from 'crypto';
 
+import type { OutboundFile } from '../../channels/adapter.js';
 import { neutralizeMentions } from '../../channels/neutralize-mentions.js';
 import { PREVIEW_ORIGIN_SUFFIX, TIMEZONE, VOICE_CALL_AGENT_GROUPS, VOICE_CALL_CODEX_BIN } from '../../config.js';
 import { deriveHumanRequest } from '../../caller-identity.js';
@@ -82,6 +83,7 @@ function finish(call: VoiceCall, reason: string): void {
 export async function deliverText(
   route: Pick<CallRoute, 'channelType' | 'instance' | 'platformId' | 'threadId'>,
   text: string,
+  files?: OutboundFile[],
 ) {
   const adapter = getDeliveryAdapter();
   if (!adapter) throw new Error('No delivery adapter is ready.');
@@ -91,7 +93,7 @@ export async function deliverText(
     route.threadId,
     'chat',
     JSON.stringify({ text: scrubSecrets(text) }),
-    undefined,
+    files,
     route.instance,
   );
 }

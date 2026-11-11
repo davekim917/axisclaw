@@ -1,4 +1,5 @@
 import { randomBytes } from 'crypto';
+import fs from 'fs';
 
 import { neutralizeMentions } from '../../../channels/neutralize-mentions.js';
 import { PREVIEW_ORIGIN_SUFFIX, TIMEZONE, VOICE_CALL_CODEX_BIN } from '../../../config.js';
@@ -10,15 +11,25 @@ import { getSession } from '../../../db/sessions.js';
 import { onHostShutdown, onHostStart } from '../../../host-lifecycle.js';
 import { log } from '../../../log.js';
 import { requestWake } from '../../../request-wake.js';
-import { writeSessionMessage } from '../../../session-manager.js';
+import { SessionWriteRefusedError, writeSessionMessage } from '../../../session-manager.js';
 import { formatLocalTime } from '../../../timezone.js';
 import type { MessagingGroup, Session } from '../../../types.js';
 import { getUser } from '../../permissions/db/users.js';
 import { ensureUserDm } from '../../permissions/user-dm.js';
+import type { ReplyFile } from '../../mobile/uploads.js';
 import { VoiceCallBridge, type AdmittedRequest, type CallPorts } from '../call.js';
-import { DiscordBusy, type CallPlace, placeOf, platformOf, rawUserId, whoCanSee } from './place.js';
+import {
+  DiscordBusy,
+  discordPoster,
+  MAX_DISCORD_FILE_BYTES,
+  type CallPlace,
+  placeOf,
+  platformOf,
+  rawUserId,
+  whoCanSee,
+} from './place.js';
 import { openLiveCall, readCodexLogin } from '../live.js';
-import { groupRequestText, platformName, voiceMirror } from '../prompts.js';
+import { groupRequestText, platformName, sharedFileNote, sharedFileText, voiceMirror } from '../prompts.js';
 import { groupCallSessions, type CallPageEvent, type CallRoute } from '../registry.js';
 import {
   deliverText,
@@ -74,7 +85,10 @@ const MAX_POLL_FAILURES = 5;
 const HEARD_WAIT_MS = 5000;
 const LINK_ID_RE = /^[0-9a-f]{32}$/;
 
-export type GroupPageEvent = CallPageEvent | { type: 'request'; speaker: string; text: string };
+export type GroupPageEvent =
+  | CallPageEvent
+  | { type: 'request'; speaker: string; text: string }
+  | { type: 'shared'; speaker: string; file: string };
 
 interface Participant {
   userId: string;
@@ -808,6 +822,94 @@ export async function claimLink(linkId: string): Promise<{ token: string; url: s
 export async function leave(linkId: string): Promise<void> {
   const found = linkFor(linkId);
   if (found && !found.person.removed) await removePerson(found.call, found.person, 'left');
+}
+
+/** Whether this link's person may share a file now: they are in a call that is live. */
+export function mayShare(linkId: string): boolean {
+  const found = linkFor(linkId);
+  return !!found && found.call.state === 'live' && found.person.claimed && !found.person.removed;
+}
+
+/**
+ * Whether the bot is cleared to put this person's file in the call's thread: never further than they could reach
+ * themselves, nor past what the platform takes. Their own DM is theirs; Discord says live whether they may attach files
+ * in the thread. Slack has no per-person check here.
+ */
+async function mayPostFile(call: GroupCall, person: Participant, file: ReplyFile): Promise<boolean> {
+  const { place } = call;
+  if (place.platform === 'discord' && file.size > MAX_DISCORD_FILE_BYTES) return false;
+  if ('dm' in place || place.platform === 'slack') return true;
+  if (!place.threadId) return false;
+  const poster = await discordPoster(
+    { ...place, threadId: place.threadId },
+    call.route.channelType,
+    rawUserId(person.userId),
+  ).catch((err: unknown) => {
+    log.warn('Group call: Discord posting check failed', { callId: call.id.slice(0, 8), err });
+    return null;
+  });
+  return poster?.files === true;
+}
+
+/**
+ * A file someone shared on the call goes to the agent as context for its next turn, never as a turn of its own: the
+ * voice is told silently, everyone on the call sees a line, and the thread keeps the file where the person could have
+ * posted it, else the line alone. `inThread` says the bot was cleared to post the file there, not that the post landed: a
+ * post that then fails is only logged. Null when the call or the person's place on it ended first.
+ */
+export async function shareOnCall(linkId: string, file: ReplyFile): Promise<{ inThread: boolean } | null> {
+  const found = linkFor(linkId);
+  if (!found || !mayShare(linkId)) return null;
+  const { call, person } = found;
+  const bytes = await fs.promises.readFile(file.path);
+  try {
+    await writeSessionMessage(
+      call.agentGroupId,
+      call.sessionId,
+      {
+        id: `voice-${call.id}-file-${randomBytes(6).toString('hex')}`,
+        kind: 'chat',
+        timestamp: new Date().toISOString(),
+        platformId: call.route.platformId,
+        channelType: call.route.channelType,
+        messagingGroupId: call.route.messagingGroupId,
+        threadId: call.route.threadId,
+        content: JSON.stringify({
+          text: sharedFileText(person.name, file.name),
+          sender: `${person.name} (on the call)`,
+          attachments: [
+            {
+              type: file.type.startsWith('image/') ? 'image' : 'file',
+              name: file.name,
+              mimeType: file.type,
+              size: file.size,
+              data: bytes.toString('base64'),
+            },
+          ],
+        }),
+        trigger: 0,
+      },
+      { guard: () => mayShare(linkId) || { ok: false, reason: 'the group call ended' } },
+    );
+  } catch (err) {
+    if (err instanceof SessionWriteRefusedError) return null;
+    throw err;
+  }
+  call.voice?.knowSoon(sharedFileNote(person.name, file.name, call.agentName));
+  emit(call, { type: 'shared', speaker: person.name, file: file.name });
+  const line = `📎 ${neutralizeMentions(person.name)} shared ${neutralizeMentions(file.name)} on the call`;
+  const inThread = await mayPostFile(call, person, file);
+  // A platform can still refuse a file it was cleared for, and the line still belongs.
+  const withFile = () =>
+    deliverText(call.route, line, [{ filename: file.name, data: bytes }]).catch((err: unknown) => {
+      log.warn('Group call: the shared file did not post to the thread', { callId: call.id.slice(0, 8), err });
+      return deliverText(call.route, line);
+    });
+  void (inThread ? withFile() : deliverText(call.route, line)).catch((err: unknown) =>
+    log.warn('Group call: thread post failed', { callId: call.id.slice(0, 8), err }),
+  );
+  log.info('Group call: file shared', { callId: call.id.slice(0, 8), type: file.type, size: file.size, inThread });
+  return { inThread };
 }
 
 async function startVoice(call: GroupCall): Promise<void> {

@@ -194,13 +194,14 @@ describe('receiveUpload', () => {
     await vi.waitFor(() => expect(onDisk()).toEqual([]));
   });
 
-  it('lets one device hold three files until a reply takes them', async () => {
+  it('lets one device hold three files until a reply takes them, and still names a file too large as that', async () => {
     for (let n = 0; n < 3; n++) expect((await upload(PNG, {})).status).toBe(200);
     const refused = await upload(PNG, {});
+    const oversized = await upload((req) => req.end(), { 'content-length': String(MAX_FILE_BYTES + 1) });
     device = 'dev-b';
     const other = await upload(PNG, {});
 
-    expect([MAX_HELD_PER_DEVICE, refused.status, other.status]).toEqual([3, 429, 200]);
+    expect([MAX_HELD_PER_DEVICE, refused.status, oversized.status, other.status]).toEqual([3, 429, 413, 200]);
     expect(onDisk()).toHaveLength(4);
   });
 

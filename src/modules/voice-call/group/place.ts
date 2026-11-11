@@ -268,6 +268,9 @@ async function discordViewers(
   return found;
 }
 
+/** Discord's default limit on each file a message carries; a boosted server allows more, but no less. */
+export const MAX_DISCORD_FILE_BYTES = 20 * 1024 * 1024;
+
 /**
  * Whether this person could post in the thread themselves, read live, the name the server shows for them, and whether
  * they could attach files there. A bot posting for someone must never reach further than they could, so a locked thread

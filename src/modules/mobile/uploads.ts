@@ -1,7 +1,7 @@
 /**
- * Files a phone sends with a reply. Each one streams to its own file in this process's own temporary directory, under a
- * size cap checked as the bytes arrive. Its kind is read from its bytes, never from what the phone declares, and it lives
- * only until the reply that names it has been tried, or ten minutes.
+ * Files a phone sends with a reply or on a call. Each one streams to its own file in this process's own temporary
+ * directory, under a size cap checked as the bytes arrive. Its kind is read from its bytes, never from what the phone
+ * declares, and it lives only until the reply or call that takes it has used it, or, for a reply, ten minutes.
  */
 import { randomBytes } from 'crypto';
 import fs from 'fs';
@@ -178,14 +178,20 @@ const WRONG_KIND = 'That kind of file cannot be sent. Send a photo, a PDF or a d
  */
 export async function receiveUpload(req: IncomingMessage, deviceId: string): Promise<Received> {
   sweep();
-  if (Number(req.headers['content-length']) > MAX_FILE_BYTES) return { status: 413, error: TOO_LARGE, close: true };
+  const declared = declaredTooLarge(req);
+  if (declared) return declared;
   const holding = [...held.values()].filter((file) => file.deviceId === deviceId).length;
   if (holding + (receiving.get(deviceId) ?? 0) >= MAX_HELD_PER_DEVICE) {
     return { status: 429, error: 'That is a lot of files at once. Send the reply first.', close: true };
   }
   receiving.set(deviceId, (receiving.get(deviceId) ?? 0) + 1);
   try {
-    return await streamUpload(req, deviceId);
+    const got = await receiveFile(req);
+    if (!('file' in got)) return got;
+    held.set(got.id, { ...got.file, deviceId, expiresAt: Date.now() + HELD_TTL_MS });
+    // A file no reply takes goes when its time is up, whether or not another upload or reply comes to sweep it.
+    setTimeout(() => sweep(), HELD_TTL_MS + 1_000).unref();
+    return { uploadId: got.id };
   } finally {
     const left = (receiving.get(deviceId) ?? 1) - 1;
     if (left > 0) receiving.set(deviceId, left);
@@ -195,7 +201,18 @@ export async function receiveUpload(req: IncomingMessage, deviceId: string): Pro
 
 type Ending = 'done' | 'too-large' | 'wrong-kind' | 'unfinished';
 
-async function streamUpload(req: IncomingMessage, deviceId: string): Promise<Received> {
+export type Refused = Extract<Received, { status: number }>;
+
+const declaredTooLarge = (req: IncomingMessage): Refused | null =>
+  Number(req.headers['content-length']) > MAX_FILE_BYTES ? { status: 413, error: TOO_LARGE, close: true } : null;
+
+/**
+ * Streams one file to its own file in this process's upload directory under the size cap, its kind read from its bytes.
+ * The file is the caller's to `discardFiles`.
+ */
+export async function receiveFile(req: IncomingMessage): Promise<{ id: string; file: ReplyFile } | Refused> {
+  const declared = declaredTooLarge(req);
+  if (declared) return declared;
   const id = randomBytes(16).toString('base64url');
   const filePath = path.join(uploadDir(), id);
   const out = fs.createWriteStream(filePath, { flags: 'wx', mode: 0o600 });
@@ -255,17 +272,7 @@ async function streamUpload(req: IncomingMessage, deviceId: string): Promise<Rec
     if (size === 0) return { status: 400, error: 'That file is empty.', close: true };
     return { status: 415, error: WRONG_KIND, close: true };
   }
-  held.set(id, {
-    path: filePath,
-    name: fileName(given, found),
-    type: found.type,
-    size,
-    deviceId,
-    expiresAt: Date.now() + HELD_TTL_MS,
-  });
-  // A file no reply takes goes when its time is up, whether or not another upload or reply comes to sweep it.
-  setTimeout(() => sweep(), HELD_TTL_MS + 1_000).unref();
-  return { uploadId: id };
+  return { id, file: { path: filePath, name: fileName(given, found), type: found.type, size } };
 }
 
 /**

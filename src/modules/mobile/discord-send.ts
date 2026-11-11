@@ -16,6 +16,7 @@ import { getUser } from '../permissions/db/users.js';
 import {
   discordPostMessage,
   discordPoster,
+  MAX_DISCORD_FILE_BYTES,
   placeOf,
   rawUserId,
   userPlatform,
@@ -28,8 +29,6 @@ import type { ReplyFile } from './uploads.js';
 
 /** Discord's own limit on one message. */
 const MAX_POST_CHARS = 2000;
-/** Discord's default limit on each file a message carries; a boosted server allows more, but no less. */
-const MAX_DISCORD_FILE_BYTES = 20 * 1024 * 1024;
 /** A thread screen asks for its reply box on every poll; a send always asks Discord whether the person may post. */
 const SHOWN_TTL_MS = 60_000;
 

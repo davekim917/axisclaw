@@ -590,7 +590,11 @@ Access is checked live, on every call request, against the platform and the cent
 endpoints a browser uses, unchanged: `POST <url>/claim` with `Origin: <url>` returns `{ token, url, pageToken }`, the
 LiveKit client connects with those, `GET <url>/events?t=<pageToken>` streams transcript and people, and
 `POST <url>/leave?t=<pageToken>` leaves. The `Origin` check defends browsers against sibling previews, and a native
-client setting that header is fine.
+client setting that header is fine. The app alone also sends `POST <url>/attach?t=<pageToken>`, a file shared on the call
+([Photos and files](#photos-and-files)).
+
+The call screen's controls are Mute, Attach and Leave. Attach is off until the call is live, and while a file is
+going it shows as busy.
 
 ### Calling from a DM
 
@@ -945,8 +949,12 @@ way (`buildThreadContextBlock`, `src/thread-context.ts`).
 
 ## Photos and files
 
-The open composer has a **+** where the thread takes files. It opens the system's photo picker or its file picker, so
-the app reads only what the person picks and needs no access to the library (`mobile/src/pickers.ts`). Photos are
+The open composer has a **+** where the thread takes files. It opens the Attach sheet (`mobile/src/attach-sheet.tsx`,
+the same one the call screen opens): low on the screen and sized to its two rows, Photo or screenshot and File, with
+the keyboard closed while it is up. Someone who was typing when they opened it gets the keyboard back once the sheet
+has gone and, if they chose a picker, once it has returned, picked or not (`mobile/src/attach-return.ts`). Each row
+opens the system's photo picker or its file picker, so the app reads only what the person picks and needs no access to
+the library (`mobile/src/pickers.ts`). Photos are
 re-encoded as JPEG at 0.7 quality, and iOS hands over JPEG rather than HEIC; a screenshot stays a PNG. Android's
 picker reports the original's type and name for a re-encoded photo, so the app names and types it by the bytes written.
 The picked file shows as a thumbnail, or by name, with a remove button. A reply carries one file of at most 25 MB, of
@@ -1002,6 +1010,19 @@ fails does too, since the file has posted. A file with no words is never archive
   granted `chat:write` alone lacks the scope: the reservation's own answer says so (`not_authed`, `missing_scope`, or
   `x-oauth-scopes` without `files:write`), nothing is sent, and the reply is refused, "Reconnect Slack to send files",
   with `offerConnect`, so the app offers Connect Slack and the phone keeps sending words.
+
+**On a call.** Attach on the call screen opens the same sheet, under the same kinds and 25 MB cap, and sends the file
+to `POST <call url>/attach?t=<pageToken>` with the call's `Origin`, the bytes raw and the name in `X-File-Name`, as an
+upload. The host checks the origin and page token as `/leave` and `/mic` do, takes a file only on a call that is live,
+one at a time per person and, on a budget of its own per person, as many as a phone may send replies (ten a
+minute, 300 a day, `src/modules/mobile/limits.ts`), and
+reads it with the same code as an upload (`receiveFile` in `uploads.ts`), so its kind
+and cap are checked the same way. It never holds the file: the route deletes it once it has been handed on, and a
+call that ended while it arrived refuses it with 409. What happens to it on the call is in
+[voice-call.md](voice-call.md#group-calls). A refusal shows as a short notice; success shows as the call's own
+"Shared" line, which everyone on the call sees. The answer's `inThread: false` means the agent has the file but the bot
+was not cleared to post it in the thread: the person may not attach files there, their permission could not be read,
+or the file is too large for the platform. The app says so. A post that was cleared and then fails is only logged.
 
 **History.** The archive keeps a message's words only, and a message with no words not at all, so thread history shows
 no attachments, from the app or anyone else. On the phone that sent it, a reply's thumbnail stays on the thread's copy
