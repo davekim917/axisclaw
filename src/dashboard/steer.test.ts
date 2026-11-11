@@ -7,7 +7,11 @@ import { applySessionSteer, _resetRateLimitForTesting } from './steer.js';
 import type { AuthedRequestContext } from './router.js';
 
 // These imports resolve AFTER vi.mock hoisting — they are the vi.fn() instances.
-import { SessionWriteRefusedError, writeSessionMessage as _wsmRaw } from '../session-manager.js';
+import {
+  SessionWriteRefusedError,
+  withExistingMailboxSession as _wemsRaw,
+  writeSessionMessage as _wsmRaw,
+} from '../session-manager.js';
 import { readSessionInbound as _rsiRaw } from '../modules/mailbox/read-only.js';
 import { wakeContainer as _wcRaw } from '../container-runner.js';
 import { getChannelAdapter as _gcaRaw } from '../channels/channel-registry.js';
@@ -17,6 +21,7 @@ import { emitDashboardEvent as _edeRaw } from './api/events.js';
 // Typed as mocks for use in test assertions / setup
 const mockWriteSessionMessage = vi.mocked(_wsmRaw);
 const mockReadSessionInbound = vi.mocked(_rsiRaw);
+const mockWithExistingMailboxSession = vi.mocked(_wemsRaw);
 const mockWakeContainer = vi.mocked(_wcRaw);
 const mockGetChannelAdapter = vi.mocked(_gcaRaw);
 const mockGetMessagingGroup = vi.mocked(_gmgRaw);
@@ -34,6 +39,16 @@ vi.mock('../session-manager.js', async (importOriginal) => ({
   heartbeatPath: vi.fn().mockReturnValue('/tmp/heartbeat'),
   resolveSession: vi.fn(),
   writeSessionRouting: vi.fn(),
+  withExistingMailboxSession: vi.fn().mockResolvedValue(undefined),
+}));
+
+const outboundWrite = vi.hoisted(() => vi.fn());
+vi.mock('../modules/mailbox/index.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../modules/mailbox/index.js')>()),
+  withExistingNanoclawOutbound: vi.fn(
+    async (_agentGroupId: string, _sessionId: string, action: (outbound: unknown) => unknown) =>
+      action({ writeOutboundDirect: outboundWrite }),
+  ),
 }));
 
 // The steer write path's partial-write probe reads through the mailbox
@@ -419,5 +434,100 @@ describe('applySessionSteer — C5', () => {
     expect(r.status).toBe(202);
     await new Promise<void>((resolve) => setImmediate(resolve));
     expect(deliverMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('applySessionSteer — model/effort flags', () => {
+  beforeEach(async () => {
+    _resetRateLimitForTesting();
+    mockWriteSessionMessage.mockReset();
+    mockWriteSessionMessage.mockResolvedValue(undefined);
+    mockReadSessionInbound.mockReset();
+    mockReadSessionInbound.mockReturnValue(false);
+    mockGetMessagingGroup.mockReset();
+    mockGetMessagingGroup.mockResolvedValue(undefined);
+    outboundWrite.mockReset();
+    // A task session's series was routed to one room; its answers, and so the notice, go there.
+    mockWithExistingMailboxSession.mockReset();
+    mockWithExistingMailboxSession.mockImplementation(async (_ag, _sess, action) =>
+      action({
+        getLatestRoutedTaskRow: (seriesId: string) =>
+          seriesId === 'series-demo'
+            ? { channel_type: 'slack', platform_id: 'slack:C0DEMO', thread_id: '1700000000.000100', content: '{}' }
+            : null,
+      } as never),
+    );
+    await setupDb();
+    await seedAgentGroup('ag-1');
+    seedSession('sess-task', 'ag-1', 'system:tasks:series-demo');
+    seedUser('owner-s');
+    grantOwner('owner-s');
+  });
+
+  afterEach(async () => {
+    await closeDb();
+    vi.clearAllMocks();
+  });
+
+  function writtenContent(): Record<string, unknown> {
+    const call = mockWriteSessionMessage.mock.calls[0]!;
+    return JSON.parse((call[2] as { content: string }).content) as Record<string, unknown>;
+  }
+
+  it('carries -m/-e as flagIntent with the cleaned text, and posts the ⚙️ confirmation to the series room', async () => {
+    const ctx = makeCtx('owner-s', { no_filter: true });
+    const r = await applySessionSteer(
+      'sess-task',
+      { idempotency_key: VALID_IKEY, text: '-m fable -e high summarize the backlog' },
+      ctx,
+    );
+    expect(r.status).toBe(202);
+
+    const content = writtenContent();
+    expect(content['text']).toBe('summarize the backlog');
+    expect(content['flagIntent']).toEqual({ stickyModel: 'fable', stickyEffort: 'high' });
+    expect(content['flagAck']).toBe('⚙️ model → claude-fable-5-2[1m] (via fable), effort → high');
+    expect(content['_via']).toBe('dashboard');
+
+    expect(outboundWrite).toHaveBeenCalledTimes(1);
+    expect(outboundWrite.mock.calls[0]![0]).toMatchObject({
+      id: `flag-${r.body['message_id'] as string}`,
+      kind: 'chat',
+      channelType: 'slack',
+      platformId: 'slack:C0DEMO',
+      threadId: null,
+      content: JSON.stringify({ text: '⚙️ model → claude-fable-5-2[1m] (via fable), effort → high' }),
+    });
+  });
+
+  it('a bad flag posts the error notice and writes the cleaned text with no intent', async () => {
+    const ctx = makeCtx('owner-s', { no_filter: true });
+    const r = await applySessionSteer('sess-task', { idempotency_key: VALID_IKEY, text: '-e extreme go' }, ctx);
+    expect(r.status).toBe(202);
+
+    const content = writtenContent();
+    expect(content['text']).toBe('go');
+    expect(content['flagIntent']).toBeUndefined();
+    expect(content['flagAck']).toBeUndefined();
+
+    expect(outboundWrite).toHaveBeenCalledTimes(1);
+    const notice = JSON.parse((outboundWrite.mock.calls[0]![0] as { content: string }).content) as { text: string };
+    expect(notice.text).toBe('❌ unknown effort level: extreme (expected low|medium|high|xhigh|max|ultracode)');
+  });
+
+  it('a write the session refuses posts no confirmation', async () => {
+    mockWriteSessionMessage.mockRejectedValueOnce(new SessionWriteRefusedError('session is closed'));
+    const ctx = makeCtx('owner-s', { no_filter: true });
+    const r = await applySessionSteer('sess-task', { idempotency_key: VALID_IKEY, text: '-e high go' }, ctx);
+    expect(r.status).toBe(409);
+    expect(outboundWrite).not.toHaveBeenCalled();
+  });
+
+  it('a steer without flags is written as it came and posts nothing', async () => {
+    const ctx = makeCtx('owner-s', { no_filter: true });
+    await applySessionSteer('sess-task', { idempotency_key: VALID_IKEY, text: 'use -m opus later' }, ctx);
+    expect(writtenContent()['text']).toBe('use -m opus later');
+    expect(writtenContent()['flagIntent']).toBeUndefined();
+    expect(outboundWrite).not.toHaveBeenCalled();
   });
 });

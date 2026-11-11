@@ -57,10 +57,9 @@ import { resolveSession, sessionMessageExists, writeSessionMessageIfNew } from '
 import { withExistingNanoclawOutbound } from './modules/mailbox/index.js';
 import { archiveTenancyOf } from './archive-tenancy.js';
 import { archiveMessage } from './message-archive.js';
-import { parseMessageFlags, formatFlagConfirmation, type FlagIntent } from './flag-parser.js';
+import { applyMessageFlags, withMessageFlags } from './message-flags.js';
 import { sessionStillActive } from './container-runner.js';
 import { requestWake } from './request-wake.js';
-import { getContainerConfig, resolveProviderName } from './db/container-configs.js';
 import type { AgentGroup, ChannelType, MessagingGroup, MessagingGroupAgent } from './types.js';
 import { isChannelVariant } from './types.js';
 import type { InboundEvent } from './channels/adapter.js';
@@ -1184,51 +1183,19 @@ async function deliverToAgent(
 
   // The host posts the flag confirmation directly and attaches structured intent (the container never re-parses).
   // Only when `wake`: a sibling's accumulate path must not echo or store flags meant for another agent.
-  let flagIntent: FlagIntent | undefined;
-  let flagCleanedText: string | null = null;
-  // The posted ⚙️ ack's settings line, so the runner can say "queued" in the same words; only for rows a person typed.
-  let flagAck: string | undefined;
-  if (wake && (event.message.kind === 'chat' || event.message.kind === 'chat-sdk')) {
-    const rawText = parsedContent.text ?? '';
-    // Flag vocabulary is provider-specific. Reads the container_configs projection (spawn reads container.json, so
-    // the two can disagree), with agent_groups.agent_provider for groups created mid-run (no row until restart).
-    const provider = resolveProviderName(
-      session.agent_provider,
-      (await getContainerConfig(session.agent_group_id))?.provider ?? agentGroup.agent_provider,
-    );
-    const parsed = parseMessageFlags(rawText, provider);
-    if (parsed.intent || parsed.errors.length > 0 || parsed.warnings.length > 0) {
-      flagIntent = parsed.intent;
-      flagCleanedText = parsed.cleanedText;
-      const notice = formatFlagConfirmation(parsed.intent ?? {}, parsed.warnings, parsed.errors);
-      if (notice) {
-        const settingsLine = notice.split('\n')[0];
-        if (parsed.intent && settingsLine.startsWith('⚙️')) flagAck = settingsLine;
-        // Outbound-keyed, as for the denial notice above.
-        await withExistingNanoclawOutbound(session.agent_group_id, session.id, (outbound) =>
-          outbound.writeOutboundDirect({
-            id: `flag-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-            kind: 'chat',
-            platformId: deliveryAddr.platformId,
-            channelType: deliveryAddr.channelType,
-            threadId: deliveryAddr.threadId,
-            content: JSON.stringify({ text: notice }),
-          }),
-        );
-      }
-    }
-  }
+  const flags =
+    wake && (event.message.kind === 'chat' || event.message.kind === 'chat-sdk')
+      ? await applyMessageFlags({
+          session,
+          agentGroupProvider: agentGroup.agent_provider,
+          rawText: parsedContent.text ?? '',
+          noticeAddress: deliveryAddr,
+        })
+      : null;
 
   // On engaged mentions in a thread, prepend recent platform thread history (the cutoff rule is shared with the
   // agent-to-agent wake path in src/thread-context.ts).
-  let contentForWrite = persistedContent;
-  if (flagIntent || flagCleanedText !== null) {
-    const parsed = JSON.parse(contentForWrite) as Record<string, unknown>;
-    if (flagCleanedText !== null) parsed.text = flagCleanedText;
-    if (flagIntent) parsed.flagIntent = flagIntent;
-    if (flagAck) parsed.flagAck = flagAck;
-    contentForWrite = JSON.stringify(parsed);
-  }
+  let contentForWrite = flags ? withMessageFlags(persistedContent, flags) : persistedContent;
   if (
     wake &&
     threadsEnabled &&

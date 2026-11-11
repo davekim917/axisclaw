@@ -1178,7 +1178,7 @@
 "src/response-registry.ts":{"diff":22,"mode":"100644","sha256":"e35f14bbb494aafb6f59284de68b744e4741e51a45dc42fcded55ba619a566ac"},
 "src/router-session-created.test.ts":{"diff":237,"mode":"100644","sha256":null,"deleted":true},
 "src/router-unknown-engage-mode.test.ts":{"diff":163,"mode":"100644","sha256":null,"deleted":true},
-"src/router.ts":{"diff":1067,"mode":"100644","sha256":"9e69ebb32fa35f72d539877b60bbaa956409a20d5ee166145d1e00b7f8e37aec"},
+"src/router.ts":{"diff":1034,"mode":"100644","sha256":"b12a0eb843ba5fa802dfc29fb2fed7cbedca055b9751b981e9535fea34f2d807"},
 "src/session-claim-fencing.test.ts":{"diff":393,"mode":"100644","sha256":null,"deleted":true},
 "src/session-manager.attachments.test.ts":{"diff":9,"mode":"100644","sha256":"e095f855c03dc5c3a19410ff5f388996677b238a3dad75a003669239272ef53a"},
 "src/session-manager.feeds.test.ts":{"diff":82,"mode":"100644","sha256":null,"deleted":true},

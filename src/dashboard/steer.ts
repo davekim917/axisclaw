@@ -7,10 +7,19 @@ import { randomUUID } from 'crypto';
 import { createHash } from 'crypto';
 
 import { withCentralSync } from '../db/central-lease.js';
-import { getSession } from '../db/sessions.js';
+import { getSession, taskSeriesId } from '../db/sessions.js';
 import { getMessagingGroup } from '../db/messaging-groups.js';
+import { getAgentGroup } from '../db/agent-groups.js';
+import {
+  parseSessionMessageFlags,
+  postFlagNotice,
+  withMessageFlags,
+  type FlagNoticeAddress,
+  type ParsedMessageFlags,
+} from '../message-flags.js';
+import type { Session } from '../types.js';
 import { log } from '../log.js';
-import { SessionWriteRefusedError, writeSessionMessage } from '../session-manager.js';
+import { SessionWriteRefusedError, withExistingMailboxSession, writeSessionMessage } from '../session-manager.js';
 import { readSessionInbound } from '../modules/mailbox/index.js';
 import { requestWake } from '../request-wake.js';
 import { sessionStillActive, unwakeableReason } from '../container-runner.js';
@@ -198,8 +207,18 @@ async function _writeAndEchoSteer(
       { busyTimeoutMs: 5000, recoverJournal: true },
     ) ?? false;
 
+  const steerFlags = await _parseSteerFlags(exec.childSessionId, trimmedText);
   if (!inboundExists) {
     const now = new Date().toISOString();
+    const content = withMessageFlags(
+      JSON.stringify({
+        text: trimmedText,
+        sender: displayName,
+        _via: 'dashboard',
+        _steer: exec.envelope,
+      }),
+      steerFlags?.parsed.flags ?? { cleanedText: null },
+    );
     try {
       await writeSessionMessage(
         exec.childAgentGroupId,
@@ -208,12 +227,7 @@ async function _writeAndEchoSteer(
           id: resolvedMessageId,
           kind: 'chat',
           timestamp: now,
-          content: JSON.stringify({
-            text: trimmedText,
-            sender: displayName,
-            _via: 'dashboard',
-            _steer: exec.envelope,
-          }),
+          content,
           trigger: 1,
         },
         { guard: sessionStillActive(exec.childSessionId) },
@@ -237,6 +251,15 @@ async function _writeAndEchoSteer(
         throw err;
       }
     }
+  }
+  // Only once the row is in: a refused write must not leave the room told about settings that never applied.
+  if (steerFlags?.parsed.notice) {
+    await postFlagNotice(
+      steerFlags.session,
+      steerFlags.parsed.notice,
+      await _steerNoticeAddress(steerFlags.session),
+      `flag-${resolvedMessageId}`,
+    );
   }
 
   if (exec.onWrite) {
@@ -289,6 +312,35 @@ async function _writeAndEchoSteer(
   }
 
   return { status: 202, body: _responseShapeForTarget(steerResponse) };
+}
+
+/**
+ * A steer is a person's message, so it carries `-m`/`-e`/`-f` the way a typed one does. The notice goes to the room the
+ * session's answers reach: its chat, or for a task session (no chat of its own) the room its series was routed to.
+ */
+async function _parseSteerFlags(
+  sessionId: string,
+  text: string,
+): Promise<{ session: Session; parsed: ParsedMessageFlags } | null> {
+  const session = await getSession(sessionId);
+  if (!session) return null;
+  const agentGroupProvider = (await getAgentGroup(session.agent_group_id))?.agent_provider;
+  return { session, parsed: await parseSessionMessageFlags(session, agentGroupProvider, text) };
+}
+
+async function _steerNoticeAddress(session: Session): Promise<FlagNoticeAddress> {
+  const mg = session.messaging_group_id ? await getMessagingGroup(session.messaging_group_id) : undefined;
+  if (mg) return { channelType: mg.channel_type, platformId: mg.platform_id, threadId: session.thread_id };
+  const seriesId = taskSeriesId(session.thread_id);
+  const stamp = seriesId
+    ? await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
+        mailbox.getLatestRoutedTaskRow(seriesId),
+      )
+    : null;
+  // Thread left to delivery, which continues the series' stamped thread as it does for the agent's own posts.
+  return stamp
+    ? { channelType: stamp.channel_type, platformId: stamp.platform_id, threadId: null }
+    : { channelType: null, platformId: null, threadId: session.thread_id };
 }
 
 /** The task endpoint's body carries `task_id`, the session endpoint's `session_id`. */
