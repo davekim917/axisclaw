@@ -43,7 +43,9 @@ Pause before implementation when a missing field changes the contract.
 
 ### 2. Implement
 
-1. Make the smallest change that satisfies the brief.
+1. Satisfy the brief without over-engineering or building ahead of need. Change
+   the code that already does the job rather than adding new code beside it; if
+   that code is outside the brief's scope, call `spawn_request_steer`.
 2. Preserve repository-local conventions and tenant boundaries.
 3. Do not expand scope merely because adjacent work is visible.
 4. Call `spawn_progress` with the files changed and the invariant each change
