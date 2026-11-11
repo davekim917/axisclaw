@@ -1,9 +1,16 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
+import { cardToBlockKit } from '@chat-adapter/slack';
 import { describe, expect, it } from 'vitest';
 
-import { CardSpecError, discordCardPayload, renderCardSpec, renderCardGuideModule } from './card-spec.js';
+import {
+  CardSpecError,
+  discordCardPayload,
+  renderCardSpec,
+  renderCardGuideModule,
+  slackCardBlocks,
+} from './card-spec.js';
 
 function card(...children: Array<{ type: string; props: Record<string, unknown> }>) {
   return {
@@ -17,6 +24,19 @@ function card(...children: Array<{ type: string; props: Record<string, unknown> 
 
 const table = (cell: string) => ({ type: 'Table', props: { headers: ['x'], rows: [[cell]] } });
 const text = (content: string) => ({ type: 'Text', props: { content } });
+const richDemo = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'docs/examples/card-rich-demo.json'), 'utf8')) as {
+  spec: unknown;
+};
+const linkButton = (label: string, url: string) => ({
+  type: 'button',
+  text: { type: 'plain_text', text: label, emoji: true },
+  action_id: `link-${url}`,
+  url,
+});
+const richCell = (element: Record<string, unknown>) => ({
+  type: 'rich_text',
+  elements: [{ type: 'rich_text_section', elements: [element] }],
+});
 
 function issuesFor(spec: unknown, channelType: string): string[] {
   try {
@@ -114,6 +134,24 @@ describe('card spec', () => {
       }),
       'a ``` in a header or cell would end',
     ],
+    [
+      'a button on a muted Text, which Slack shows as a context block with no room for one',
+      'slack',
+      card({
+        type: 'Text',
+        props: { content: 'Footnote', style: 'muted', button: { label: 'Open', url: 'https://example.com/open' } },
+      }),
+      'a muted Text cannot carry a button',
+    ],
+    [
+      'a number cell that also links, which Slack cannot show as one cell',
+      'discord',
+      card({
+        type: 'Table',
+        props: { headers: ['Revenue'], rows: [[{ text: '$1K', value: 1000, url: 'https://example.com/a' }]] },
+      }),
+      'takes no url or style',
+    ],
   ])('refuses %s', (_name, channelType, spec, issue) => {
     expect(issuesFor(spec, channelType)).toEqual([expect.stringContaining(issue)]);
   });
@@ -187,6 +225,119 @@ describe('card spec', () => {
       'Staging',
       'Deploys: 3',
     ]);
+  });
+
+  it('turns a spec using every rich piece into the Block Kit of the hand-built Slack demo', () => {
+    const blocks = slackCardBlocks(renderCardSpec(richDemo.spec, 'slack'));
+    expect(blocks.map((block) => block.type)).toEqual([
+      'section',
+      'section',
+      'divider',
+      'section',
+      'data_visualization',
+      'data_visualization',
+      'data_table',
+      'actions',
+      'context',
+    ]);
+    expect(blocks[1]).toEqual({
+      type: 'section',
+      text: { type: 'mrkdwn', text: '*Q3 revenue at a glance*' },
+      accessory: linkButton('View report', 'https://example.com/report'),
+    });
+    expect(blocks[3]).toEqual({
+      type: 'section',
+      fields: [
+        { type: 'mrkdwn', text: '*This quarter*\nRevenue: *$4.2M* +18%\nARR: *$16.8M* +12%\nNet retention: *118%*' },
+        { type: 'mrkdwn', text: '*Pipeline*\nNew customers: *64*\nAvg deal: *$65.6K*\nWin rate: *31%*' },
+      ],
+    });
+    const table = blocks[6] as unknown as { caption: string; page_size: number; rows: unknown[][] };
+    expect(table.caption).toBe('Top accounts this quarter');
+    expect(table.page_size).toBe(4);
+    expect(table.rows).toHaveLength(7);
+    expect(table.rows[0]).toEqual(['Account', 'Region', 'Revenue', 'QoQ'].map((h) => ({ type: 'raw_text', text: h })));
+    expect(table.rows[1]).toEqual([
+      richCell({ type: 'link', url: 'https://example.com/accounts/northwind', text: 'Northwind Labs' }),
+      richCell({ type: 'text', text: 'NA', style: { code: true } }),
+      { type: 'raw_number', value: 412000, text: '$412K' },
+      richCell({ type: 'text', text: '+22%', style: { bold: true } }),
+    ]);
+    expect(blocks[7]).toEqual({
+      type: 'actions',
+      elements: [
+        { ...linkButton('Open dashboard', 'https://example.com/dashboard'), style: 'primary' },
+        linkButton('Export CSV', 'https://example.com/export.csv'),
+      ],
+    });
+  });
+
+  it('posts a card without the rich pieces as the adapter writes it, and leaves plain neighbours of rich ones alone', () => {
+    const plain = renderCardSpec(
+      card(
+        text('All green'),
+        { type: 'Table', props: { headers: ['Service', 'Deploys'], rows: [['ledger-api', 9]] } },
+        { type: 'Divider', props: {} },
+      ),
+      'slack',
+    );
+    expect(slackCardBlocks(plain)).toEqual([
+      { type: 'header', text: { type: 'plain_text', text: 'Report', emoji: true } },
+      { type: 'section', text: { type: 'mrkdwn', text: 'All green' } },
+      {
+        type: 'data_table',
+        caption: 'Table',
+        rows: [
+          [
+            { type: 'raw_text', text: 'Service' },
+            { type: 'raw_text', text: 'Deploys' },
+          ],
+          [
+            { type: 'raw_text', text: 'ledger-api' },
+            { type: 'raw_text', text: '9' },
+          ],
+        ],
+      },
+      { type: 'divider' },
+    ]);
+
+    const mixed = renderCardSpec(
+      card(text('All green'), {
+        type: 'Table',
+        props: { headers: ['Service', 'Deploys'], rows: [['ledger-api', { text: '9', value: 9 }]] },
+      }),
+      'slack',
+    );
+    const [header, note, rich] = slackCardBlocks(mixed);
+    expect([header, note]).toEqual(cardToBlockKit(mixed).slice(0, 2));
+    expect((rich as unknown as { rows: unknown[][] }).rows[1]).toEqual([
+      { type: 'raw_text', text: 'ledger-api' },
+      { type: 'raw_number', value: 9, text: '9' },
+    ]);
+  });
+
+  it('posts the same rich spec on Discord with the button beside its text and every value in the card', () => {
+    const [container] = discordCardPayload(renderCardSpec(richDemo.spec, 'discord')).components;
+    const parts = container!.components!;
+    expect(parts.find((c) => c.type === 9)).toEqual({
+      type: 9,
+      components: [{ type: 10, content: '**Q3 revenue at a glance**' }],
+      accessory: { type: 2, style: 5, label: 'View report', url: 'https://example.com/report' },
+    });
+    expect(parts.find((c) => c.type === 1)!.components!.map((b) => [b.label, b.url])).toEqual([
+      ['Open dashboard', 'https://example.com/dashboard'],
+      ['Export CSV', 'https://example.com/export.csv'],
+    ]);
+    const shown = parts.map((c) => c.content ?? '').join('\n');
+    for (const value of [
+      '$4.2M',
+      'Win rate: **31%**',
+      'Northwind Labs   | NA     | $412K   | +22%',
+      'Osprey Analytics | LATAM  | $142K   | +15%',
+      'Top accounts this quarter',
+      'Source: demo data',
+    ])
+      expect(shown).toContain(value);
   });
 
   it('is described to agents by the guide generated into the runner tree', () => {
@@ -267,6 +418,15 @@ describe('card spec', () => {
       },
       'Slack takes 25',
       [],
+    ],
+    [
+      'a Text button URL Slack refuses',
+      card({
+        type: 'Text',
+        props: { content: 'Report', button: { label: 'Open', url: `https://example.com/${'x'.repeat(2981)}` } },
+      }),
+      'which Slack refuses',
+      ['URL is over 512'],
     ],
   ])('refuses %s on Slack, and holds it to Discord’s own limits', (_name, spec, issue, discordIssues: string[]) => {
     expect(issuesFor(spec, 'slack')).toEqual([expect.stringContaining(issue)]);

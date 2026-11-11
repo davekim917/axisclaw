@@ -58,6 +58,8 @@ const noPhoto = {
   profile: { real_name: 'No Photo', is_custom_image: false, image_72: 'https://avatars.example/default-72.png' },
 };
 
+const REFUSED_BLOCKS = 'Blocks this fake Slack refuses';
+
 function webApi(method: string, body: Record<string, unknown>, port: number): Record<string, unknown> {
   switch (method) {
     case 'auth.test':
@@ -77,6 +79,13 @@ function webApi(method: string, body: Record<string, unknown>, port: number): Re
       };
     case 'chat.postMessage':
       posted.push(body);
+      if (String(body.blocks ?? '').includes(REFUSED_BLOCKS))
+        return {
+          ok: false,
+          error: 'invalid_blocks',
+          errors: ['must be a valid url [json-pointer:/blocks/0/accessory/url]'],
+          response_metadata: { messages: ['[ERROR] must be a valid url [json-pointer:/blocks/0/accessory/url]'] },
+        };
       return { ok: true, channel: body.channel, ts: '1790000099.000100', message: { ts: '1790000099.000100' } };
     case 'bots.info':
       return { ok: true, bot: { id: 'B0BOT', user_id: BOT_USER, name: 'example-agent' } };
@@ -557,6 +566,94 @@ describe('Slack inbound through the real adapter and Socket Mode client', () => 
     expect(posted[0]).toMatchObject({ channel: CHANNEL, thread_ts: '1790000001.000100' });
     expect(JSON.stringify(posted[0])).toContain('a reply from the agent');
     expect(id).toBe('1790000099.000100');
+  });
+
+  it('posts an agent card in its thread as the Block Kit it was checked against, rich pieces included', async () => {
+    const adapter = registry.getChannelAdapterExact('slack')!;
+    posted.length = 0;
+    const id = await adapter.deliver(`slack:${CHANNEL}`, `slack:${CHANNEL}:1790000001.000100`, {
+      kind: 'chat-sdk',
+      content: {
+        type: 'card',
+        fallbackText: 'Deploys: ledger-api 9',
+        spec: {
+          root: 'card',
+          elements: {
+            card: { type: 'Card', props: {}, children: ['title', 'rows', 'links'] },
+            title: {
+              type: 'Text',
+              props: { content: 'Deploys', button: { label: 'Open', url: 'https://example.com/deploys' } },
+              children: [],
+            },
+            rows: {
+              type: 'Table',
+              props: {
+                headers: ['Service', 'Deploys'],
+                rows: [
+                  [
+                    { text: 'ledger-api', url: 'https://example.com/ledger' },
+                    { text: '9', value: 9 },
+                  ],
+                ],
+              },
+              children: [],
+            },
+            links: { type: 'Actions', props: {}, children: ['all'] },
+            all: {
+              type: 'LinkButton',
+              props: { label: 'All services', url: 'https://example.com/all', style: 'primary' },
+              children: [],
+            },
+          },
+        },
+      },
+    });
+
+    expect(id).toBe('1790000099.000100');
+    expect(posted).toHaveLength(1);
+    expect(posted[0]).toMatchObject({ channel: CHANNEL, thread_ts: '1790000001.000100' });
+    const blocks = JSON.parse(posted[0]!.blocks as string) as Array<Record<string, unknown>>;
+    expect(blocks.map((block) => block.type)).toEqual(['section', 'data_table', 'actions']);
+    expect(blocks[0]!.accessory).toMatchObject({ type: 'button', url: 'https://example.com/deploys' });
+    expect((blocks[1]!.rows as unknown[][])[1]).toEqual([
+      {
+        type: 'rich_text',
+        elements: [
+          {
+            type: 'rich_text_section',
+            elements: [{ type: 'link', url: 'https://example.com/ledger', text: 'ledger-api' }],
+          },
+        ],
+      },
+      { type: 'raw_number', value: 9, text: '9' },
+    ]);
+    expect((blocks[2]!.elements as unknown[])[0]).toMatchObject({ url: 'https://example.com/all', style: 'primary' });
+  });
+
+  it('hands the agent Slack’s reason when Slack refuses a card’s blocks', async () => {
+    const adapter = registry.getChannelAdapterExact('slack')!;
+    const refused = adapter.deliver(`slack:${CHANNEL}`, `slack:${CHANNEL}:1790000001.000100`, {
+      kind: 'chat-sdk',
+      content: {
+        type: 'card',
+        fallbackText: 'Report',
+        spec: {
+          root: 'card',
+          elements: {
+            card: { type: 'Card', props: {}, children: ['note'] },
+            note: {
+              type: 'Text',
+              props: { content: REFUSED_BLOCKS, button: { label: 'Open', url: 'https://example.com/report' } },
+              children: [],
+            },
+          },
+        },
+      },
+    });
+
+    await expect(refused).rejects.toThrow(
+      'Slack rejected blocks (invalid_blocks): ["must be a valid url [json-pointer:/blocks/0/accessory/url]"',
+    );
   });
 
   it('answers every Web API call the host made, so no step ran on a faked failure', () => {

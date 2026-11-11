@@ -14,6 +14,9 @@ patchedDependencies:
   '@chat-adapter/shared@4.44.0':
     hash: 11d4cec96c93cdc96f8fb70ce2bc7eb0e564d5d77029de8c6abc2aa5c3e70183
     path: patches/@chat-adapter__shared@4.44.0.patch
+  '@json-render/chat@0.22.0':
+    hash: 358734f992d02a8f37f7d5fa219b27478c709a6bbc2144375057b3ebac1e2d9c
+    path: patches/@json-render__chat@0.22.0.patch
 
 importers:
 
@@ -36,7 +39,7 @@ importers:
         version: 1.8.1
       '@json-render/chat':
         specifier: 0.22.0
-        version: 0.22.0(chat@4.44.0(zod@4.6.5))(zod@4.6.5)
+        version: 0.22.0(patch_hash=358734f992d02a8f37f7d5fa219b27478c709a6bbc2144375057b3ebac1e2d9c)(chat@4.44.0(zod@4.6.5))(zod@4.6.5)
       '@json-render/core':
         specifier: 0.22.0
         version: 0.22.0(zod@4.6.5)
@@ -73,6 +76,9 @@ importers:
       yaml:
         specifier: ^2.9.1
         version: 2.9.1
+      zod:
+        specifier: 4.6.5
+        version: 4.6.5
     devDependencies:
       '@eslint/js':
         specifier: ^10.0.1
@@ -2425,7 +2431,7 @@ snapshots:
       '@jridgewell/resolve-uri': 3.1.2
       '@jridgewell/sourcemap-codec': 1.5.5
 
-  '@json-render/chat@0.22.0(chat@4.44.0(zod@4.6.5))(zod@4.6.5)':
+  '@json-render/chat@0.22.0(patch_hash=358734f992d02a8f37f7d5fa219b27478c709a6bbc2144375057b3ebac1e2d9c)(chat@4.44.0(zod@4.6.5))(zod@4.6.5)':
     dependencies:
       '@json-render/core': 0.22.0(zod@4.6.5)
       chat: 4.44.0(zod@4.6.5)

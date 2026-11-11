@@ -1,0 +1,110 @@
+diff --git a/dist/index.js b/dist/index.js
+index e877f5986bbefa29cf92e72aa1ee313cab9e83ca..8b4ec2f1a0de3d878289cce38dcc35300c5a3fa6 100644
+--- a/dist/index.js
++++ b/dist/index.js
+@@ -363,6 +363,17 @@ function validateLimits(elements, limits) {
+   }
+   return issues;
+ }
++// NanoClaw: an element keeps the props a catalog adds beyond the standard ones, so an extended catalog reaches the card.
++var STANDARD_PROPS = {
++  Text: ["content", "style"],
++  Table: ["headers", "rows", "align", "caption"],
++  LinkButton: ["label", "url"]
++};
++function withAddedProps(element, type, props) {
++  for (const [name, value] of Object.entries(props))
++    if (!STANDARD_PROPS[type].includes(name) && value !== null && value !== void 0) element[name] = value;
++  return element;
++}
+ function toChild(key, elements) {
+   const el = elements[key];
+   const p = el.props;
+@@ -377,7 +388,7 @@ function toChild(key, elements) {
+         ...el.children.map((k) => toChild(k, elements))
+       ]);
+     case "Text":
+-      return text(p.content, p.style ?? void 0);
++      return withAddedProps(text(p.content, p.style ?? void 0), "Text", p);
+     case "Divider":
+       return divider();
+     case "Image":
+@@ -387,12 +398,12 @@ function toChild(key, elements) {
+         children().map((f) => field(f.props.label, f.props.value))
+       );
+     case "Table":
+-      return table({
++      return withAddedProps(table({
+         headers: p.headers,
+         rows: p.rows,
+         align: p.align ?? void 0,
+         caption: p.caption ?? void 0
+-      });
++      }), "Table", p);
+     case "Chart": {
+       const c = p.chart;
+       return chart({
+@@ -417,7 +428,7 @@ function toChild(key, elements) {
+     case "Actions":
+       return actions(
+         children().map(
+-          (b) => b.type === "LinkButton" ? linkButton({ label: b.props.label, url: b.props.url }) : button({
++          (b) => b.type === "LinkButton" ? withAddedProps(linkButton({ label: b.props.label, url: b.props.url }), "LinkButton", b.props) : button({
+             id: b.props.id,
+             label: b.props.label,
+             style: b.props.style ?? void 0,
+diff --git a/dist/index.mjs b/dist/index.mjs
+index 45cba3afa7ff364ab9d6fc34d01a38ddfeff9e2d..f0cb76a7f20e3bafa2dcc64358fbd91a0be3e2f9 100644
+--- a/dist/index.mjs
++++ b/dist/index.mjs
+@@ -339,6 +339,17 @@ function validateLimits(elements, limits) {
+   }
+   return issues;
+ }
++// NanoClaw: an element keeps the props a catalog adds beyond the standard ones, so an extended catalog reaches the card.
++var STANDARD_PROPS = {
++  Text: ["content", "style"],
++  Table: ["headers", "rows", "align", "caption"],
++  LinkButton: ["label", "url"]
++};
++function withAddedProps(element, type, props) {
++  for (const [name, value] of Object.entries(props))
++    if (!STANDARD_PROPS[type].includes(name) && value !== null && value !== void 0) element[name] = value;
++  return element;
++}
+ function toChild(key, elements) {
+   const el = elements[key];
+   const p = el.props;
+@@ -353,7 +364,7 @@ function toChild(key, elements) {
+         ...el.children.map((k) => toChild(k, elements))
+       ]);
+     case "Text":
+-      return text(p.content, p.style ?? void 0);
++      return withAddedProps(text(p.content, p.style ?? void 0), "Text", p);
+     case "Divider":
+       return divider();
+     case "Image":
+@@ -363,12 +374,12 @@ function toChild(key, elements) {
+         children().map((f) => field(f.props.label, f.props.value))
+       );
+     case "Table":
+-      return table({
++      return withAddedProps(table({
+         headers: p.headers,
+         rows: p.rows,
+         align: p.align ?? void 0,
+         caption: p.caption ?? void 0
+-      });
++      }), "Table", p);
+     case "Chart": {
+       const c = p.chart;
+       return chart({
+@@ -393,7 +404,7 @@ function toChild(key, elements) {
+     case "Actions":
+       return actions(
+         children().map(
+-          (b) => b.type === "LinkButton" ? linkButton({ label: b.props.label, url: b.props.url }) : button({
++          (b) => b.type === "LinkButton" ? withAddedProps(linkButton({ label: b.props.label, url: b.props.url }), "LinkButton", b.props) : button({
+             id: b.props.id,
+             label: b.props.label,
+             style: b.props.style ?? void 0,

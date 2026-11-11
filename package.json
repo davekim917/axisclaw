@@ -63,7 +63,8 @@
     "kleur": "^4.1.5",
     "livekit-client": "2.23.0",
     "undici": "8.11.2",
-    "yaml": "^2.9.1"
+    "yaml": "^2.9.1",
+    "zod": "4.6.5"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
@@ -93,7 +94,8 @@
     },
     "patchedDependencies": {
       "@chat-adapter/discord@4.44.0": "patches/@chat-adapter__discord@4.44.0.patch",
-      "@chat-adapter/shared@4.44.0": "patches/@chat-adapter__shared@4.44.0.patch"
+      "@chat-adapter/shared@4.44.0": "patches/@chat-adapter__shared@4.44.0.patch",
+      "@json-render/chat@0.22.0": "patches/@json-render__chat@0.22.0.patch"
     }
   }
 }

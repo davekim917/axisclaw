@@ -3,12 +3,14 @@
  * `SLACK_BOT_TOKEN` (+ `SLACK_SIGNING_SECRET` or `SLACK_APP_TOKEN`) → channelType "slack"; `SLACK_BOT_TOKEN_<SUFFIX>`
  * → "slack-<suffix>". Each workspace is its own Slack app. Suffix is [A-Za-z0-9_]+, lowercased for the channelType.
  */
-import { createSlackAdapter } from '@chat-adapter/slack';
-import { WebClient } from '@slack/web-api';
+import { cardToFallbackText, createSlackAdapter } from '@chat-adapter/slack';
+import { WebClient, type Block } from '@slack/web-api';
+import type { CardElement } from 'chat';
 
 import { readEnvFileMatching } from '../env.js';
 import { log } from '../log.js';
 import { markdownHeadingsToBold } from '../text-styles.js';
+import { slackCardBlocks } from './card-spec.js';
 import { createChatSdkBridge } from './chat-sdk-bridge.js';
 import { createAdapterLogger } from './post-deploy-inbound.js';
 import { conversationDisplayName } from './adapter.js';
@@ -518,6 +520,39 @@ export async function slackPostParent(
   return { messageId: response.ts as string };
 }
 
+/**
+ * Posts the blocks the card was checked against, which the adapter's own card post would build without its additions.
+ * Slack's reasons for refusing blocks ride in the error's data, and delivery hands the agent only its message, so they
+ * move into the message as the adapter's post does.
+ */
+export async function slackPostCard(
+  adapter: ReturnType<typeof createSlackAdapter>,
+  client: WebClient,
+  threadId: string,
+  card: CardElement,
+): Promise<string> {
+  const { channel, threadTs } = adapter.decodeThreadId(threadId);
+  const blocks = slackCardBlocks(card);
+  try {
+    const response = await client.chat.postMessage({
+      channel,
+      thread_ts: threadTs || undefined,
+      text: cardToFallbackText(card),
+      blocks: blocks as Block[],
+      unfurl_links: false,
+      unfurl_media: false,
+    });
+    return response.ts as string;
+  } catch (err) {
+    const data = (err as { data?: { error?: string; errors?: string[]; response_metadata?: { messages?: string[] } } })
+      .data;
+    if (data?.error !== 'invalid_blocks') throw err;
+    const details = [...(data.errors ?? []), ...(data.response_metadata?.messages ?? [])];
+    log.error('Slack rejected card blocks', { details, blocks: JSON.stringify(blocks) });
+    throw new Error(`Slack rejected blocks (invalid_blocks): ${JSON.stringify(details)}`, { cause: err });
+  }
+}
+
 /** threadId IS the parent message's ts (Slack's thread_ts), not reply.ts. */
 export async function slackCreateThread(
   client: SlackPostMessageClient,
@@ -616,6 +651,7 @@ export function registerSlackWorkspace(ws: SlackWorkspace): void {
         // A pasted table arrives as attachments[].blocks[], in neither the text nor the file list.
         extractRawText: extractSlackRawText,
         concurrency: 'concurrent',
+        postCard: (threadId, card) => slackPostCard(slackAdapter, client, threadId, card),
         supportsThreads: true,
         defaults: SLACK_DEFAULTS,
         maxTextLength: SLACK_MESSAGE_MAX_TEXT_LENGTH,

@@ -4,21 +4,85 @@ import { createEmojiConverter } from '@chat-adapter/shared';
 import { cardToDiscordPayload, DiscordContentFormat } from '@chat-adapter/discord';
 import { ValidationError } from '@chat-adapter/shared';
 import { cardToBlockKit } from '@chat-adapter/slack';
-import { chartElementToFallbackText, tableElementToAscii, type CardChild, type CardElement } from 'chat';
+import {
+  chartElementToFallbackText,
+  tableElementToAscii,
+  type CardChild,
+  type CardElement,
+  type TableElement,
+  type TextElement,
+} from 'chat';
+import { z } from 'zod';
 
 import { isChannelVariant } from '../types.js';
 
 // A Button sends a click back to the agent, and clicks ride the choice-card flow, so display cards carry links only.
 const { Button: _clickBack, ...display } = standardComponentDefinitions;
+
+const richCell = z
+  .object({
+    text: z.string().min(1),
+    url: z.string().url().optional(),
+    style: z.enum(['tag', 'bold']).optional(),
+    value: z.number().optional(),
+  })
+  .strict()
+  .refine((cell) => cell.value === undefined || (cell.url === undefined && cell.style === undefined), {
+    message: 'a cell with a value sorts as a number and takes no url or style',
+  });
+type RichCell = z.infer<typeof richCell>;
+type LinkTarget = { label: string; url: string };
+
 const components = {
   ...display,
+  Text: {
+    ...display.Text,
+    props: display.Text.props
+      .extend({ button: display.LinkButton.props.strict().optional() })
+      .refine((text) => !(text.button && text.style === 'muted'), {
+        message: 'a muted Text cannot carry a button',
+        path: ['button'],
+      }),
+    description: 'A paragraph of markdown text. Use muted for footnotes. button shows a link button beside it.',
+  },
+  Field: {
+    ...display.Field,
+    description: 'One label and value pair inside Fields. The value may span lines and use **bold**.',
+  },
   Actions: { ...display.Actions, description: 'Row of LinkButton elements that open URLs.' },
+  LinkButton: {
+    ...display.LinkButton,
+    props: display.LinkButton.props.extend({ style: z.enum(['primary']).optional() }),
+    description: 'Button that opens a URL. primary highlights it on Slack.',
+  },
   Table: {
     ...display.Table,
+    props: display.Table.props.extend({
+      rows: z.array(z.array(z.union([display.Table.props.shape.rows.element.element, richCell]))),
+      pageSize: z.number().int().min(1).max(100).optional(),
+    }),
     description:
-      'Table for row data. Every row has one cell per header. Slack and Discord left-align every column, so align is ignored.',
+      'Table for row data. Every row has one cell per header. A cell is a string, { text, url } for a link, { text, style } or { text, value } to sort by number. pageSize pages the rows on Slack. Slack and Discord left-align every column, so align is ignored.',
   },
 };
+
+type CardText = TextElement & { button?: LinkTarget };
+type CardTable = TableElement & { cells?: RichCell[][] };
+
+/**
+ * json-render passes a Table's cells through as the agent wrote them. Every reader of `rows` expects text, so a rich
+ * cell's text goes there and the cell itself goes in `cells`, which only the Slack conversion reads.
+ */
+function splitRichCells(children: CardChild[]): CardChild[] {
+  return children.map((child): CardChild => {
+    if (child.type === 'section') return { ...child, children: splitRichCells(child.children) };
+    if (child.type !== 'table') return child;
+    const rows = child.rows as Array<Array<string | RichCell>>;
+    if (rows.every((row) => row.every((cell) => typeof cell === 'string'))) return child;
+    const cells = rows.map((row) => row.map((cell) => (typeof cell === 'string' ? { text: cell } : cell)));
+    return { ...child, rows: cells.map((row) => row.map((cell) => cell.text)), cells } as CardTable;
+  });
+}
 
 // Slack's adapter degrades content past Block Kit's caps instead of refusing it: a second table becomes a code block
 // and a chart past a cap becomes text. Refusing tells the agent to split or trim the card.
@@ -55,6 +119,57 @@ function flatten(children: CardChild[]): CardChild[] {
   return children.flatMap((child) => (child.type === 'section' ? [child, ...flatten(child.children)] : [child]));
 }
 
+type SlackBlock = { type: string; [key: string]: unknown };
+type SlackCell = { type: string; [key: string]: unknown };
+
+const hasButton = (child: CardChild): child is CardText => child.type === 'text' && Boolean((child as CardText).button);
+const hasCells = (child: CardChild): child is CardTable =>
+  child.type === 'table' && Boolean((child as CardTable).cells);
+
+function slackLinkButton(button: LinkTarget): SlackBlock {
+  const [row] = cardToBlockKit({
+    type: 'card',
+    children: [{ type: 'actions', children: [{ type: 'link-button', ...button }] }],
+  });
+  return (row as unknown as { elements: SlackBlock[] }).elements[0]!;
+}
+
+function slackCell(cell: RichCell, plain: SlackCell): SlackCell {
+  const text = slackEmoji(cell.text);
+  if (cell.value !== undefined) return { type: 'raw_number', value: cell.value, text };
+  if (!cell.url && !cell.style) return plain;
+  const style = cell.style === 'tag' ? { code: true } : cell.style === 'bold' ? { bold: true } : undefined;
+  const element = { ...(cell.url ? { type: 'link', url: cell.url } : { type: 'text' }), text, ...(style && { style }) };
+  return { type: 'rich_text', elements: [{ type: 'rich_text_section', elements: [element] }] };
+}
+
+/**
+ * The Block Kit an agent card posts as on Slack: the adapter's own conversion, with a Text's button as its section's
+ * accessory and a Table's rich cells in its data_table. The adapter writes one block per element below a section, after
+ * one each for the card's title, subtitle and image, which is how a block is matched to the element it came from.
+ */
+export function slackCardBlocks(card: CardElement): SlackBlock[] {
+  const blocks = cardToBlockKit(card) as SlackBlock[];
+  const elements = flatten(card.children).filter((child) => child.type !== 'section');
+  if (!elements.some((child) => hasButton(child) || hasCells(child))) return blocks;
+  const head = [card.title, card.subtitle, card.imageUrl].filter(Boolean).length;
+  if (blocks.length !== head + elements.length)
+    throw new Error('the Slack adapter no longer writes one block per card element; slackCardBlocks needs updating');
+  return blocks.map((block, i) => {
+    const element = elements[i - head];
+    if (!element) return block;
+    if (hasButton(element)) return { ...block, accessory: slackLinkButton(element.button!) };
+    if (hasCells(element) && block.type === 'data_table') {
+      const [header, ...rows] = block.rows as SlackCell[][];
+      return {
+        ...block,
+        rows: [header, ...element.cells!.map((row, r) => row.map((cell, c) => slackCell(cell, rows[r]![c]!)))],
+      };
+    }
+    return block;
+  });
+}
+
 /**
  * What would not reach Slack whole, read from the converter the adapter posts with (`cardToBlockKit`), so its own
  * rules decide which tables and charts it shows natively. Text is measured after the adapter's emoji conversion,
@@ -62,7 +177,7 @@ function flatten(children: CardChild[]): CardChild[] {
  * unnoticed. A title, button label or alt text past its cap is shortened with an ellipsis, and that is allowed.
  */
 function slackLosses(card: CardElement): string[] {
-  const blocks = cardToBlockKit(card) as Array<{ type: string }>;
+  const blocks = slackCardBlocks(card);
   const children = flatten(card.children);
   const count = (types: string[]) => blocks.filter((block) => types.includes(block.type)).length;
   const issues: string[] = [];
@@ -82,6 +197,8 @@ function slackLosses(card: CardElement): string[] {
   for (const child of children) {
     if (child.type === 'text' && over(child.content, child.style === 'bold' ? SLACK_MAX_TEXT - 2 : SLACK_MAX_TEXT))
       issues.push(`a Text element is over ${SLACK_MAX_TEXT} characters, where Slack cuts it; split it`);
+    if (hasButton(child) && child.button!.url.length > SLACK_MAX_URL)
+      issues.push(`a Text button URL is over ${SLACK_MAX_URL} characters, which Slack refuses`);
     if (child.type === 'fields')
       for (const field of child.children)
         if (slackEmoji(field.label).length + slackEmoji(field.value).length > SLACK_MAX_FIELD - 3)
@@ -104,11 +221,18 @@ const codeBlock = (text: string) => `\`\`\`\n${text}\n\`\`\``;
 /**
  * Discord markdown has no tables, so a Table or Chart goes out as a monospaced text table in a code block, which keeps
  * its columns lined up; the adapter's own rendering is GFM pipe syntax, which Discord shows as written. A Section is
- * spread into the card, because the adapter's V2 Section puts all its text ahead of its other children.
+ * spread into the card, because the adapter's V2 Section puts all its text ahead of its other children; a Text with a
+ * button becomes a Section of its own, which the adapter shows with the button beside the text.
  */
 function discordChildren(children: CardChild[]): CardChild[] {
   return children.flatMap((child): CardChild[] => {
     if (child.type === 'section') return discordChildren(child.children);
+    if (hasButton(child)) {
+      const { button, ...text } = child;
+      return [
+        { type: 'section', children: [text, { type: 'actions', children: [{ type: 'link-button', ...button! }] }] },
+      ];
+    }
     if (child.type === 'table') {
       const table = codeBlock(tableElementToAscii(child.headers, child.rows));
       return [{ type: 'text', content: child.caption ? `*${child.caption}*\n${table}` : table }];
@@ -222,7 +346,8 @@ export function renderCardSpec(spec: unknown, channelType: string): CardElement 
   if (!spec || typeof spec !== 'object' || Array.isArray(spec)) throw new CardSpecError(['spec must be an object']);
   const nested = nestedCards(spec as Spec);
   if (nested.length) throw new CardSpecError(nested);
-  const card = toCard(spec as Spec, { components, limits: limitsFor(channelType) });
+  const built = toCard(spec as Spec, { components, limits: limitsFor(channelType) });
+  const card = { ...built, children: splitRichCells(built.children) };
   const losses = isSlack(channelType)
     ? slackLosses(card)
     : isDiscord(channelType)
@@ -263,7 +388,7 @@ const DISPLAY_RULES: Record<string, string> = {
   'Pick components by the shape of the data: Fields for a few key numbers, Table for row data, Chart for a trend or a share of a whole, Actions for next steps.':
     'Pick components by the shape of the data: Fields for a few key numbers, Table for row data, Chart for a trend or a share of a whole, Actions for links.',
   'Text content uses markdown: **bold**, _italic_, `code` and [label](https://url). Do not use headings inside Text.':
-    'Text content uses markdown: **bold**, _italic_ and `code`. Do not use headings inside Text. Put a link in an Actions row as a LinkButton: Slack shows a [label](url) link inside Text as written.',
+    'Text content uses markdown: **bold**, _italic_ and `code`. Do not use headings inside Text. Put a link in a LinkButton, a Text button or a Table cell: Slack shows a [label](url) link inside Text as written.',
   'Field elements MUST be children of a Fields element. Button and LinkButton elements MUST be children of an Actions element.':
     'Field elements MUST be children of a Fields element. LinkButton elements MUST be children of an Actions element.',
 };
