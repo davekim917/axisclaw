@@ -29,6 +29,7 @@ import {
   ownSlackPicture,
   registerSlackBot,
   registerSlackWorkspaceHumans,
+  slackMentionNames,
   slackMentionOutsideCode,
   slackPermalink,
   slackChannelPermalink,
@@ -610,6 +611,32 @@ function decodeFallbackReferences(slackAdapter: ReturnType<typeof createSlackAda
 
 const SLACK_CODE_REGION = /(`{3,}[\s\S]*?`{3,}|``[\s\S]*?``|`[^`\n]+`)/;
 
+/**
+ * Every name the adapter has rendered `userId`'s mention under. It renders `<@U…>` as `@name` from `lookupUser`,
+ * whose persisted cache answers at once after a restart and can hold a pre-rename name, while the host identity's
+ * profile names arrive only after setup. Recording the lookup's own answer needs no second lookup.
+ */
+function trackRenderedNames(slackAdapter: ReturnType<typeof createSlackAdapter>, userId: string): () => string[] {
+  type Lookup = (id: string) => Promise<{ displayName?: string; realName?: string } | null>;
+  const adapter = slackAdapter as unknown as { lookupUser?: Lookup };
+  const names = new Set<string>();
+  if (typeof adapter.lookupUser !== 'function') {
+    log.warn(
+      'Slack adapter exposes no lookupUser; a mention right after boot can be demoted until the bot profile loads',
+    );
+    return () => [...names];
+  }
+  const lookup = adapter.lookupUser.bind(slackAdapter);
+  adapter.lookupUser = async (id) => {
+    const info = await lookup(id);
+    if (id === userId) {
+      for (const name of [info?.displayName, info?.realName]) if (name) names.add(name);
+    }
+    return info;
+  };
+  return () => [...names];
+}
+
 /** Provisioning calls this after adding a token pair so the adapter starts without a host restart. */
 export function registerSlackWorkspace(ws: SlackWorkspace): void {
   registerChannelAdapter(ws.channelType, {
@@ -642,6 +669,7 @@ export function registerSlackWorkspace(ws: SlackWorkspace): void {
       // Setup publishes the identity provisionally before Socket Mode can deliver inbound events, and rolls it back
       // if setup fails.
       const identity = await fetchSlackBotIdentity(client);
+      const renderedBotNames = identity ? trackRenderedNames(slackAdapter, identity.userId) : () => [];
 
       // One governor per bridge instance: each is one bot identity.
       const hopGovernor = createSlackHopGovernor(ws.channelType);
@@ -691,7 +719,8 @@ export function registerSlackWorkspace(ws: SlackWorkspace): void {
         // Keep the platform verdict when identity is unavailable.
         refineInboundMention: (text) => {
           const self = getKnownSlackBots().get(ws.channelType);
-          return self ? slackMentionOutsideCode(text, self) : true;
+          if (!self || slackMentionOutsideCode(text, self, renderedBotNames())) return { keep: true };
+          return { keep: false, checkedNames: [`<@${self.userId}>`, ...slackMentionNames(self, renderedBotNames())] };
         },
         // Loop governor for sibling-bot ping-pong with no human in it, on live dispatch only: recovery pages arrive
         // newest-first and were already judged live. A sibling's task-list post is never a turn for this bot.

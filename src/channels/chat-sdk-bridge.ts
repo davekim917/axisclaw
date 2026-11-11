@@ -295,10 +295,10 @@ export interface ChatSdkBridgeConfig {
   /** Link and escaping syntax of the small-print line; without it the sources line renders as plain text. */
   subtextMarkup?: SubtextMarkup;
   /**
-   * Re-verifies a platform-claimed mention against the final text; false demotes it. Slack fires app_mention for
-   * `@name` inside code spans.
+   * Re-verifies a platform-claimed mention against the final text; a rejection demotes it and names what it looked
+   * for, so the demotion is logged. Slack fires app_mention for `@name` inside code spans.
    */
-  refineInboundMention?: (text: string) => boolean;
+  refineInboundMention?: (text: string) => { keep: true } | { keep: false; checkedNames: readonly string[] };
   /**
    * Applied to `serialized.text` and `serialized.replyTo.text` before they land in `messages_in`, for platforms whose
    * wire format leaks opaque user references (Discord `<@snowflake>`). Any other place the raw form leaks needs its
@@ -978,7 +978,17 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
     // Raw ids are already resolved to @name here.
     let effectiveMention = isMention;
     if (effectiveMention && isDM !== true && config.refineInboundMention && typeof serialized.text === 'string') {
-      effectiveMention = config.refineInboundMention(serialized.text);
+      const refined = config.refineInboundMention(serialized.text);
+      if (!refined.keep) {
+        effectiveMention = false;
+        log.info('Platform mention demoted: no mention of the bot outside code', {
+          channelType: bridgeChannelType,
+          threadId: message.threadId,
+          messageId: message.id,
+          recovered,
+          checkedNames: refined.checkedNames,
+        });
+      }
     }
 
     // An explicit flat field so the router does not depend on chat-sdk's internal naming.

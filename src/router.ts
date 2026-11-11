@@ -430,27 +430,47 @@ export async function completeDeferredInbound(event: InboundEvent): Promise<void
   await completeDeferredChannelIngress(receiptKey(event));
 }
 
+/** What routing did with one claimed event. Every branch that leaves an addressed event unwoken names its reason. */
+interface RouteOutcome {
+  /** Held for an approval that replays it, so the receipt is deferred rather than completed. */
+  replayPending: boolean;
+  woken: number;
+  notWokenReason?: string;
+  /** Per wiring, why it did not wake: `<agent group id>:<verdict>`. */
+  declined: string[];
+}
+
 async function routeClaimedInbound(event: InboundEvent, receipt: ChannelIngressReceiptKey): Promise<void> {
-  let replayPending = false;
+  const outcome: RouteOutcome = { replayPending: false, woken: 0, declined: [] };
   try {
-    await routeInboundClaimed(event, () => {
-      replayPending = true;
-    });
-    if (replayPending) await deferChannelIngress(receipt);
+    await routeInboundClaimed(event, outcome);
+    if (outcome.replayPending) await deferChannelIngress(receipt);
     else await completeChannelIngress(receipt);
   } catch (err) {
     await releaseChannelIngress(receipt);
     throw err;
   }
+  const addressed = event.message.isMention === true || event.isDM === true;
+  if (addressed && outcome.woken === 0 && !outcome.replayPending) {
+    log.info('Addressed message woke no agent', {
+      ...receipt,
+      threadId: event.threadId,
+      reason: outcome.notWokenReason ?? 'unknown',
+      ...(outcome.declined.length > 0 ? { declined: outcome.declined } : {}),
+    });
+  }
 }
 
-async function routeInboundClaimed(event: InboundEvent, markReplayPending: () => void): Promise<void> {
+async function routeInboundClaimed(event: InboundEvent, outcome: RouteOutcome): Promise<void> {
   // Pre-route interceptors — let modules consume messages before any routing
   // (e.g. free-text DM replies during multi-step approval flows). They run in
   // registration order; the first to claim the message stops routing. The
   // sequential await is intentional — first-to-claim is order-dependent.
   for (const intercept of messageInterceptors) {
-    if (await intercept(event)) return;
+    if (await intercept(event)) {
+      outcome.notWokenReason = 'claimed_by_interceptor';
+      return;
+    }
   }
 
   // 0. Apply the adapter's thread policy. Non-threaded adapters (Telegram,
@@ -482,7 +502,10 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
     // No messaging_groups row. Auto-create only when the message warrants
     // attention (the bot was addressed — @mention or DM). Plain chatter in
     // channels we merely sit in stays silent — no row, no DB writes.
-    if (!isMention) return;
+    if (!isMention) {
+      outcome.notWokenReason = 'unknown_channel_not_mentioned';
+      return;
+    }
     const mgId = `mg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     // Unknown DM/group: default to group (mention) mode. DM-style means engage-on-everything, so an undeclared
     // adapter's group chat would answer every message.
@@ -514,12 +537,12 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
   // 1b. No wirings — either silent drop (plain chatter / denied channel) or
   //     escalate to owner for channel-registration approval.
   if (agentCount === 0) {
-    if (!isMention) return;
+    if (!isMention) {
+      outcome.notWokenReason = 'unwired_channel_not_mentioned';
+      return;
+    }
     if (mg.denied_at) {
-      log.debug('Message dropped — channel was denied by owner', {
-        messagingGroupId: mg.id,
-        deniedAt: mg.denied_at,
-      });
+      outcome.notWokenReason = 'channel_denied_by_owner';
       return;
     }
 
@@ -590,7 +613,7 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
         } catch {
           /* non-critical — the wiring stands either way */
         }
-        return routeInboundClaimed(event, markReplayPending);
+        return routeInboundClaimed(event, outcome);
       } catch (err) {
         if (err instanceof AutoWireUniquenessLost) {
           log.info('auto-wire refused: workspace uniqueness was lost before the wiring landed', {
@@ -619,7 +642,7 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
           platformId: event.platformId,
           agentGroupIds: wirings.map((w) => w.agent_group_id),
         });
-        return routeInboundClaimed(event, markReplayPending);
+        return routeInboundClaimed(event, outcome);
       }
     }
 
@@ -634,10 +657,11 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
       agent_group_id: null,
     });
 
+    outcome.notWokenReason = 'no_agent_wired';
     if (channelRequestGate) {
       // Defer only the exact event the approval row retains; later messages stay ordinary drops.
       try {
-        if (await channelRequestGate(mg, event)) markReplayPending();
+        if (await channelRequestGate(mg, event)) outcome.replayPending = true;
       } catch (err) {
         log.error('Channel-request gate threw', { messagingGroupId: mg.id, err });
       }
@@ -686,6 +710,7 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
           command: preGate.command,
           messagingGroupId: mg.id,
         });
+        outcome.notWokenReason = 'command_left_to_sibling';
         return;
       }
     }
@@ -718,10 +743,11 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
       } else {
         log.warn('No intercept handler registered', { handlerName: preGate.handlerName });
       }
+      outcome.notWokenReason = 'command_intercepted';
       return;
     }
     if (preGate.action === 'filter') {
-      log.debug('Pre-fanout filtered command dropped');
+      outcome.notWokenReason = 'command_filtered';
       return;
     }
     if (preGate.action === 'deny') {
@@ -741,6 +767,7 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
             log.warn('Pre-fanout deny reply failed to deliver', { command: preGate.command, err: String(err) });
           });
       }
+      outcome.notWokenReason = 'command_denied';
       return;
     }
     // 'pass' — fall through to fan-out
@@ -779,7 +806,10 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
 
   for (const agent of agents) {
     const agentGroup = await getAgentGroup(agent.agent_group_id);
-    if (!agentGroup) continue;
+    if (!agentGroup) {
+      outcome.declined.push(`${agent.agent_group_id}:agent_group_missing`);
+      continue;
+    }
 
     // Effective thread id for THIS wiring: the event-derived address is
     // policy-stripped when the wiring (or its channel declaration) opts out
@@ -800,12 +830,12 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
 
     const accessDecision =
       engages && accessGate ? await accessGate(event, userId, mg, agent.agent_group_id, effectiveThreadId) : null;
-    if (accessDecision && !accessDecision.allowed && accessDecision.replayPending) markReplayPending();
+    if (accessDecision && !accessDecision.allowed && accessDecision.replayPending) outcome.replayPending = true;
     const accessOk = engages && (!accessDecision || accessDecision.allowed);
     const scopeOk = engages && (!senderScopeGate || (await senderScopeGate(event, userId, mg, agent)).allowed);
 
     if (engages && accessOk && scopeOk) {
-      await deliverToAgent(
+      const notDelivered = await deliverToAgent(
         agent,
         agentGroup,
         mg,
@@ -818,6 +848,8 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
         adapter,
       );
       engagedCount++;
+      if (notDelivered) outcome.declined.push(`${agent.agent_group_id}:${notDelivered}`);
+      else outcome.woken++;
 
       // Mention-sticky: ask the adapter to subscribe the thread so the
       // platform's subscribed-message path carries follow-ups without
@@ -848,6 +880,7 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
       // message (which also stages their attachments to disk via
       // writeSessionMessage → extractAttachmentFiles) is exactly what the
       // gate is meant to prevent.
+      outcome.declined.push(`${agent.agent_group_id}:not_engaged_kept_as_context`);
       await deliverToAgent(
         agent,
         agentGroup,
@@ -862,6 +895,8 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
       );
       accumulatedCount++;
     } else {
+      const verdict = !engages ? 'not_engaged' : !accessOk ? 'access_refused' : 'sender_scope_refused';
+      outcome.declined.push(`${agent.agent_group_id}:${verdict}`);
       log.debug('Message not engaged for agent (drop policy)', {
         agentGroupId: agent.agent_group_id,
         engage_mode: agent.engage_mode,
@@ -872,6 +907,7 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
     }
   }
 
+  if (outcome.woken === 0) outcome.notWokenReason = engagedCount > 0 ? 'engaged_but_not_delivered' : 'no_agent_engaged';
   if (engagedCount + accumulatedCount === 0) {
     await recordDroppedMessage({
       channel_type: event.channelType,
@@ -1022,7 +1058,7 @@ async function deliverToAgent(
   wake: boolean,
   parsedContent: ParsedContent,
   adapter: ReturnType<typeof getChannelAdapter>,
-): Promise<void> {
+): Promise<string | undefined> {
   // Apply the resolved thread policy (wiring override AND channel declaration
   // AND adapter capability — resolveThreadPolicy at fanout): thread-enabled
   // wiring in a group chat → per-thread session regardless of wiring
@@ -1065,7 +1101,7 @@ async function deliverToAgent(
       threadId: effectiveThreadId,
       platformMessageId: event.message.id,
     });
-    return;
+    return 'kept_in_archive_only';
   }
 
   const { session, created } = await resolveSession(
@@ -1084,7 +1120,7 @@ async function deliverToAgent(
       agentGroup: session.agent_group_id,
       platformMessageId: event.message.id,
     });
-    return;
+    return 'already_delivered';
   }
 
   if (!created && wake && parsedContent.author?.isBot !== true && sessionHasActiveGates(session.id)) {
@@ -1126,7 +1162,7 @@ async function deliverToAgent(
     const gate = await gateCommand(event.message.content, userId, agent.agent_group_id);
     if (gate.action === 'filter') {
       log.debug('Filtered command dropped by gate', { agentGroupId: agent.agent_group_id });
-      return;
+      return 'command_filtered';
     }
     if (gate.action === 'deny') {
       // Outbound-keyed and existing-only: never provision a mailbox for a denial, and an inbound-keyed funnel would
@@ -1142,7 +1178,7 @@ async function deliverToAgent(
         }),
       );
       log.info('Admin command denied by gate', { command: gate.command, userId, agentGroupId: agent.agent_group_id });
-      return;
+      return 'command_denied';
     }
   }
 
@@ -1253,7 +1289,7 @@ async function deliverToAgent(
       agentGroup: session.agent_group_id,
       platformMessageId: event.message.id,
     });
-    return;
+    return 'already_delivered';
   }
 
   // Stamped AFTER the backfill read (needs pre-wake state) and the write (a failed or duplicate insert never engages).

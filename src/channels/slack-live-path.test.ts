@@ -21,6 +21,8 @@ const BOT_USER = 'U0BOT';
 const HUMAN = 'U0HUMAN';
 const CHANNEL = 'C0CHANNELTEST';
 const DM = 'D0DIRECT';
+/** The bot's profile name, which differs from its install-time `auth.test` username as a renamed bot's does. */
+const BOT_DISPLAY_NAME = 'Example Agent';
 
 vi.mock('../env.js', async (importOriginal) => {
   const values: Record<string, string> = { SLACK_BOT_TOKEN: BOT_TOKEN, SLACK_APP_TOKEN: APP_TOKEN };
@@ -68,7 +70,16 @@ function webApi(method: string, body: Record<string, unknown>, port: number): Re
       return { ok: true, url: `ws://127.0.0.1:${port}/link` };
     case 'users.info':
       return body.user === BOT_USER
-        ? { ok: true, user: { id: BOT_USER, team_id: TEAM, name: 'example-agent', is_bot: true, profile: {} } }
+        ? {
+            ok: true,
+            user: {
+              id: BOT_USER,
+              team_id: TEAM,
+              name: 'example-agent',
+              is_bot: true,
+              profile: { display_name: BOT_DISPLAY_NAME, real_name: BOT_DISPLAY_NAME },
+            },
+          }
         : { ok: true, user: human };
     case 'users.list':
       return { ok: true, members: [human, noPhoto], response_metadata: { next_cursor: '' } };
@@ -107,6 +118,9 @@ const inbound: Array<{ platformId: string; threadId: string | null; message: Inb
 const waiters: Array<() => void> = [];
 let registry: typeof import('./channel-registry.js');
 let savedApiUrl: string | undefined;
+/** Holds the bot's own `users.info` answer, so the host's profile lookup is still in flight after setup. */
+let releaseBotProfile: () => void = () => {};
+const botProfileHeld = new Promise<void>((resolve) => (releaseBotProfile = resolve));
 
 function readBody(req: http.IncomingMessage): Promise<Record<string, unknown>> {
   return new Promise((resolve) => {
@@ -180,6 +194,7 @@ beforeAll(async () => {
     const method = (req.url ?? '').replace(/^\/api\//, '').split('?')[0]!;
     const body = await readBody(req);
     apiCalls.push({ method, auth: req.headers.authorization });
+    if (method === 'users.info' && body.user === BOT_USER) await botProfileHeld;
     res.setHeader('content-type', 'application/json');
     res.end(JSON.stringify(webApi(method, body, (server.address() as AddressInfo).port)));
   };
@@ -208,6 +223,15 @@ beforeAll(async () => {
       socket!.send(JSON.stringify({ envelope_id: id, type: 'events_api', accepts_response_payload: false, payload }));
     });
 
+  // A restarted host finds the bot's profile already in the SDK's persisted user cache, so the SDK renders a mention
+  // of the bot by its profile name at once, while the host's own profile lookup has yet to answer.
+  const { SqliteStateAdapter } = await import('../state-sqlite.js');
+  await new SqliteStateAdapter().set(
+    `slack:user:${BOT_USER}`,
+    { displayName: BOT_DISPLAY_NAME, realName: BOT_DISPLAY_NAME, isBot: true },
+    60 * 60 * 1000,
+  );
+
   await import('./slack.js');
   registry = await import('./channel-registry.js');
   const setup: ChannelSetup = {
@@ -226,6 +250,7 @@ beforeAll(async () => {
 }, 30_000);
 
 afterAll(async () => {
+  releaseBotProfile();
   await registry?.teardownChannelAdapters();
   if (savedApiUrl === undefined) delete process.env.SLACK_API_URL;
   else process.env.SLACK_API_URL = savedApiUrl;
@@ -280,6 +305,29 @@ describe('Slack inbound through the real adapter and Socket Mode client', () => 
     });
   });
 
+  it('marks an app_mention as a mention while the bot’s own profile lookup is still in flight after a restart', async () => {
+    const { getKnownSlackBots } = await import('./slack-mentions.js');
+    expect(getKnownSlackBots().get('slack')).toMatchObject({ userId: BOT_USER, username: 'example-agent' });
+    expect(getKnownSlackBots().get('slack')?.displayName).toBeUndefined();
+
+    inbound.length = 0;
+    await sendEnvelope(
+      'env-mention-at-boot',
+      message({
+        type: 'app_mention',
+        channel: CHANNEL,
+        user: HUMAN,
+        text: `<@${BOT_USER}> are you up?`,
+        ts: '1790000003.000100',
+      }),
+    );
+    await nextInbound(1);
+
+    expect(inbound[0]!.message.content).toMatchObject({ text: `@${BOT_DISPLAY_NAME} are you up?` });
+    expect(inbound[0]!.message).toMatchObject({ isMention: true, isDM: false });
+    releaseBotProfile();
+  });
+
   it('marks an app_mention as a mention and threads the reply under it', async () => {
     inbound.length = 0;
     await sendEnvelope(
@@ -328,6 +376,40 @@ describe('Slack inbound through the real adapter and Socket Mode client', () => 
     await nextInbound(1);
 
     expect(inbound[0]!.message).toMatchObject({ isMention: false, isDM: false });
+  });
+
+  it('says why it demotes a mention the platform confirmed but the bot is named only inside code', async () => {
+    const { log } = await import('../log.js');
+    const info = vi.spyOn(log, 'info');
+    inbound.length = 0;
+    // Plain mrkdwn with no rich_text blocks: the SDK classifies the text, where an unclosed fence is not code, and
+    // reports a mention, while the body the agent reads keeps the mention inside a code block.
+    await sendEnvelope(
+      'env-fenced-mention',
+      message({
+        type: 'app_mention',
+        channel: CHANNEL,
+        user: HUMAN,
+        text: `usage:\n\`\`\`\n<@${BOT_USER}> ship 42`,
+        ts: '1790000013.000100',
+        blocks: undefined,
+      }),
+    );
+    await nextInbound(1);
+
+    expect(inbound[0]!.message).toMatchObject({ isMention: false });
+    expect(info.mock.calls.filter(([line]) => line.startsWith('Platform mention demoted'))).toEqual([
+      [
+        'Platform mention demoted: no mention of the bot outside code',
+        expect.objectContaining({
+          channelType: 'slack',
+          threadId: `slack:${CHANNEL}:1790000013.000100`,
+          messageId: '1790000013.000100',
+          checkedNames: expect.arrayContaining([`<@${BOT_USER}>`, 'example-agent', BOT_DISPLAY_NAME]),
+        }),
+      ],
+    ]);
+    info.mockRestore();
   });
 
   it('keeps a list from Slack’s composer as a list, nested item included', async () => {

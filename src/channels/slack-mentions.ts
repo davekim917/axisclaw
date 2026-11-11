@@ -573,15 +573,26 @@ function stripSlackCodeRegions(text: string): string {
 /**
  * True when the bot's mention appears outside code. Slack fires app_mention even for `@name` inside backticks, which
  * would wake mention-mode agents off their own documentation. Raw ids are already resolved to @name here, so both
- * forms are checked.
+ * forms are checked. `renderedNames` are the names the Chat SDK rendered the bot's mention under, which the identity's
+ * own profile names can trail.
  */
-export function slackMentionOutsideCode(text: string, identity: SlackBotIdentity): boolean {
+export function slackMentionOutsideCode(
+  text: string,
+  identity: SlackBotIdentity,
+  renderedNames: readonly string[] = [],
+): boolean {
   const outsideCode = stripSlackCodeRegions(text);
   if (outsideCode.includes(`<@${identity.userId}>`)) return true;
   const lower = outsideCode.toLocaleLowerCase('en-US');
-  return [identity.displayName, identity.realName, identity.username]
-    .filter((name): name is string => !!name)
-    .some((name) => lower.includes(`@${name.toLocaleLowerCase('en-US')}`));
+  return slackMentionNames(identity, renderedNames).some((name) =>
+    lower.includes(`@${name.toLocaleLowerCase('en-US')}`),
+  );
+}
+
+/** The names `slackMentionOutsideCode` accepts after `@`, besides the raw id. */
+export function slackMentionNames(identity: SlackBotIdentity, renderedNames: readonly string[] = []): string[] {
+  const names = [identity.displayName, identity.realName, identity.username, ...renderedNames];
+  return [...new Set(names.filter((name): name is string => !!name))];
 }
 
 /**

@@ -209,10 +209,11 @@ import { wakeContainer } from './container-runner.js';
 import { getSession } from './db/sessions.js';
 import { isAnyAdmin } from './modules/permissions/db/user-roles.js';
 import { formatFlagConfirmation, parseMessageFlags } from './flag-parser.js';
-import { claimChannelIngress, completeChannelIngress } from './db/channel-ingress-receipts.js';
+import { claimChannelIngress, completeChannelIngress, deferChannelIngress } from './db/channel-ingress-receipts.js';
 import { registerInterceptHandler, clearInterceptHandlers } from './command-gate.js';
 import { getDeliveryAdapter } from './delivery.js';
 import { archiveMessage } from './message-archive.js';
+import { log } from './log.js';
 import type { ChannelAdapter, InboundEvent } from './channels/adapter.js';
 import type { MessagingGroup, MessagingGroupAgent } from './types.js';
 
@@ -1303,5 +1304,144 @@ describe('autoCreateMessagingGroup (seam 3: the lookup yields before the insert)
       Object.assign(new Error('disk I/O'), { code: 'SQLITE_IOERR' }),
     );
     await expect(autoCreateMessagingGroup(candidate, 'slack')).rejects.toThrow('disk I/O');
+  });
+});
+
+describe('an addressed message that wakes no agent says why', () => {
+  const groupMention = (overrides: Partial<InboundEvent['message']> = {}): InboundEvent => {
+    const event = makeChatEvent('can you look at this', { isDM: false, threadId: 'thread-1' });
+    return { ...event, message: { ...event.message, id: 'msg-addressed', ...overrides } };
+  };
+
+  async function wireOneAgent(agent: Partial<MessagingGroupAgent>): Promise<void> {
+    const { getAgentGroup } = await import('./db/agent-groups.js');
+    vi.mocked(getMessagingGroupWithAgentCount).mockResolvedValue({ mg: makeMg({ is_group: 1 }), agentCount: 1 });
+    vi.mocked(getMessagingGroupAgents).mockResolvedValue([makeAgent(agent)]);
+    vi.mocked(getAgentGroup).mockResolvedValue({
+      id: 'ag-1',
+      name: 'Example Assistant',
+      folder: 'example-assistant',
+      agent_provider: null,
+      created_at: new Date().toISOString(),
+    });
+    vi.mocked(resolveSession).mockResolvedValue({
+      session: {
+        id: 's-1',
+        agent_group_id: 'ag-1',
+        messaging_group_id: 'mg-1',
+        thread_id: 'thread-1',
+        agent_provider: null,
+        status: 'active',
+        container_status: 'idle',
+        last_active: null,
+        created_at: new Date().toISOString(),
+      },
+      created: false,
+    });
+  }
+
+  const notWokenLines = () =>
+    vi.mocked(log.info).mock.calls.filter(([message]) => message === 'Addressed message woke no agent');
+
+  it.each([
+    {
+      name: 'a mention no wiring engages on',
+      agent: { engage_mode: 'mention-pattern' as const, engage_pattern: '^deploy' },
+      arrange: () => {},
+      reason: 'no_agent_engaged',
+      declined: ['ag-1:not_engaged'],
+    },
+    {
+      name: 'a mention the access gate refuses',
+      agent: {},
+      arrange: () => setAccessGate(() => ({ allowed: false, reason: 'unknown_user' })),
+      reason: 'no_agent_engaged',
+      declined: ['ag-1:access_refused'],
+    },
+    {
+      name: 'an engaged mention whose admin command is denied',
+      agent: {},
+      text: '/clear',
+      arrange: () => vi.mocked(isAnyAdmin).mockResolvedValue(false),
+      reason: 'engaged_but_not_delivered',
+      declined: ['ag-1:command_denied'],
+    },
+    {
+      name: 'an engaged mention the session already holds',
+      agent: {},
+      arrange: () => vi.mocked(writeSessionMessageIfNew).mockResolvedValueOnce(false),
+      reason: 'engaged_but_not_delivered',
+      declined: ['ag-1:already_delivered'],
+    },
+  ])(
+    '$name completes its receipt and logs the reason per wiring',
+    async ({ agent, text, arrange, reason, declined }) => {
+      await wireOneAgent(agent);
+      arrange();
+      const event = groupMention();
+      if (text) event.message.content = JSON.stringify({ text });
+
+      await routeInbound(event);
+
+      expect(completeChannelIngress).toHaveBeenCalledOnce();
+      expect(notWokenLines()).toEqual([
+        ['Addressed message woke no agent', expect.objectContaining({ messageId: 'msg-addressed', reason, declined })],
+      ]);
+    },
+  );
+
+  it('logs a mention in a channel its owner denied', async () => {
+    vi.mocked(getMessagingGroupWithAgentCount).mockResolvedValue({
+      mg: makeMg({ is_group: 1, denied_at: new Date().toISOString() }),
+      agentCount: 0,
+    });
+
+    await routeInbound(groupMention());
+
+    expect(notWokenLines()).toEqual([
+      ['Addressed message woke no agent', expect.objectContaining({ reason: 'channel_denied_by_owner' })],
+    ]);
+  });
+
+  it.each([
+    {
+      name: 'unaddressed channel chatter kept as context',
+      event: () => groupMention({ isMention: false }),
+      agent: { ignored_message_policy: 'accumulate' as const },
+    },
+    { name: 'a mention that wakes the agent', event: () => groupMention(), agent: {} },
+  ])('stays quiet for $name', async ({ event, agent }) => {
+    await wireOneAgent(agent);
+
+    await routeInbound(event());
+
+    expect(completeChannelIngress).toHaveBeenCalledOnce();
+    expect(notWokenLines()).toEqual([]);
+  });
+
+  it('writes the wake row for the mention it stays quiet about', async () => {
+    await wireOneAgent({});
+
+    await routeInbound(groupMention());
+
+    expect(writeSessionMessageIfNew).toHaveBeenCalledWith(
+      'ag-1',
+      's-1',
+      expect.objectContaining({ trigger: 1 }),
+      expect.anything(),
+    );
+  });
+
+  it('stays quiet for a mention held for a channel-registration approval', async () => {
+    vi.mocked(getMessagingGroupWithAgentCount).mockResolvedValue({ mg: makeMg({ is_group: 1 }), agentCount: 0 });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    vi.mocked(getDb).mockReturnValue({ all: vi.fn(async () => []) } as any);
+    setChannelRequestGate(() => Promise.resolve(true));
+
+    await routeInbound(groupMention());
+
+    expect(deferChannelIngress).toHaveBeenCalledOnce();
+    expect(completeChannelIngress).not.toHaveBeenCalled();
+    expect(notWokenLines()).toEqual([]);
   });
 });
