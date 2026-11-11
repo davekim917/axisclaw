@@ -1,8 +1,57 @@
 # Migration: the Claude default model
 
-## Current: Fable default moves to 5.2 (2026-11-10)
+## Current: subagents default to Opus (2026-11-11)
 
-This section is the current migration. Opus, Sonnet and Haiku defaults do not move, and no family default effort moves. The Fable family default model and the container's pinned CLI move.
+This section is the current migration. No family default model or effort moves, and no pin is rewritten. What moves is the model a Claude subagent runs when nothing names one.
+
+**What moves.** `claudeSpawnEnv` (`src/claude-spawn-defaults.ts`) now sets `CLAUDE_CODE_SUBAGENT_MODEL` to `DEFAULT_OPUS_MODEL` (`claude-opus-5-5[1m]`) in every Claude container, agent and wiki alike. A subagent whose Agent call names no model and whose definition has no `model` field (`general-purpose`, the `bootstrap-orchestrate:worker-*` shims, a group or plugin agent without `model:`) used to inherit its parent's model and now runs Opus. A session on Fable or Sonnet therefore builds with Opus subagents. The variable follows `DEFAULT_OPUS_MODEL`, so a later Opus bump moves it too. Codex and OpenCode are untouched.
+
+What does **not** move, on the pinned CLI (2.1.322):
+- a model named on the Agent call (`model: "sonnet"`) wins;
+- a `model:` field in the agent definition wins, `model: inherit` included (that one keeps the parent's model);
+- an Opus parent's unnamed subagents already ran Opus.
+
+`container/agent-runner/src/providers/claude-live-path.test.ts` ("subagent model precedence") drives the real SDK and CLI and asserts all of these, with a control showing an unnamed subagent inherits when the variable is absent. If a CLI bump changes the ranking, that test fails.
+
+A group's `.claude-shared/settings.json` cannot pin the variable: the CLI applies settings `env` over the process env, so group-init (`DEPRECATED_ENV`, `src/group-init.ts`) scrubs the key on every spawn, as it does for the family aliases.
+
+**Detect.** Paths that move are subagents spawned with no model from a parent not on Opus. Check which parents those are:
+
+```bash
+# 1. Groups, wirings and tasks pinned off Opus (their unnamed subagents move):
+grep -HiE '"(model|defaultModel)": *"[^"]*(sonnet|fable|haiku)' groups/*/container.json
+pnpm exec tsx scripts/q.ts data/v2.db "select mga.id, mg.name, mga.agent_group_id, mga.default_model from messaging_group_agents mga join messaging_groups mg on mg.id = mga.messaging_group_id where lower(coalesce(mga.default_model,'')) like '%sonnet%' or lower(coalesce(mga.default_model,'')) like '%fable%' or lower(coalesce(mga.default_model,'')) like '%haiku%'"
+ncl tasks list --json | grep -iE -B1 -A1 '"model_pin": "[^"]*(sonnet|fable|haiku)'
+# 2. Subagent definitions that name no model (they follow the new default under any parent):
+grep -rLE '^model:' groups/*/.claude/agents/*.md; find ~/plugins -path '*/agents/*.md' -not -path '*/node_modules/*' -exec grep -LE '^model:' {} +
+# 3. A settings pin, which group-init scrubs at the next spawn:
+grep -l CLAUDE_CODE_SUBAGENT_MODEL data/v2-sessions/*/.claude-shared/settings.json
+```
+
+**Why.** A Fable session orchestrates and Opus builds, the same split the host's own Claude Code runs with. Without the variable a subagent with no model inherits the parent's, so a Fable or Sonnet session also built with Fable or Sonnet.
+
+**Fix: keep a subagent on its parent's model.** There is no per-group setting. Give the definition `model: inherit`, or have the Agent call name a model. Both outrank the variable.
+
+**Deploy.** `scripts/deploy.sh`: the value is a spawn `-e` in compiled host code, so the host must be rebuilt and restarted. The script also rebuilds the agent image because `container/` changed, though the runner change is only a comment and tests. A host restart **adopts** running containers, which keep their spawn-time env, so an adopted container keeps inheriting until it exits. Recycle a group with `ncl groups restart --id <group-id>` at a quiet moment.
+
+**Verify.**
+
+```bash
+docker inspect <fresh claude container> --format '{{range .Config.Env}}{{println .}}{{end}}' | grep CLAUDE_CODE_SUBAGENT_MODEL
+# In a fresh session of a Fable- or Sonnet-pinned group, have the agent spawn a `general-purpose` subagent with no model, then read the models the parent and the subagent ran:
+grep -ho '"model":"claude-[^"]*"' data/v2-sessions/<group-id>/<session-id>/.claude-projects/*/<transcript-uuid>.jsonl | sort | uniq -c
+grep -ho '"model":"claude-[^"]*"' data/v2-sessions/<group-id>/<session-id>/.claude-projects/*/<transcript-uuid>/subagents/*.jsonl | sort | uniq -c
+```
+
+Expect `CLAUDE_CODE_SUBAGENT_MODEL=claude-opus-5-5[1m]`, the parent transcript on Fable or Sonnet, and the subagent transcript on `claude-opus-5-5`. `turn_usage` cannot show this: it has one row per model per turn and no parent/child split, so an Opus parent with a Sonnet-named child looks the same as a Sonnet parent with an Opus child.
+
+**Rollback.** `scripts/deploy.sh` deploys only what is on `origin/main`: it refuses a checkout with tracked edits, then checks out and pulls `main`. So land the rollback there first. Open a PR that reverts this change (`git revert <merge commit>`), or that removes both elements of the pair in `claudeSpawnEnv` (the `'-e'` and the `CLAUDE_CODE_SUBAGENT_MODEL=…` string after it; a lone `'-e'` breaks every spawn) together with the test lines that assert it. Merge it, then run `scripts/deploy.sh`. Containers spawned after that inherit again; check one with the `docker inspect` line above, which should print nothing.
+
+---
+
+## History: 2026-11-10 — Fable default moves to 5.2
+
+Opus, Sonnet and Haiku defaults do not move, and no family default effort moves. The Fable family default model and the container's pinned CLI move.
 
 **What moves.**
 - `DEFAULT_FABLE_MODEL` (`src/flag-parser.ts`) is `claude-fable-5-2[1m]`, was `claude-fable-5-1[1m]`. Every Claude path whose model resolves through the word `fable` runs Fable 5.2: a chat `-m fable`, a `fable` wiring, group, task or `providerFallback` pin, a subagent's `model: fable`, and any call the CLI makes through the word (resolved through `ANTHROPIC_DEFAULT_FABLE_MODEL`, which `claudeSpawnEnv` sets from the same constant). Unpinned groups resolve to Opus and do not move.

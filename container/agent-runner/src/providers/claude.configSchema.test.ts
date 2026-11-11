@@ -603,9 +603,10 @@ describe('live applySettings (-m/-e on an active query — same conversation, no
 });
 
 describe('subagent model env', () => {
-  it('test_claude_no_subagent_model_pin: perQueryEnv omits CLAUDE_CODE_SUBAGENT_MODEL and rewrites no family alias', () => {
-    // CLAUDE_CODE_SUBAGENT_MODEL outranks per-invocation and frontmatter model
-    // selection — setting it would pin every subagent to the group model.
+  it('test_claude_no_subagent_model_pin: perQueryEnv passes CLAUDE_CODE_SUBAGENT_MODEL through and rewrites no family alias', () => {
+    // CLAUDE_CODE_SUBAGENT_MODEL is the install's subagent default from the
+    // spawn env. Rewriting it to the group model would make every unnamed
+    // subagent run the group model, which is what the default exists to stop.
     //
     // Nor may the query rewrite the resolved model's OWN family alias, which
     // it did until PR #839: a group running a non-current opus rewrote `opus`
@@ -616,12 +617,14 @@ describe('subagent model env', () => {
     capturedSdkOptions = null;
     mockSdkQuery.mockClear();
 
-    const provider = makeClaudeProvider({ env: { ANTHROPIC_DEFAULT_OPUS_MODEL: 'claude-opus-5[1m]' } });
+    const provider = makeClaudeProvider({
+      env: { ANTHROPIC_DEFAULT_OPUS_MODEL: 'claude-opus-5[1m]', CLAUDE_CODE_SUBAGENT_MODEL: 'claude-opus-5[1m]' },
+    });
     provider.query({ prompt: 'hi', cwd: '/tmp', model: 'claude-opus-4-8[1m]' });
 
     expect(mockSdkQuery).toHaveBeenCalledTimes(1);
     const env = capturedSdkOptions?.env as Record<string, string | undefined>;
-    expect(env.CLAUDE_CODE_SUBAGENT_MODEL).toBeUndefined();
+    expect(env.CLAUDE_CODE_SUBAGENT_MODEL).toBe('claude-opus-5[1m]');
     // The group runs opus 4.8; the word `opus` still means the install's Opus.
     expect(capturedSdkOptions?.model).toBe('claude-opus-4-8[1m]');
     expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('claude-opus-5[1m]');

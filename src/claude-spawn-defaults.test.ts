@@ -182,6 +182,8 @@ describe('claudeSpawnEnv', () => {
       '-e',
       `ANTHROPIC_DEFAULT_FABLE_MODEL=${DEFAULT_FABLE_MODEL}`,
       '-e',
+      'CLAUDE_CODE_SUBAGENT_MODEL=claude-opus-5-5[1m]',
+      '-e',
       'NANOCLAW_EFFORT_OVERRIDE=medium',
       '-e',
       'CLAUDE_CODE_AUTO_COMPACT_WINDOW=800000',
@@ -209,13 +211,14 @@ describe('claudeSpawnEnv', () => {
       ANTHROPIC_DEFAULT_SONNET_MODEL: DEFAULT_SONNET_MODEL,
       ANTHROPIC_DEFAULT_HAIKU_MODEL: 'claude-haiku-5-5',
       ANTHROPIC_DEFAULT_FABLE_MODEL: DEFAULT_FABLE_MODEL,
+      CLAUDE_CODE_SUBAGENT_MODEL: DEFAULT_OPUS_MODEL,
       CLAUDE_CODE_AUTO_COMPACT_WINDOW: '800000',
       CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH: '2',
       CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS: '5',
       CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL: '1h',
       CLAUDE_CODE_FORK_SUBAGENT: '0',
     });
-    expect(env).toHaveLength(20);
+    expect(env).toHaveLength(22);
   });
 
   it('claude_spawn_env_matches_the_live_fleet_baseline', () => {
@@ -225,6 +228,7 @@ describe('claudeSpawnEnv', () => {
     // The deliberate literals: a model bump must change them on purpose.
     expect(pairs(claudeSpawnEnv(cfg())).NANOCLAW_CLAUDE_MODEL).toBe('claude-opus-5-5[1m]');
     expect(pairs(claudeSpawnEnv(cfg())).ANTHROPIC_DEFAULT_FABLE_MODEL).toBe('claude-fable-5-2[1m]');
+    expect(pairs(claudeSpawnEnv(cfg())).CLAUDE_CODE_SUBAGENT_MODEL).toBe('claude-opus-5-5[1m]');
     expect(claudeSpawnEnv(cfg()).includes('NANOCLAW_EFFORT_OVERRIDE=')).toBe(false);
   });
 
@@ -291,6 +295,16 @@ describe('claudeSpawnEnv — the family aliases are install constants, never the
 
   it('a group pinned to bare fable follows DEFAULT_FABLE_MODEL', () => {
     expect(pairs(claudeSpawnEnv(cfg({ model: 'fable' }))).NANOCLAW_CLAUDE_MODEL).toBe(DEFAULT_FABLE_MODEL);
+  });
+
+  it('the subagent default is the install Opus whatever the group or channel runs', () => {
+    // A Fable- or Sonnet-pinned session still builds with Opus subagents.
+    expect(pairs(claudeSpawnEnv(cfg())).CLAUDE_CODE_SUBAGENT_MODEL).toBe(DEFAULT_OPUS_MODEL);
+    expect(pairs(claudeSpawnEnv(cfg({ model: 'fable' }))).CLAUDE_CODE_SUBAGENT_MODEL).toBe(DEFAULT_OPUS_MODEL);
+    expect(
+      pairs(claudeSpawnEnv(cfg({ model: 'claude-fable-5-2[1m]' }), { model: 'claude-sonnet-5-5' }))
+        .CLAUDE_CODE_SUBAGENT_MODEL,
+    ).toBe(DEFAULT_OPUS_MODEL);
   });
 
   it('the group model travels in its own variable, never in an alias', () => {

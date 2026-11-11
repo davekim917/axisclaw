@@ -2148,9 +2148,8 @@ export class ClaudeProvider implements AgentProvider {
       log('Delegating Bash email approval gate to loaded plugin');
     }
 
-    // Leave CLAUDE_CODE_SUBAGENT_MODEL unset: a concrete value outranks frontmatter model selection, pinning every
-    // subagent to the group model. Never rewrite a family alias to the group's model here: family words are install
-    // constants, and the model in force travels as the SDK's own `model` option.
+    // Never rewrite a family alias or CLAUDE_CODE_SUBAGENT_MODEL to the group's model here: both are install
+    // constants from the spawn env, and the model in force travels as the SDK's own `model` option.
     const perQueryEnv: Record<string, string | undefined> = { ...this.env, PATH: withCodexShimPath(this.env.PATH) };
 
     // The ring slot is fixed for the query's life (the CLI subprocess starts with this env), so it is captured here,

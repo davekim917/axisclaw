@@ -96,6 +96,9 @@ export function resolveClaudeSpawnDefaults(
  * The four `ANTHROPIC_DEFAULT_<FAMILY>_MODEL` vars are install-wide alias answers (what a bare `opus` or a
  * `model: opus` subagent resolves to), never the group's model, which travels in NANOCLAW_CLAUDE_MODEL. Putting
  * the group's model in the opus alias would make every `model: opus` pin silently run the group's model.
+ *
+ * CLAUDE_CODE_SUBAGENT_MODEL only fills in for a subagent nothing else names a model for: a model on the Agent call
+ * or in the agent definition (`inherit` included) still wins.
  */
 export function claudeSpawnEnv(
   containerConfig: ClaudeSpawnConfig,
@@ -115,6 +118,8 @@ export function claudeSpawnEnv(
     `ANTHROPIC_DEFAULT_HAIKU_MODEL=${DEFAULT_HAIKU_MODEL}`,
     '-e',
     `ANTHROPIC_DEFAULT_FABLE_MODEL=${DEFAULT_FABLE_MODEL}`,
+    '-e',
+    `CLAUDE_CODE_SUBAGENT_MODEL=${DEFAULT_OPUS_MODEL}`,
   ];
   if (resolved.effort) env.push('-e', `NANOCLAW_EFFORT_OVERRIDE=${resolved.effort}`);
   env.push(

@@ -265,4 +265,91 @@ describe.skipIf(sdkMocked)('provider-claude live path', () => {
     expect(argv).toContain('--input-format');
     expect(claudeCyclePlan(argv, { CLAUDE_CODE_OAUTH_TOKEN: 'one', CLAUDE_CODE_OAUTH_TOKEN_2: 'two' })).toBeNull();
   }, 60_000);
+  // The spawn env sets CLAUDE_CODE_SUBAGENT_MODEL as a fleet default; it is only safe while the CLI ranks it below a
+  // model the Agent call names and below an agent definition's `model`, `inherit` included.
+  describe('subagent model precedence', () => {
+    const MAIN = 'claude-fable-5-2[1m]';
+    const SUBAGENT_DEFAULT = 'claude-opus-5-5[1m]';
+    const cases: Array<{ name: string; agentInput: Record<string, unknown>; env: boolean; want: string }> = [
+      {
+        name: 'an unnamed model takes the env default',
+        agentInput: { subagent_type: 'general-purpose' },
+        env: true,
+        want: 'claude-opus-5-5',
+      },
+      {
+        name: 'without the env an unnamed model inherits the main model',
+        agentInput: { subagent_type: 'general-purpose' },
+        env: false,
+        want: 'claude-fable-5-2',
+      },
+      {
+        name: 'a definition model beats the env default',
+        agentInput: { subagent_type: 'probe-haiku' },
+        env: true,
+        want: 'claude-haiku-5-5',
+      },
+      {
+        name: 'a definition `inherit` beats the env default',
+        agentInput: { subagent_type: 'probe-inherit' },
+        env: true,
+        want: 'claude-fable-5-2',
+      },
+      {
+        name: 'a model named on the Agent call beats the env default',
+        agentInput: { subagent_type: 'general-purpose', model: 'sonnet' },
+        env: true,
+        want: 'claude-sonnet-5-5',
+      },
+    ];
+    for (const c of cases) {
+      it(
+        c.name,
+        async () => {
+          home ||= fs.mkdtempSync(path.join(os.tmpdir(), 'claude-live-path-'));
+          allowWritesTo(home);
+          const agents = path.join(home, 'work', '.claude', 'agents');
+          fs.mkdirSync(agents, { recursive: true });
+          for (const m of ['haiku', 'inherit']) {
+            fs.writeFileSync(
+              path.join(agents, `probe-${m}.md`),
+              `---\nname: probe-${m}\ndescription: probe\nmodel: ${m}\n---\nSUBAGENT-PROBE-MARKER\n`,
+            );
+          }
+          script = [
+            {
+              toolUse: {
+                id: 'toolu_agent_1',
+                name: 'Agent',
+                input: { description: 'probe', prompt: 'SUBAGENT-TASK-MARKER', ...c.agentInput },
+              },
+            },
+            { text: 'sub done' },
+            { text: 'main done' },
+          ];
+          const provider = liveProvider({
+            ANTHROPIC_API_KEY: 'sk-ant-live-path-fake',
+            ANTHROPIC_DEFAULT_OPUS_MODEL: SUBAGENT_DEFAULT,
+            ANTHROPIC_DEFAULT_SONNET_MODEL: 'claude-sonnet-5-5',
+            ANTHROPIC_DEFAULT_HAIKU_MODEL: 'claude-haiku-5-5',
+            ANTHROPIC_DEFAULT_FABLE_MODEL: MAIN,
+            CLAUDE_CODE_FORK_SUBAGENT: '0',
+            ...(c.env ? { CLAUDE_CODE_SUBAGENT_MODEL: SUBAGENT_DEFAULT } : {}),
+          });
+          const result = await runTurn({ prompt: 'delegate', model: MAIN }, provider);
+
+          expect(result.text).toContain('main done');
+          const sub = turns.filter(
+            (t) =>
+              JSON.stringify(t.messages).includes('SUBAGENT-TASK-MARKER') &&
+              !JSON.stringify(t.messages).includes('toolu_agent_1'),
+          );
+          expect(sub).toHaveLength(1);
+          expect(sub[0].model).toBe(c.want);
+          expect(turns[0].model).toBe('claude-fable-5-2');
+        },
+        90_000,
+      );
+    }
+  });
 });

@@ -94,6 +94,7 @@ describe('quota env reconciliation (PR #810 F2)', () => {
     expect(fresh.env.CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL).toBe(CLAUDE_SUBAGENT_PROMPT_CACHE_TTL);
     expect(fresh.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW).toBeUndefined();
     expect(fresh.env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE).toBeUndefined();
+    expect(fresh.env.CLAUDE_CODE_SUBAGENT_MODEL).toBeUndefined();
 
     // Seed the shadowing shape: a hand-edit (or a pre-#810 file) with values
     // that disagree with the spawn `-e`.
@@ -106,6 +107,9 @@ describe('quota env reconciliation (PR #810 F2)', () => {
     // the 80 in place in each existing file; only the DEPRECATED_ENV listing
     // scrubs it, and this is the assertion that holds that apart.
     fresh.env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE = '80';
+    // The CLI applies settings.json env over the process env, so a pin here
+    // would replace the spawn's subagent default for every session in the group.
+    fresh.env.CLAUDE_CODE_SUBAGENT_MODEL = 'claude-sonnet-5-5';
     fs.writeFileSync(file, JSON.stringify(fresh, null, 2) + '\n');
 
     initGroupFilesystem(ag, {}); // next spawn
@@ -116,6 +120,7 @@ describe('quota env reconciliation (PR #810 F2)', () => {
     expect(after.env.CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL).toBe(CLAUDE_SUBAGENT_PROMPT_CACHE_TTL);
     expect(after.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW).toBeUndefined();
     expect(after.env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE).toBeUndefined();
+    expect(after.env.CLAUDE_CODE_SUBAGENT_MODEL).toBeUndefined();
   });
 });
 
