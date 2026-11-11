@@ -21,8 +21,9 @@ metadata:
 # OneCLI Gateway
 
 Your outbound HTTPS traffic is transparently proxied through the OneCLI
-gateway, which injects stored credentials at the proxy boundary. You never
-see or handle credential values directly.
+gateway, which injects stored credentials at the proxy boundary, so they are
+never in your requests. A response body is different: it can carry
+credentials back to you (see Credentials in Responses).
 
 ## How to Access External Services
 
@@ -73,6 +74,28 @@ If an MCP server won't start due to missing credentials, create stubs
 **before** starting it. Use `"onecli-managed"` as the placeholder for all
 secret values, with file permissions `0600`. See the guide at:
 https://www.onecli.sh/docs/guides/credential-stubs/general-app
+
+## Credentials in Responses
+
+An integration or settings endpoint can return credentials in its body:
+destination configs, connection settings, webhook secrets, API keys. The
+gateway does not mask them.
+
+- Select only the fields you need at the call, with `jq` or the API's own
+  field selection, and drop credential fields before the output is printed
+  or saved:
+
+  ```bash
+  curl -s "https://api.example-vendor.com/v1/destinations" \
+    | jq '[.destinations[] | {id, name, enabled}]' 2>/dev/null \
+    || echo "unexpected response shape"
+  ```
+
+  jq's error messages quote the input, so keep its stderr out of the output.
+
+- Never save a raw settings response under `artifacts/` or any shared folder.
+- If a credential did reach the transcript or a file, say so in the thread so
+  the owner can decide on rotation. Don't scrub it silently.
 
 ## When a Request Fails
 
